@@ -3922,21 +3922,29 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
 
   if (provenance_draw_id) {
-    uint32_t depth_and_color_formats = 0;
+    std::array<uint32_t, 1 + xenos::kMaxColorRenderTargets> depth_and_color_formats{};
+    static_assert(std::tuple_size_v<decltype(depth_and_color_formats)> ==
+                  1 + xenos::kMaxColorRenderTargets);
     bool host_render_targets =
         render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
     uint32_t bound_targets =
         host_render_targets
-            ? render_target_cache_->GetLastUpdateBoundRenderTargets(&depth_and_color_formats)
+            ? render_target_cache_->GetLastUpdateBoundRenderTargets(depth_and_color_formats.data())
             : render_target_cache_->last_update_render_pass_key().depth_and_color_used;
     auto render_pass_key = render_target_cache_->last_update_render_pass_key();
     REXGPU_INFO(
-        "GPU provenance frame {} draw {} targets path={} mask=0x{:X} formats=0x{:X} "
+        "GPU provenance frame {} draw {} targets path={} mask=0x{:X} depth_format=0x{:X} "
         "render_pass_key=0x{:X} framebuffer={:p} edram_buffer={:p}",
         frame_current_, provenance_draw_id, host_render_targets ? "host" : "fsi", bound_targets,
-        depth_and_color_formats, render_pass_key.key,
+        depth_and_color_formats[0], render_pass_key.key,
         static_cast<const void*>(render_target_cache_->last_update_framebuffer()),
         static_cast<void*>(render_target_cache_->edram_buffer()));
+    if (host_render_targets) {
+      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+        REXGPU_INFO("GPU provenance frame {} draw {} color{} format=0x{:X}", frame_current_,
+                    provenance_draw_id, i, depth_and_color_formats[1 + i]);
+      }
+    }
     if (host_render_targets) {
       VkRenderingAttachmentInfo colors[xenos::kMaxColorRenderTargets]{};
       VkRenderingAttachmentInfo depth{};
