@@ -10,6 +10,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -107,6 +109,26 @@ struct HeapAllocationInfo {
   uint32_t state;
   // The access protection of the pages in the region.
   uint32_t protect;
+};
+
+struct GuestMemoryViewSnapshot {
+  uint32_t guest_address = 0;
+  uint32_t physical_address = UINT32_MAX;
+  uintptr_t host_address = 0;
+  bool allocation_info_available = false;
+  HeapAllocationInfo allocation{};
+  bool host_protection_available = false;
+  rex::memory::PageAccess host_protection = rex::memory::PageAccess::kNoAccess;
+  bool write_watch_known = false;
+  bool write_watched = false;
+};
+
+struct GuestMemoryProtectionSnapshot {
+  uint32_t requested_address = 0;
+  uint32_t physical_address = UINT32_MAX;
+  size_t host_page_size = 0;
+  std::array<GuestMemoryViewSnapshot, 5> views{};
+  size_t view_count = 0;
 };
 
 // Describes a single page in the page table.
@@ -321,6 +343,7 @@ class PhysicalHeap : public BaseHeap {
                         bool unwatch_exact_range, bool unprotect = true);
 
   uint32_t GetPhysicalAddress(uint32_t address) const;
+  bool IsAddressWriteWatched(uint32_t address) const;
 
  protected:
   bool IsHostPageWriteWatched(uint32_t host_page_number) const override;
@@ -412,6 +435,10 @@ class Memory {
   // Returns the guest physical address for the guest virtual address, or
   // UINT32_MAX if it can't be obtained.
   uint32_t GetPhysicalAddress(uint32_t address) const;
+
+  // Read-only metadata snapshot for diagnosing guest aliases and protections.
+  bool GetProtectionSnapshot(uint32_t guest_address, GuestMemoryProtectionSnapshot& snapshot) const;
+  bool LogProtectionSnapshot(uint32_t guest_address) const;
 
   // Zeros out a range of memory at the given guest address.
   void Zero(uint32_t address, uint32_t size);

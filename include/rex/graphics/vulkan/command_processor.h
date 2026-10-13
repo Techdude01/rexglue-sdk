@@ -538,6 +538,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;
+  uint32_t gpu_provenance_draw_index_ = 0;
   uint64_t frame_completed_ = 0;
   // Submission indices of frames that have already been submitted.
   uint64_t closed_frame_submissions_[kMaxFramesInFlight] = {};

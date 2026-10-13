@@ -462,6 +462,87 @@ uint32_t Memory::GetPhysicalAddress(uint32_t address) const {
   return static_cast<const PhysicalHeap*>(heap)->GetPhysicalAddress(address);
 }
 
+bool Memory::GetProtectionSnapshot(uint32_t guest_address,
+                                   GuestMemoryProtectionSnapshot& snapshot) const {
+  snapshot = {};
+  snapshot.requested_address = guest_address;
+  snapshot.host_page_size = rex::memory::page_size();
+  snapshot.physical_address = GetPhysicalAddress(guest_address);
+
+  auto add_view = [&](uint32_t address, bool physical_view) {
+    if (snapshot.view_count >= snapshot.views.size()) {
+      return;
+    }
+    for (size_t i = 0; i < snapshot.view_count; ++i) {
+      if (snapshot.views[i].guest_address == address) {
+        return;
+      }
+    }
+
+    GuestMemoryViewSnapshot& view = snapshot.views[snapshot.view_count++];
+    view.guest_address = address;
+    view.physical_address = physical_view ? address : GetPhysicalAddress(address);
+    const BaseHeap* const_heap = physical_view ? &heaps_.physical : LookupHeap(address);
+    if (!const_heap) {
+      return;
+    }
+    auto* heap = const_cast<BaseHeap*>(const_heap);
+    view.allocation_info_available = heap->QueryRegionInfo(address, &view.allocation);
+
+    uint8_t* host_address = physical_view ? TranslatePhysical(address) : TranslateVirtual(address);
+    view.host_address = reinterpret_cast<uintptr_t>(host_address);
+    size_t host_protection_length = 1;
+    view.host_protection_available =
+        host_address &&
+        memory::QueryProtect(host_address, host_protection_length, view.host_protection);
+    if (heap->heap_type() == HeapType::kGuestPhysical) {
+      const auto* physical_heap = static_cast<const PhysicalHeap*>(heap);
+      view.write_watch_known = true;
+      view.write_watched = physical_heap->IsAddressWriteWatched(address);
+    }
+  };
+
+  add_view(guest_address, false);
+  if (snapshot.physical_address == UINT32_MAX) {
+    return snapshot.view_count != 0;
+  }
+
+  add_view(snapshot.physical_address, true);
+  add_view(0xA0000000u + snapshot.physical_address, false);
+  add_view(0xC0000000u + snapshot.physical_address, false);
+  if (snapshot.physical_address >= 0x1000u) {
+    add_view(0xE0000000u + snapshot.physical_address - 0x1000u, false);
+  }
+  return snapshot.view_count != 0;
+}
+
+bool Memory::LogProtectionSnapshot(uint32_t guest_address) const {
+  GuestMemoryProtectionSnapshot snapshot;
+  if (!GetProtectionSnapshot(guest_address, snapshot)) {
+    REXSYS_WARN("Memory snapshot: no mapped heap for guest address 0x{:08X}", guest_address);
+    return false;
+  }
+  REXSYS_INFO("Memory snapshot: guest=0x{:08X} physical=0x{:08X} host_page_size={} views={}",
+              snapshot.requested_address, snapshot.physical_address, snapshot.host_page_size,
+              snapshot.view_count);
+  for (size_t i = 0; i < snapshot.view_count; ++i) {
+    const GuestMemoryViewSnapshot& view = snapshot.views[i];
+    REXSYS_INFO(
+        "Memory snapshot view: guest=0x{:08X} physical=0x{:08X} host=0x{:016X} "
+        "allocation={} base=0x{:08X} allocation_base=0x{:08X} allocation_size=0x{:X} "
+        "region_size=0x{:X} state=0x{:X} allocation_protect=0x{:X} guest_protect=0x{:X} "
+        "host_protect={} "
+        "write_watch={}",
+        view.guest_address, view.physical_address, view.host_address,
+        view.allocation_info_available, view.allocation.base_address,
+        view.allocation.allocation_base, view.allocation.allocation_size,
+        view.allocation.region_size, view.allocation.state, view.allocation.allocation_protect,
+        view.allocation.protect, view.host_protection_available ? int(view.host_protection) : -1,
+        view.write_watch_known ? (view.write_watched ? "armed" : "clear") : "n/a");
+  }
+  return true;
+}
+
 void Memory::Zero(uint32_t address, uint32_t size) {
   std::memset(TranslateVirtual(address), 0, size);
 }
@@ -2345,6 +2426,15 @@ bool PhysicalHeap::IsHostPageWriteWatched(uint32_t host_page_number) const {
   }
   return (system_page_flags_[host_page_number >> 6].notify_on_invalidation &
           (uint64_t(1) << (host_page_number & 63))) != 0;
+}
+
+bool PhysicalHeap::IsAddressWriteWatched(uint32_t address) const {
+  if (address < heap_base_ || address - heap_base_ >= heap_size_) {
+    return false;
+  }
+  uint64_t host_offset = uint64_t(address - heap_base_) + host_address_offset_;
+  uint32_t host_page_number = uint32_t(host_offset / memory_->system_page_size_);
+  return IsHostPageWriteWatched(host_page_number);
 }
 
 uint32_t PhysicalHeap::GetPhysicalAddress(uint32_t address) const {

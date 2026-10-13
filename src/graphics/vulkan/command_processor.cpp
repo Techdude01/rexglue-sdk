@@ -69,9 +69,49 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(
+    gpu_provenance_frame, 0, "GPU/Vulkan",
+    "Trace this guest frame through draws, resolve, slot-0 swap, and output capture; "
+    "0 disables tracing")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::vulkan {
 
 namespace {
+
+bool IsGpuProvenanceFrame(uint64_t frame) {
+  int32_t selected_frame = REXCVAR_GET(gpu_provenance_frame);
+  return selected_frame > 0 && frame == uint64_t(selected_frame);
+}
+
+void LogGpuProvenanceOutput(uint64_t frame, const ui::RawImage& image) {
+  if (!image.width || !image.height || image.stride < size_t(image.width) * 4 ||
+      image.data.size() < image.stride * image.height) {
+    REXGPU_WARN("GPU provenance frame {} output capture has invalid dimensions/storage", frame);
+    return;
+  }
+  uint64_t nonblack_pixels = 0;
+  uint8_t minimum[3] = {UINT8_MAX, UINT8_MAX, UINT8_MAX};
+  uint8_t maximum[3] = {0, 0, 0};
+  for (uint32_t y = 0; y < image.height; ++y) {
+    const uint8_t* row = image.data.data() + size_t(y) * image.stride;
+    for (uint32_t x = 0; x < image.width; ++x) {
+      const uint8_t* pixel = row + size_t(x) * 4;
+      bool nonblack = false;
+      for (size_t channel = 0; channel < 3; ++channel) {
+        minimum[channel] = std::min(minimum[channel], pixel[channel]);
+        maximum[channel] = std::max(maximum[channel], pixel[channel]);
+        nonblack |= pixel[channel] != 0;
+      }
+      nonblack_pixels += nonblack;
+    }
+  }
+  REXGPU_INFO(
+      "GPU provenance frame {} captured guest output {}x{} nonblack_pixels={}/{} "
+      "rgb_min={},{},{} rgb_max={},{},{}",
+      frame, image.width, image.height, nonblack_pixels, uint64_t(image.width) * image.height,
+      minimum[0], minimum[1], minimum[2], maximum[0], maximum[1], maximum[2]);
+}
 
 // glslang default built-in resource limits.
 constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
@@ -2272,6 +2312,8 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  const uint64_t provenance_frame = frame_current_;
+  const bool provenance_frame_selected = IsGpuProvenanceFrame(provenance_frame);
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -2293,6 +2335,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                             frame_used_async_placeholder_pipeline_;
   if (skip_present_due_async_placeholder) {
+    if (provenance_frame_selected) {
+      REXGPU_INFO("GPU provenance frame {} status=skipped_async_placeholder", provenance_frame);
+    }
     static bool skipped_incomplete_frame_logged = false;
     if (!skipped_incomplete_frame_logged) {
       skipped_incomplete_frame_logged = true;
@@ -2312,10 +2357,16 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   uint32_t frontbuffer_width_unscaled = 0, frontbuffer_height_unscaled = 0;
   xenos::TextureFormat frontbuffer_format;
   bool swap_source_needs_rb_swap = false;
+  uint32_t swap_source_guest_base = UINT32_MAX;
   VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
       frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
-      &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
+      &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap,
+      &swap_source_guest_base);
   if (swap_texture_view == VK_NULL_HANDLE) {
+    if (provenance_frame_selected) {
+      REXGPU_INFO("GPU provenance frame {} slot0_guest_base=0x{:08X} status=no_swap_source",
+                  provenance_frame, swap_source_guest_base);
+    }
     REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
     return;
   }
@@ -2408,7 +2459,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
-  presenter->RefreshGuestOutput(
+  bool guest_output_refreshed = presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
        swap_post_effect,
@@ -2923,6 +2974,23 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         EndSubmission(true);
         return true;
       });
+
+  if (provenance_frame_selected) {
+    REXGPU_INFO(
+        "GPU provenance frame {} swap slot0_guest_base=0x{:08X} frontbuffer_ptr=0x{:08X} "
+        "image_view={:p} size={}x{} format={} output_refreshed={}",
+        provenance_frame, swap_source_guest_base, frontbuffer_ptr,
+        static_cast<void*>(swap_texture_view), frontbuffer_width_scaled, frontbuffer_height_scaled,
+        uint32_t(frontbuffer_format), guest_output_refreshed);
+    if (guest_output_refreshed) {
+      ui::RawImage captured_output;
+      if (presenter->CaptureGuestOutput(captured_output)) {
+        LogGpuProvenanceOutput(provenance_frame, captured_output);
+      } else {
+        REXGPU_WARN("GPU provenance frame {} guest output capture failed", provenance_frame);
+      }
+    }
+  }
 
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
@@ -3596,6 +3664,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   const RegisterFile& regs = *register_file_;
   (void)index_buffer_info;
+  uint32_t provenance_draw_id = 0;
   auto draw_fail = [&](const char* stage) {
     auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
     REXGPU_ERROR(
@@ -3607,6 +3676,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         uint32_t(regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select),
         uint32_t(regs.Get<reg::VGT_HOS_CNTL>().tess_mode),
         uint32_t(regs.Get<reg::RB_MODECONTROL>().edram_mode));
+    if (provenance_draw_id) {
+      REXGPU_INFO("GPU provenance frame {} draw {} status=failed stage={}", frame_current_,
+                  provenance_draw_id, stage);
+    }
     return false;
   };
 
@@ -3614,6 +3687,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
     return IssueCopy();
+  }
+
+  if (IsGpuProvenanceFrame(frame_current_)) {
+    provenance_draw_id = ++gpu_provenance_draw_index_;
   }
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
@@ -3844,6 +3921,42 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     return draw_fail("render_target_update");
   }
 
+  if (provenance_draw_id) {
+    uint32_t depth_and_color_formats = 0;
+    bool host_render_targets =
+        render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
+    uint32_t bound_targets =
+        host_render_targets
+            ? render_target_cache_->GetLastUpdateBoundRenderTargets(&depth_and_color_formats)
+            : render_target_cache_->last_update_render_pass_key().depth_and_color_used;
+    auto render_pass_key = render_target_cache_->last_update_render_pass_key();
+    REXGPU_INFO(
+        "GPU provenance frame {} draw {} targets path={} mask=0x{:X} formats=0x{:X} "
+        "render_pass_key=0x{:X} framebuffer={:p} edram_buffer={:p}",
+        frame_current_, provenance_draw_id, host_render_targets ? "host" : "fsi", bound_targets,
+        depth_and_color_formats, render_pass_key.key,
+        static_cast<const void*>(render_target_cache_->last_update_framebuffer()),
+        static_cast<void*>(render_target_cache_->edram_buffer()));
+    if (host_render_targets) {
+      VkRenderingAttachmentInfo colors[xenos::kMaxColorRenderTargets]{};
+      VkRenderingAttachmentInfo depth{};
+      VkRenderingAttachmentInfo stencil{};
+      uint32_t color_count = 0;
+      render_target_cache_->GetLastUpdateRenderingAttachments(colors, &color_count, &depth,
+                                                              &stencil);
+      for (uint32_t i = 0; i < color_count; ++i) {
+        if (colors[i].imageView != VK_NULL_HANDLE) {
+          REXGPU_INFO("GPU provenance frame {} draw {} color{} image_view={:p}", frame_current_,
+                      provenance_draw_id, i, static_cast<void*>(colors[i].imageView));
+        }
+      }
+      if (depth.imageView != VK_NULL_HANDLE) {
+        REXGPU_INFO("GPU provenance frame {} draw {} depth image_view={:p}", frame_current_,
+                    provenance_draw_id, static_cast<void*>(depth.imageView));
+      }
+    }
+  }
+
   // Create the pipeline (for this, need the render pass from the render target
   // cache), translating the shaders - doing this now to obtain the used
   // textures.
@@ -3863,6 +3976,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                                 &pipeline_is_placeholder);
   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
     frame_used_async_placeholder_pipeline_ = true;
+    if (provenance_draw_id) {
+      REXGPU_INFO("GPU provenance frame {} draw {} status=async_placeholder_not_executed",
+                  frame_current_, provenance_draw_id);
+    }
     return true;
   }
   if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
@@ -4181,6 +4298,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
 
+  if (provenance_draw_id) {
+    REXGPU_INFO("GPU provenance frame {} draw {} status=commands_recorded", frame_current_,
+                provenance_draw_id);
+  }
   return true;
 }
 
@@ -4392,9 +4513,16 @@ bool VulkanCommandProcessor::IssueCopy() {
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
-    uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    uint32_t written_address = 0, written_length = 0;
+    bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                                  written_address, written_length);
+    if (IsGpuProvenanceFrame(frame_current_)) {
+      REXGPU_INFO(
+          "GPU provenance frame {} resolve success={} physical_destination=0x{:08X} "
+          "length=0x{:X}",
+          frame_current_, resolved, written_address, written_length);
+    }
+    return resolved;
   }
 
   return IssueCopy_ReadbackResolvePath();
@@ -4405,10 +4533,19 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
-  uint32_t written_address, written_length;
+  uint32_t written_address = 0, written_length = 0;
   if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
                                      written_length)) {
+    if (IsGpuProvenanceFrame(frame_current_)) {
+      REXGPU_INFO("GPU provenance frame {} resolve success=false", frame_current_);
+    }
     return false;
+  }
+  if (IsGpuProvenanceFrame(frame_current_)) {
+    REXGPU_INFO(
+        "GPU provenance frame {} resolve success=true physical_destination=0x{:08X} "
+        "length=0x{:X}",
+        frame_current_, written_address, written_length);
   }
 
   if (!written_length) {
@@ -5165,6 +5302,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   if (is_opening_frame) {
     frame_open_ = true;
     frame_used_async_placeholder_pipeline_ = false;
+    if (IsGpuProvenanceFrame(frame_current_)) {
+      gpu_provenance_draw_index_ = 0;
+    }
 
     // Reset bindings that depend on transient data.
     std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));

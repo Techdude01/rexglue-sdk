@@ -1,0 +1,36 @@
+#!/bin/sh
+# Read-only allocation, alias, host protection, and watch snapshot.
+# Usage: tools/memory-snapshot <pid> <guest-address>
+set -u
+
+PID="${1:-}"
+ADDRESS="${2:-}"
+ADDRESS="${ADDRESS#0x}"
+ADDRESS="${ADDRESS#0X}"
+case "$PID" in
+  ''|*[!0-9]*) echo "usage: memory-snapshot <pid> <guest-address>" >&2; exit 2 ;;
+esac
+if [ "$PID" -eq 0 ]; then
+  echo "pid must be greater than zero" >&2
+  exit 2
+fi
+case "$ADDRESS" in
+  ''|*[!0-9a-fA-F]*) echo "guest address must be hexadecimal" >&2; exit 2 ;;
+esac
+if [ "${#ADDRESS}" -gt 8 ]; then
+  echo "guest address must fit in 32 bits" >&2
+  exit 2
+fi
+
+echo "pid: $PID  guest: 0x$ADDRESS (process pauses during snapshot)"
+set +e
+lldb --batch -p "$PID" \
+  -o "expression -- (void)rex::Runtime::instance()->memory()->LogProtectionSnapshot(static_cast<uint32_t>(0x$ADDRESS))" \
+  -o "detach"
+STATUS=$?
+kill -CONT "$PID" 2>/dev/null
+if [ "$STATUS" -ne 0 ]; then
+  echo "LLDB snapshot failed (sent SIGCONT if the process remained stopped)" >&2
+  exit "$STATUS"
+fi
+echo "(sent SIGCONT to $PID)"

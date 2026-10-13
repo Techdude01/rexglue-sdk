@@ -649,6 +649,34 @@ TEST_CASE("TranslatePhysical masks to 29 bits", "[memory][translation]") {
   CHECK(ptr_low == ptr_high);
 }
 
+TEST_CASE("Protection snapshot reports physical aliases", "[memory][protection]") {
+  auto& memory = GetTestMemory();
+  auto* heap = MutableHeap(memory.LookupHeap(0xA0000000));
+  REQUIRE(heap != nullptr);
+
+  uint32_t address = 0;
+  REQUIRE(heap->Alloc(
+      4096, 4096, rex::memory::kMemoryAllocationReserve | rex::memory::kMemoryAllocationCommit,
+      rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite, false, &address));
+
+  rex::memory::GuestMemoryProtectionSnapshot snapshot;
+  REQUIRE(memory.GetProtectionSnapshot(address, snapshot));
+  CHECK(snapshot.requested_address == address);
+  CHECK(snapshot.physical_address != UINT32_MAX);
+  CHECK(snapshot.host_page_size >= 4096);
+  CHECK(snapshot.view_count >= 3);
+  CHECK(snapshot.view_count <= 4);
+  CHECK(snapshot.views[0].guest_address == address);
+  CHECK(snapshot.views[0].allocation_info_available);
+  CHECK((snapshot.views[0].allocation.state & rex::memory::kMemoryAllocationCommit) != 0);
+  CHECK(snapshot.views[0].host_address != 0);
+  CHECK(snapshot.views[0].host_protection_available);
+  CHECK(snapshot.views[0].write_watch_known);
+  CHECK(snapshot.views[1].guest_address == snapshot.physical_address);
+
+  REQUIRE(heap->Release(address, nullptr));
+}
+
 // =============================================================================
 // Physical Heap Tests
 // =============================================================================

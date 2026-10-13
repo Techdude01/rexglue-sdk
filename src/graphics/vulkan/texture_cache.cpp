@@ -980,12 +980,13 @@ uint64_t VulkanTextureCache::GetSubmissionToAwaitOnSamplerOverflow(
   return sampler_used->second.last_usage_submission;
 }
 
-VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
-                                                   uint32_t& height_scaled_out,
-                                                   xenos::TextureFormat& format_out,
-                                                   uint32_t* width_unscaled_out,
-                                                   uint32_t* height_unscaled_out,
-                                                   bool* swap_source_needs_rb_swap_out) {
+VkImageView VulkanTextureCache::RequestSwapTexture(
+    uint32_t& width_scaled_out, uint32_t& height_scaled_out, xenos::TextureFormat& format_out,
+    uint32_t* width_unscaled_out, uint32_t* height_unscaled_out,
+    bool* swap_source_needs_rb_swap_out, uint32_t* guest_base_address_out) {
+  if (guest_base_address_out) {
+    *guest_base_address_out = UINT32_MAX;
+  }
   const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(0);
   TextureKey key;
@@ -996,6 +997,9 @@ VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
   VulkanTexture* texture = static_cast<VulkanTexture*>(FindOrCreateTexture(key));
   if (!texture) {
     return VK_NULL_HANDLE;
+  }
+  if (guest_base_address_out) {
+    *guest_base_address_out = key.base_page << 12;
   }
   uint32_t host_swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(key));
   if (swap_source_needs_rb_swap_out) {
