@@ -44,18 +44,28 @@ bool ParseSequence(std::string_view text, std::vector<StartupInputDriver::Pulse>
     std::transform(button.begin(), button.end(), button.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     uint16_t mask = 0;
+    int16_t thumb_lx = 0, thumb_ly = 0;
     if (button == "a")
       mask = X_INPUT_GAMEPAD_A;
     else if (button == "start")
       mask = X_INPUT_GAMEPAD_START;
+    else if (button == "up")
+      thumb_ly = 24576;
+    else if (button == "down")
+      thumb_ly = -24576;
+    else if (button == "left")
+      thumb_lx = -24576;
+    else if (button == "right")
+      thumb_lx = 24576;
     else
       return false;
     uint32_t first = 0, count = 0;
     if (!ParseNumber(item.substr(at + 1, colon - at - 1), first) ||
-        !ParseNumber(item.substr(colon + 1), count) || count == 0 || count > 4) {
+        !ParseNumber(item.substr(colon + 1), count) || count == 0 ||
+        (mask ? count > 4 : count > 60)) {
       return false;
     }
-    pulses.push_back({first, count, mask});
+    pulses.push_back({first, count, mask, thumb_lx, thumb_ly});
     if (pulses.size() > 8)
       return false;
     if (comma == std::string_view::npos)
@@ -71,7 +81,7 @@ StartupInputDriver::StartupInputDriver(std::string sequence, uint32_t cutoff_pol
   if (!ParseSequence(sequence, pulses_)) {
     pulses_.clear();
     REXLOG_ERROR(
-        "Startup input disabled: invalid sequence '{}'; expected a@poll:1-4[,start@poll:1-4]",
+        "Startup input disabled: invalid sequence (buttons a/start: 1-4 polls; stick directions up/down/left/right: 1-60 polls): '{}'",
         sequence);
   }
   std::stable_sort(pulses_.begin(), pulses_.end(),
@@ -96,18 +106,24 @@ X_RESULT StartupInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_stat
     return X_ERROR_DEVICE_NOT_CONNECTED;
   ++poll_count_;
   uint16_t buttons = 0;
+  int16_t thumb_lx = 0, thumb_ly = 0;
   if (poll_count_ <= cutoff_poll_) {
     for (const Pulse& pulse : pulses_) {
       if (poll_count_ >= pulse.first_poll && poll_count_ - pulse.first_poll < pulse.poll_count) {
         buttons |= pulse.button;
+        thumb_lx = pulse.thumb_lx;
+        thumb_ly = pulse.thumb_ly;
       }
     }
   }
-  if (buttons != last_buttons_) {
+  if (buttons != last_buttons_ || thumb_lx != last_thumb_lx_ || thumb_ly != last_thumb_ly_) {
     ++packet_number_;
-    REXLOG_INFO("Startup input XInput poll {}: buttons=0x{:04X}{}", poll_count_, buttons,
-                buttons ? " pressed" : " released");
+    REXLOG_INFO("Startup input XInput poll {}: buttons=0x{:04X} thumb_lx={} thumb_ly={}{}",
+                poll_count_, buttons, thumb_lx, thumb_ly,
+                buttons || thumb_lx || thumb_ly ? " active" : " released");
     last_buttons_ = buttons;
+    last_thumb_lx_ = thumb_lx;
+    last_thumb_ly_ = thumb_ly;
   }
   const uint16_t changed = buttons ^ state_buttons_;
   for (const auto [mask, key] :
@@ -127,6 +143,8 @@ X_RESULT StartupInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_stat
     std::memset(out_state, 0, sizeof(*out_state));
     out_state->packet_number = packet_number_;
     out_state->gamepad.buttons = buttons;
+    out_state->gamepad.thumb_lx = thumb_lx;
+    out_state->gamepad.thumb_ly = thumb_ly;
   }
   return X_ERROR_SUCCESS;
 }
@@ -140,6 +158,8 @@ X_RESULT StartupInputDriver::GetDeviceCapabilities(DeviceId id, uint32_t,
     out_caps->type = XINPUT_DEVTYPE_GAMEPAD;
     out_caps->sub_type = 0x01;
     out_caps->gamepad.buttons = X_INPUT_GAMEPAD_A | X_INPUT_GAMEPAD_START;
+    out_caps->gamepad.thumb_lx = static_cast<int16_t>(0x7FFF);
+    out_caps->gamepad.thumb_ly = static_cast<int16_t>(0x7FFF);
   }
   return X_ERROR_SUCCESS;
 }

@@ -32,7 +32,7 @@ REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-thro
 REXCVAR_DEFINE_BOOL(test_startup_input, false, "Input/Test",
                     "Enable bounded synthetic startup input for automated runs");
 REXCVAR_DEFINE_STRING(startup_input_sequence, "a@180:2", "Input/Test",
-                      "Synthetic button pulses as button@poll:duration (a or start), comma-separated");
+                      "Synthetic button or stick pulses as input@poll:duration, comma-separated");
 REXCVAR_DEFINE_UINT32(startup_input_cutoff_poll, 240, "Input/Test",
                       "Stop synthetic startup input after this guest XInput poll count");
 namespace rex::input {
