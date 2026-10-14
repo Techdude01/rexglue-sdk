@@ -36,6 +36,7 @@
 #include <rex/graphics/pipeline_util.h>
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -977,6 +978,17 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
                               regs.Get<reg::SQ_INTERPOLATOR_CNTL>().sampling_pattern);
   modification.pixel.alpha_to_mask_enable =
       regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable;
+
+  const std::vector<Shader::TextureBinding>& texture_bindings = shader.texture_bindings();
+  if (!texture_bindings.empty()) {
+    modification.pixel.texture_signs_all_unsigned = 1;
+    for (const Shader::TextureBinding& binding : texture_bindings) {
+      if (texture_util::SwizzleSigns(regs.GetTextureFetch(binding.fetch_constant)) != 0) {
+        modification.pixel.texture_signs_all_unsigned = 0;
+        break;
+      }
+    }
+  }
 
   if (param_gen_pos < xenos::kMaxInterpolators) {
     modification.pixel.param_gen_enable = 1;

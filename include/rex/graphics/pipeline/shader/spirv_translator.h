@@ -33,7 +33,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 13;
+    static constexpr uint32_t kVersion = 14;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -90,6 +90,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t alpha_to_mask_enable : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // All texture fetch constants used by this shader select unsigned data.
+      uint32_t texture_signs_all_unsigned : 1;
     } pixel;
     uint64_t value = 0;
 
