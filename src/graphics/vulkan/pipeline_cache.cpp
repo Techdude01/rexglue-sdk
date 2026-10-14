@@ -975,6 +975,8 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
                               regs.Get<reg::RB_SURFACE_INFO>().msaa_samples,
                               regs.Get<reg::SQ_CONTEXT_MISC>().sc_sample_cntl,
                               regs.Get<reg::SQ_INTERPOLATOR_CNTL>().sampling_pattern);
+  modification.pixel.alpha_to_mask_enable =
+      regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable;
 
   if (param_gen_pos < xenos::kMaxInterpolators) {
     modification.pixel.param_gen_enable = 1;

@@ -33,7 +33,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 12;
+    static constexpr uint32_t kVersion = 13;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -86,6 +86,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // must not be set for other primitive types - enables the point sprite
       // coordinates input, and also effects the flag bits in PsParamGen.
       uint32_t param_gen_point : 1;
+      // Whether alpha-to-coverage can affect the fragment sample mask.
+      uint32_t alpha_to_mask_enable : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
     } pixel;
