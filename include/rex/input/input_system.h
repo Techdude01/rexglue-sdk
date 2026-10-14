@@ -65,6 +65,7 @@ class InputSystem : public system::IInputSystem {
   // does not renumber pad two.
   std::vector<DeviceInfo> devices_;
   std::vector<InputDriver*> device_owners_;
+  uint16_t last_test_guest_buttons_ = 0;
 };
 
 /// Create a default InputSystem with SDL + NOP drivers.

@@ -20,6 +20,7 @@
 #include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
 #include <rex/input/sdl/sdl_input_driver.h>
+#include <rex/input/startup/startup_input_driver.h>
 #include <rex/input/state_merge.h>
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
@@ -28,6 +29,12 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+REXCVAR_DEFINE_BOOL(test_startup_input, false, "Input/Test",
+                    "Enable bounded synthetic startup input for automated runs");
+REXCVAR_DEFINE_STRING(startup_input_sequence, "a@180:2", "Input/Test",
+                      "Synthetic button pulses as button@poll:duration (a or start), comma-separated");
+REXCVAR_DEFINE_UINT32(startup_input_cutoff_poll, 240, "Input/Test",
+                      "Stop synthetic startup input after this guest XInput poll count");
 namespace rex::input {
 
 namespace {
@@ -224,6 +231,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
 
   X_INPUT_STATE merged = {};
   bool any = false;
+  bool test_controller_connected = false;
   for (DeviceId id : ids) {
     auto* driver = DriverForDevice(id);
     if (!driver) {
@@ -233,6 +241,8 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     if (driver->GetDeviceState(id, &state) != X_ERROR_SUCCESS) {
       continue;
     }
+    const DeviceInfo* info = DeviceInfoFor(id);
+    test_controller_connected |= info && info->name == "Test startup controller";
     active_devices_.Observe(user_index, id, state.gamepad);
     if (!any) {
       merged = state;
@@ -247,6 +257,14 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   }
   if (out_state) {
     *out_state = merged;
+    if (test_controller_connected) {
+      const uint16_t buttons = static_cast<uint16_t>(merged.gamepad.buttons);
+      if (buttons != last_test_guest_buttons_) {
+        REXLOG_INFO("Startup input guest XInput response user={} buttons=0x{:04X}", user_index,
+                    buttons);
+        last_test_guest_buttons_ = buttons;
+      }
+    }
   }
   return X_ERROR_SUCCESS;
 }
@@ -325,6 +343,13 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
   auto input = std::make_unique<InputSystem>(nullptr);
 
   if (!tool_mode) {
+    if (REXCVAR_GET(test_startup_input)) {
+      auto startup_driver = std::make_unique<startup::StartupInputDriver>(
+          REXCVAR_GET(startup_input_sequence), REXCVAR_GET(startup_input_cutoff_poll));
+      if (startup_driver->Setup() == X_STATUS_SUCCESS) {
+        input->AddDriver(std::move(startup_driver));
+      }
+    }
 #if REX_PLATFORM_WIN32
     if (REXCVAR_GET(input_backend) == "xinput") {
       auto xinput_driver = std::make_unique<xinput::XinputInputDriver>(nullptr, 0);

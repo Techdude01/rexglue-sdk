@@ -3,6 +3,7 @@
 
 add_library(rexinput OBJECT
     input_system.cpp
+    startup/startup_input_driver.cpp
     device_assignment.cpp
     state_merge.cpp
     mnk/mnk_input_driver.cpp
