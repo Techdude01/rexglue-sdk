@@ -3163,9 +3163,16 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   bool use_dynamic_rendering =
       REXCVAR_GET(vulkan_dynamic_rendering) && vulkan_device->properties().dynamicRendering;
 
+  reg::RB_DEPTHCONTROL normalized_depth_control =
+      draw_util::GetNormalizedDepthControl(*register_file_);
+  bool needs_stencil =
+      (render_target_cache_->last_update_render_pass_key().depth_and_color_used & 0b1) &&
+      normalized_depth_control.stencil_enable;
+
   if (use_dynamic_rendering) {
     if (in_render_pass_ && current_framebuffer_ == framebuffer &&
-        current_render_pass_ == VK_NULL_HANDLE) {
+        current_render_pass_ == VK_NULL_HANDLE &&
+        current_dynamic_rendering_has_stencil_ == needs_stencil) {
       return;
     }
   } else {
@@ -3195,6 +3202,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
         color_attachments, &color_attachment_count, &depth_attachment, &stencil_attachment);
     bool has_depth = depth_attachment.sType == VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     bool has_stencil = stencil_attachment.sType == VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    current_dynamic_rendering_has_stencil_ = has_stencil;
 
     VkRenderingInfo rendering_info = {};
     rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
@@ -3334,6 +3342,7 @@ void VulkanCommandProcessor::EndRenderPass() {
   current_render_pass_ = VK_NULL_HANDLE;
   current_framebuffer_ = nullptr;
   in_render_pass_ = false;
+  current_dynamic_rendering_has_stencil_ = false;
 }
 
 VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(

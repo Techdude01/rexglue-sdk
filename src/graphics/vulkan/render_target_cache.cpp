@@ -1526,7 +1526,6 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
     const auto* vulkan_rt = static_cast<const VulkanRenderTarget*>(rts[0]);
     depth_attachment->sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     depth_attachment->pNext = nullptr;
-    depth_attachment->imageView = vulkan_rt->view_depth_stencil();
     depth_attachment->imageLayout = VulkanRenderTarget::kDepthDrawLayout;
     depth_attachment->resolveMode = VK_RESOLVE_MODE_NONE;
     depth_attachment->resolveImageView = VK_NULL_HANDLE;
@@ -1534,7 +1533,14 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
     depth_attachment->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     depth_attachment->storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     depth_attachment->clearValue = {};
-    *stencil_attachment = *depth_attachment;
+
+    auto depth_control = draw_util::GetNormalizedDepthControl(register_file());
+    if (depth_control.stencil_enable) {
+      depth_attachment->imageView = vulkan_rt->view_depth_stencil();
+      *stencil_attachment = *depth_attachment;
+    } else {
+      depth_attachment->imageView = vulkan_rt->view_depth_color();
+    }
   }
 
   uint32_t color_attachment_count = 0;
