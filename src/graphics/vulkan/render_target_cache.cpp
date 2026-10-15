@@ -5983,45 +5983,12 @@ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInf
   ++direct_resolve_attempt_count_;
   (void)copy_shader;
   (void)draw_resolution_scaled;
-  if (direct_resolve_pipeline_layout_color_ == VK_NULL_HANDLE ||
-      direct_resolve_pipeline_layout_depth_ == VK_NULL_HANDLE) {
-    return false;
-  }
 
   uint32_t dump_base;
   uint32_t dump_row_length_used;
   uint32_t dump_rows;
   uint32_t dump_pitch;
   resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
-  GetResolveCopyDispatchesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
-                                 dump_rectangles_, direct_resolve_dispatches_);
-  if (direct_resolve_dispatches_.empty()) {
-    return false;
-  }
-
-  for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
-    const auto* render_target = static_cast<const VulkanRenderTarget*>(rectangle.render_target);
-    if (render_target == nullptr) {
-      return false;
-    }
-    DumpPipelineKey dump_pipeline_key;
-    dump_pipeline_key.msaa_samples = render_target->key().msaa_samples;
-    dump_pipeline_key.resource_format = render_target->key().resource_format;
-    dump_pipeline_key.is_depth = render_target->key().is_depth;
-    if (GetDumpPipeline(dump_pipeline_key) == VK_NULL_HANDLE) {
-      return false;
-    }
-    DirectResolvePipelineKey direct_pipeline_key;
-    direct_pipeline_key.dump_pipeline_key = dump_pipeline_key;
-    direct_pipeline_key.copy_shader = copy_shader;
-    direct_pipeline_key.draw_resolution_scaled = draw_resolution_scaled;
-    if (GetDirectResolvePipeline(direct_pipeline_key) == VK_NULL_HANDLE) {
-      return false;
-    }
-  }
-
-  // Dedicated direct resolve dispatches are staged behind the same preflight;
-  // keep using the existing dump path until source-image direct shaders land.
   return DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch);
 }
 
@@ -6069,6 +6036,11 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
 
   // Sort the invocations to reduce context and binding switches.
   std::sort(dump_invocations_.begin(), dump_invocations_.end());
+
+  // Submit all accumulated barriers for the source render target images and EDRAM
+  // buffer once before compute dispatches. This transitions all source render target
+  // images to SHADER_READ_ONLY_OPTIMAL and ends any active rasterization render pass.
+  command_processor_.SubmitBarriers(true);
 
   // Dump the render targets.
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
@@ -6141,7 +6113,6 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
                                           sizeof(uint32_t) * kDumpPushConstantOffsets,
                                           sizeof(last_offsets), &last_offsets);
       }
-      command_processor_.SubmitBarriers(true);
       command_buffer.CmdVkDispatch(
           (draw_resolution_scale_x() *
                (xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp())) *
