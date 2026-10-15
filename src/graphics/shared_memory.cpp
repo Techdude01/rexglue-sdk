@@ -30,6 +30,30 @@ SharedMemory::~SharedMemory() {
   ShutdownCommon();
 }
 
+void SharedMemory::LogGuestMemoryByteComparison(uint32_t physical_address,
+                                                uint32_t virtual_address,
+                                                uint32_t length) const {
+  const uint8_t* physical_data = memory_.TranslatePhysical<const uint8_t*>(physical_address);
+  const uint8_t* virtual_data = memory_.TranslateVirtual<const uint8_t*>(virtual_address);
+  uint32_t physical_nonzero_bytes = 0;
+  uint32_t virtual_nonzero_bytes = 0;
+  uint32_t differing_bytes = 0;
+  for (uint32_t i = 0; i < length; ++i) {
+    physical_nonzero_bytes += physical_data[i] != 0;
+    virtual_nonzero_bytes += virtual_data[i] != 0;
+    differing_bytes += physical_data[i] != virtual_data[i];
+  }
+  REXGPU_INFO(
+      "Guest memory sample physical=0x{:08X} virtual=0x{:08X} length=0x{:X}: "
+      "physical_nonzero={} virtual_nonzero={} differing={}",
+      physical_address, virtual_address, length, physical_nonzero_bytes,
+      virtual_nonzero_bytes, differing_bytes);
+}
+
+void SharedMemory::LogGuestMemoryProtectionSnapshot(uint32_t guest_address) const {
+  memory_.LogProtectionSnapshot(guest_address);
+}
+
 void SharedMemory::InitializeCommon() {
   num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
   system_page_flags_valid_.assign(num_system_page_flags_, 0);

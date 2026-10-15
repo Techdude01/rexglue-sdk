@@ -94,6 +94,9 @@ class SharedMemory {
   // the pages they touch, the CPU data is properly loaded to the unmodified
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
+  void LogGuestMemoryByteComparison(uint32_t physical_address, uint32_t virtual_address,
+                                    uint32_t length) const;
+  void LogGuestMemoryProtectionSnapshot(uint32_t guest_address) const;
 
   memory::Memory& memory() const { return memory_; }
 
