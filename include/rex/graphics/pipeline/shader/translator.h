@@ -130,6 +130,8 @@ class ShaderTranslator {
   // inactive.
   virtual void ProcessAluInstruction(const ParsedAluInstruction& /*instr*/,
                                      uint8_t /*memexport_eM_potentially_written_before*/) {}
+  // Handles post-processing after an instruction has been translated.
+  virtual void PostProcessInstruction(uint32_t /*instr_offset*/) {}
 
  private:
   void TranslateControlFlowInstruction(const ucode::ControlFlowInstruction& cf);

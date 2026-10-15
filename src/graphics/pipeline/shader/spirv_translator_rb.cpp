@@ -16,6 +16,7 @@
 #include <SPIRV/GLSL.std.450.h>
 
 #include <rex/assert.h>
+#include <rex/logging.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/util/draw.h>
@@ -394,6 +395,132 @@ spv::Id SpirvShaderTranslator::Depth20e4To32(SpirvBuilder& builder, spv::Id f24_
   return f32;
 }
 
+void SpirvShaderTranslator::EmitAlphaTestKill() {
+  EnsureBuildPointAvailable();
+
+  // Alpha test.
+  // Extract the comparison function (less, equal, greater bits).
+  spv::Id alpha_test_function = builder_->createTriOp(
+      spv::OpBitFieldUExtract, type_uint_, main_system_constant_flags_,
+      builder_->makeUintConstant(kSysFlag_AlphaPassIfLess_Shift), builder_->makeUintConstant(3));
+  // Check if the comparison function is not "always" - that should pass even
+  // for NaN likely, unlike "less, equal or greater".
+  SpirvBuilder::IfBuilder if_alpha_test_function_is_non_always(
+      builder_->createBinOp(
+          spv::OpINotEqual, type_bool_, alpha_test_function,
+          builder_->makeUintConstant(uint32_t(xenos::CompareFunction::kAlways))),
+      spv::SelectionControlDontFlattenMask, *builder_);
+  {
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(3));
+    spv::Id alpha_test_alpha = builder_->createLoad(
+        builder_->createAccessChain(edram_fragment_shader_interlock_ ? spv::StorageClassFunction
+                                                                     : spv::StorageClassOutput,
+                                    output_or_var_fragment_data_[0], id_vector_temp_),
+        spv::NoPrecision);
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantAlphaTestReference));
+    spv::Id alpha_test_reference = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                    id_vector_temp_),
+        spv::NoPrecision);
+    // The comparison function is not "always" - perform the alpha test.
+    SpirvBuilder::IfBuilder if_alpha_test_function_is_not_equal(
+        builder_->createBinOp(
+            spv::OpIEqual, type_bool_, alpha_test_function,
+            builder_->makeUintConstant(uint32_t(xenos::CompareFunction::kNotEqual))),
+        spv::SelectionControlDontFlattenMask, *builder_, 1, 2);
+    spv::Id alpha_test_result_not_equal;
+    {
+      // "Not equal" function.
+      alpha_test_result_not_equal = builder_->createBinOp(spv::OpFUnordNotEqual, type_bool_,
+                                                          alpha_test_alpha, alpha_test_reference);
+    }
+    if_alpha_test_function_is_not_equal.makeBeginElse();
+    spv::Id alpha_test_result_non_not_equal;
+    {
+      // Function other than "not equal".
+      static const spv::Op kAlphaTestOps[] = {spv::OpFOrdLessThan, spv::OpFOrdEqual,
+                                              spv::OpFOrdGreaterThan};
+      for (uint32_t i = 0; i < 3; ++i) {
+        spv::Id alpha_test_comparison_result = builder_->createBinOp(
+            spv::OpLogicalAnd, type_bool_,
+            builder_->createBinOp(kAlphaTestOps[i], type_bool_, alpha_test_alpha,
+                                  alpha_test_reference),
+            builder_->createBinOp(
+                spv::OpINotEqual, type_bool_,
+                builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, alpha_test_function,
+                                      builder_->makeUintConstant(UINT32_C(1) << i)),
+                const_uint_0_));
+        if (i) {
+          alpha_test_result_non_not_equal =
+              builder_->createBinOp(spv::OpLogicalOr, type_bool_, alpha_test_result_non_not_equal,
+                                    alpha_test_comparison_result);
+        } else {
+          alpha_test_result_non_not_equal = alpha_test_comparison_result;
+        }
+      }
+    }
+    if_alpha_test_function_is_not_equal.makeEndIf();
+    spv::Id alpha_test_result = if_alpha_test_function_is_not_equal.createMergePhi(
+        alpha_test_result_not_equal, alpha_test_result_non_not_equal);
+
+    // Discard the pixel if the alpha test has failed.
+    SpirvBuilder::IfBuilder alpha_test_kill_if(
+        builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, alpha_test_result),
+        spv::SelectionControlDontFlattenMask, *builder_);
+    builder_->createNoResultOp(spv::OpKill);
+    alpha_test_kill_if.makeEndIf(false);
+  }
+  if_alpha_test_function_is_non_always.makeEndIf();
+}
+
+void SpirvShaderTranslator::PostProcessInstruction(uint32_t instr_offset) {
+  if (!is_pixel_shader()) {
+    return;
+  }
+  if (alpha_test_killed_emitted_) {
+    return;
+  }
+  if (edram_fragment_shader_interlock_) {
+    return;
+  }
+  const Shader& shader = current_shader();
+  if (shader.writes_depth() || shader.memexport_eM_written()) {
+    return;
+  }
+  if (!(shader.writes_color_targets() & 0b1)) {
+    return;
+  }
+  if (IsExecutionModeEarlyFragmentTests()) {
+    return;
+  }
+  // Check that this instruction wrote color 0 alpha and is the only write instruction in the shader.
+  if (shader.c0_alpha_write_count() != 1 || shader.c0_alpha_write_instr_offset() != instr_offset) {
+    return;
+  }
+  // Must have substantial remaining work in the shader to benefit from early kill hoisting.
+  if (instr_offset + 1 >= shader.total_instruction_count()) {
+    return;
+  }
+  // Must be under uniform control flow.
+  if (cf_exec_conditional_merge_ != nullptr ||
+      cf_instruction_predicate_merge_ != nullptr ||
+      main_loop_header_ != nullptr ||
+      main_switch_header_ != nullptr) {
+    return;
+  }
+
+  REXGPU_INFO(
+      "SpirvShaderTranslator: Hoisting early alpha-test OpKill in shader {:016X} "
+      "at instr {}/{} (saving up to {} subsequent instructions and fetches)",
+      shader.ucode_data_hash(), instr_offset, shader.total_instruction_count(),
+      shader.total_instruction_count() - 1 - instr_offset);
+
+  EmitAlphaTestKill();
+  alpha_test_killed_emitted_ = true;
+}
+
 void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
   // Loaded if needed.
   spv::Id msaa_samples = spv::NoResult;
@@ -488,104 +615,106 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
     }
 
     // Alpha test.
-    // TODO(Triang3l): Check how alpha test works with NaN on Direct3D 9.
-    // Extract the comparison function (less, equal, greater bits).
-    spv::Id alpha_test_function = builder_->createTriOp(
-        spv::OpBitFieldUExtract, type_uint_, main_system_constant_flags_,
-        builder_->makeUintConstant(kSysFlag_AlphaPassIfLess_Shift), builder_->makeUintConstant(3));
-    // Check if the comparison function is not "always" - that should pass even
-    // for NaN likely, unlike "less, equal or greater".
-    SpirvBuilder::IfBuilder if_alpha_test_function_is_non_always(
-        builder_->createBinOp(
-            spv::OpINotEqual, type_bool_, alpha_test_function,
-            builder_->makeUintConstant(uint32_t(xenos::CompareFunction::kAlways))),
-        spv::SelectionControlDontFlattenMask, *builder_);
-    {
-      id_vector_temp_.clear();
-      id_vector_temp_.push_back(builder_->makeIntConstant(3));
-      spv::Id alpha_test_alpha = builder_->createLoad(
-          builder_->createAccessChain(edram_fragment_shader_interlock_ ? spv::StorageClassFunction
-                                                                       : spv::StorageClassOutput,
-                                      output_or_var_fragment_data_[0], id_vector_temp_),
-          spv::NoPrecision);
-      id_vector_temp_.clear();
-      id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantAlphaTestReference));
-      spv::Id alpha_test_reference = builder_->createLoad(
-          builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                      id_vector_temp_),
-          spv::NoPrecision);
-      // The comparison function is not "always" - perform the alpha test.
-      // Handle "not equal" specially (specifically as "not equal" so it's true
-      // for NaN, not "less or greater" which is false for NaN).
-      SpirvBuilder::IfBuilder if_alpha_test_function_is_not_equal(
+    if (!alpha_test_killed_emitted_) {
+      // TODO(Triang3l): Check how alpha test works with NaN on Direct3D 9.
+      // Extract the comparison function (less, equal, greater bits).
+      spv::Id alpha_test_function = builder_->createTriOp(
+          spv::OpBitFieldUExtract, type_uint_, main_system_constant_flags_,
+          builder_->makeUintConstant(kSysFlag_AlphaPassIfLess_Shift), builder_->makeUintConstant(3));
+      // Check if the comparison function is not "always" - that should pass even
+      // for NaN likely, unlike "less, equal or greater".
+      SpirvBuilder::IfBuilder if_alpha_test_function_is_non_always(
           builder_->createBinOp(
-              spv::OpIEqual, type_bool_, alpha_test_function,
-              builder_->makeUintConstant(uint32_t(xenos::CompareFunction::kNotEqual))),
-          spv::SelectionControlDontFlattenMask, *builder_, 1, 2);
-      spv::Id alpha_test_result_not_equal;
+              spv::OpINotEqual, type_bool_, alpha_test_function,
+              builder_->makeUintConstant(uint32_t(xenos::CompareFunction::kAlways))),
+          spv::SelectionControlDontFlattenMask, *builder_);
       {
-        // "Not equal" function.
-        alpha_test_result_not_equal = builder_->createBinOp(spv::OpFUnordNotEqual, type_bool_,
-                                                            alpha_test_alpha, alpha_test_reference);
-      }
-      if_alpha_test_function_is_not_equal.makeBeginElse();
-      spv::Id alpha_test_result_non_not_equal;
-      {
-        // Function other than "not equal".
-        static const spv::Op kAlphaTestOps[] = {spv::OpFOrdLessThan, spv::OpFOrdEqual,
-                                                spv::OpFOrdGreaterThan};
-        for (uint32_t i = 0; i < 3; ++i) {
-          spv::Id alpha_test_comparison_result = builder_->createBinOp(
-              spv::OpLogicalAnd, type_bool_,
-              builder_->createBinOp(kAlphaTestOps[i], type_bool_, alpha_test_alpha,
-                                    alpha_test_reference),
-              builder_->createBinOp(
-                  spv::OpINotEqual, type_bool_,
-                  builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, alpha_test_function,
-                                        builder_->makeUintConstant(UINT32_C(1) << i)),
-                  const_uint_0_));
-          if (i) {
-            alpha_test_result_non_not_equal =
-                builder_->createBinOp(spv::OpLogicalOr, type_bool_, alpha_test_result_non_not_equal,
-                                      alpha_test_comparison_result);
-          } else {
-            alpha_test_result_non_not_equal = alpha_test_comparison_result;
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(builder_->makeIntConstant(3));
+        spv::Id alpha_test_alpha = builder_->createLoad(
+            builder_->createAccessChain(edram_fragment_shader_interlock_ ? spv::StorageClassFunction
+                                                                         : spv::StorageClassOutput,
+                                        output_or_var_fragment_data_[0], id_vector_temp_),
+            spv::NoPrecision);
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantAlphaTestReference));
+        spv::Id alpha_test_reference = builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                        id_vector_temp_),
+            spv::NoPrecision);
+        // The comparison function is not "always" - perform the alpha test.
+        // Handle "not equal" specially (specifically as "not equal" so it's true
+        // for NaN, not "less or greater" which is false for NaN).
+        SpirvBuilder::IfBuilder if_alpha_test_function_is_not_equal(
+            builder_->createBinOp(
+                spv::OpIEqual, type_bool_, alpha_test_function,
+                builder_->makeUintConstant(uint32_t(xenos::CompareFunction::kNotEqual))),
+            spv::SelectionControlDontFlattenMask, *builder_, 1, 2);
+        spv::Id alpha_test_result_not_equal;
+        {
+          // "Not equal" function.
+          alpha_test_result_not_equal = builder_->createBinOp(spv::OpFUnordNotEqual, type_bool_,
+                                                              alpha_test_alpha, alpha_test_reference);
+        }
+        if_alpha_test_function_is_not_equal.makeBeginElse();
+        spv::Id alpha_test_result_non_not_equal;
+        {
+          // Function other than "not equal".
+          static const spv::Op kAlphaTestOps[] = {spv::OpFOrdLessThan, spv::OpFOrdEqual,
+                                                  spv::OpFOrdGreaterThan};
+          for (uint32_t i = 0; i < 3; ++i) {
+            spv::Id alpha_test_comparison_result = builder_->createBinOp(
+                spv::OpLogicalAnd, type_bool_,
+                builder_->createBinOp(kAlphaTestOps[i], type_bool_, alpha_test_alpha,
+                                      alpha_test_reference),
+                builder_->createBinOp(
+                    spv::OpINotEqual, type_bool_,
+                    builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, alpha_test_function,
+                                          builder_->makeUintConstant(UINT32_C(1) << i)),
+                    const_uint_0_));
+            if (i) {
+              alpha_test_result_non_not_equal =
+                  builder_->createBinOp(spv::OpLogicalOr, type_bool_, alpha_test_result_non_not_equal,
+                                        alpha_test_comparison_result);
+            } else {
+              alpha_test_result_non_not_equal = alpha_test_comparison_result;
+            }
           }
         }
-      }
-      if_alpha_test_function_is_not_equal.makeEndIf();
-      spv::Id alpha_test_result = if_alpha_test_function_is_not_equal.createMergePhi(
-          alpha_test_result_not_equal, alpha_test_result_non_not_equal);
-      // Discard the pixel if the alpha test has failed.
-      if (edram_fragment_shader_interlock_ && !features_.demote_to_helper_invocation) {
-        fsi_pixel_potentially_killed = true;
-        fsi_sample_mask_in_rt_0_alpha_tests =
-            builder_->createTriOp(spv::OpSelect, type_uint_, alpha_test_result,
-                                  fsi_sample_mask_in_rt_0_alpha_tests, const_uint_0_);
-      } else {
-        SpirvBuilder::IfBuilder alpha_test_kill_if(
-            builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, alpha_test_result),
-            spv::SelectionControlDontFlattenMask, *builder_);
-        bool branch_to_alpha_test_kill_merge = true;
-        if (edram_fragment_shader_interlock_) {
-          assert_true(features_.demote_to_helper_invocation);
+        if_alpha_test_function_is_not_equal.makeEndIf();
+        spv::Id alpha_test_result = if_alpha_test_function_is_not_equal.createMergePhi(
+            alpha_test_result_not_equal, alpha_test_result_non_not_equal);
+        // Discard the pixel if the alpha test has failed.
+        if (edram_fragment_shader_interlock_ && !features_.demote_to_helper_invocation) {
           fsi_pixel_potentially_killed = true;
-          // TODO(Triang3l): Promoted to SPIR-V 1.6 - don't add the extension
-          // there.
-          builder_->addExtension("SPV_EXT_demote_to_helper_invocation");
-          builder_->addCapability(spv::CapabilityDemoteToHelperInvocationEXT);
-          builder_->createNoResultOp(spv::OpDemoteToHelperInvocationEXT);
+          fsi_sample_mask_in_rt_0_alpha_tests =
+              builder_->createTriOp(spv::OpSelect, type_uint_, alpha_test_result,
+                                    fsi_sample_mask_in_rt_0_alpha_tests, const_uint_0_);
         } else {
-          // TODO(Triang3l): Use OpTerminateInvocation when SPIR-V 1.6 is
-          // targeted.
-          builder_->createNoResultOp(spv::OpKill);
-          // OpKill terminates the block.
-          branch_to_alpha_test_kill_merge = false;
+          SpirvBuilder::IfBuilder alpha_test_kill_if(
+              builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, alpha_test_result),
+              spv::SelectionControlDontFlattenMask, *builder_);
+          bool branch_to_alpha_test_kill_merge = true;
+          if (edram_fragment_shader_interlock_) {
+            assert_true(features_.demote_to_helper_invocation);
+            fsi_pixel_potentially_killed = true;
+            // TODO(Triang3l): Promoted to SPIR-V 1.6 - don't add the extension
+            // there.
+            builder_->addExtension("SPV_EXT_demote_to_helper_invocation");
+            builder_->addCapability(spv::CapabilityDemoteToHelperInvocationEXT);
+            builder_->createNoResultOp(spv::OpDemoteToHelperInvocationEXT);
+          } else {
+            // TODO(Triang3l): Use OpTerminateInvocation when SPIR-V 1.6 is
+            // targeted.
+            builder_->createNoResultOp(spv::OpKill);
+            // OpKill terminates the block.
+            branch_to_alpha_test_kill_merge = false;
+          }
+          alpha_test_kill_if.makeEndIf(branch_to_alpha_test_kill_merge);
         }
-        alpha_test_kill_if.makeEndIf(branch_to_alpha_test_kill_merge);
       }
+      if_alpha_test_function_is_non_always.makeEndIf();
     }
-    if_alpha_test_function_is_non_always.makeEndIf();
 
     // Alpha to coverage.
     if (edram_fragment_shader_interlock_ || output_fragment_sample_mask_ != spv::NoResult) {

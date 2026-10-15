@@ -948,6 +948,13 @@ class Shader {
     return (writes_color_targets() & (uint32_t(1) << i)) != 0;
   }
 
+  // Instruction offset writing to color 0 alpha (oC0.w), or UINT32_MAX if none.
+  uint32_t c0_alpha_write_instr_offset() const { return c0_alpha_write_instr_offset_; }
+  // Number of distinct instructions writing to oC0.w.
+  uint32_t c0_alpha_write_count() const { return c0_alpha_write_count_; }
+  // Total number of instructions in the shader ucode.
+  uint32_t total_instruction_count() const { return total_instruction_count_; }
+
   // Host translations with the specified modification bits. Not thread-safe
   // with respect to translation creation/destruction.
   const std::unordered_map<uint64_t, Translation*>& translations() const { return translations_; }
@@ -1033,6 +1040,11 @@ class Shader {
 
   uint32_t ucode_storage_index_ = UINT32_MAX;
 
+  uint32_t c0_alpha_write_instr_offset_ = UINT32_MAX;
+  uint32_t c0_alpha_write_count_ = 0;
+  uint32_t total_instruction_count_ = 0;
+  uint32_t last_c0_alpha_write_instr_offset_ = UINT32_MAX;
+
  private:
   void GatherExecInformation(const ParsedExecInstruction& instr,
                              ucode::VertexFetchInstruction& previous_vfetch_full,
@@ -1045,10 +1057,12 @@ class Shader {
                                      uint32_t& unique_texture_bindings,
                                      string::StringBuffer& ucode_disasm_buffer);
   void GatherAluInstructionInformation(const ucode::AluInstruction& op, uint32_t exec_cf_index,
+                                       uint32_t instr_offset,
                                        string::StringBuffer& ucode_disasm_buffer);
   void GatherOperandInformation(const InstructionOperand& operand);
   void GatherFetchResultInformation(const InstructionResult& result);
-  void GatherAluResultInformation(const InstructionResult& result, uint32_t exec_cf_index);
+  void GatherAluResultInformation(const InstructionResult& result, uint32_t exec_cf_index,
+                                  uint32_t instr_offset);
 };
 
 }  // namespace rex::graphics

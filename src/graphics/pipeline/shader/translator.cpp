@@ -343,6 +343,8 @@ void Shader::GatherExecInformation(const ParsedExecInstruction& instr,
                                    uint32_t& unique_texture_bindings,
                                    string::StringBuffer& ucode_disasm_buffer) {
   instr.Disassemble(&ucode_disasm_buffer);
+  total_instruction_count_ =
+      std::max(total_instruction_count_, instr.instruction_address + instr.instruction_count);
   uint32_t sequence = instr.sequence;
   for (uint32_t instr_offset = instr.instruction_address;
        instr_offset < instr.instruction_address + instr.instruction_count;
@@ -362,7 +364,7 @@ void Shader::GatherExecInformation(const ParsedExecInstruction& instr,
       }
     } else {
       auto& op = *reinterpret_cast<const AluInstruction*>(op_ptr);
-      GatherAluInstructionInformation(op, instr.dword_index, ucode_disasm_buffer);
+      GatherAluInstructionInformation(op, instr.dword_index, instr_offset, ucode_disasm_buffer);
     }
   }
 }
@@ -468,6 +470,7 @@ void Shader::GatherTextureFetchInformation(const TextureFetchInstruction& op,
 }
 
 void Shader::GatherAluInstructionInformation(const AluInstruction& op, uint32_t exec_cf_index,
+                                             uint32_t instr_offset,
                                              string::StringBuffer& ucode_disasm_buffer) {
   ParsedAluInstruction instr;
   ParseAluInstruction(op, type(), instr);
@@ -479,8 +482,8 @@ void Shader::GatherAluInstructionInformation(const AluInstruction& op, uint32_t 
                   (ucode::GetAluScalarOpcodeInfo(op.scalar_opcode()).changed_state &
                    ucode::kAluOpChangedStatePixelKill);
 
-  GatherAluResultInformation(instr.vector_and_constant_result, exec_cf_index);
-  GatherAluResultInformation(instr.scalar_result, exec_cf_index);
+  GatherAluResultInformation(instr.vector_and_constant_result, exec_cf_index, instr_offset);
+  GatherAluResultInformation(instr.scalar_result, exec_cf_index, instr_offset);
   for (size_t i = 0; i < instr.vector_operand_count; ++i) {
     GatherOperandInformation(instr.vector_operands[i]);
   }
@@ -553,7 +556,8 @@ void Shader::GatherFetchResultInformation(const InstructionResult& result) {
   }
 }
 
-void Shader::GatherAluResultInformation(const InstructionResult& result, uint32_t exec_cf_index) {
+void Shader::GatherAluResultInformation(const InstructionResult& result, uint32_t exec_cf_index,
+                                        uint32_t instr_offset) {
   uint32_t used_write_mask = result.GetUsedWriteMask();
   if (!used_write_mask) {
     return;
@@ -583,6 +587,13 @@ void Shader::GatherAluResultInformation(const InstructionResult& result, uint32_
       break;
     case InstructionStorageTarget::kColor:
       writes_color_targets_ |= uint32_t(1) << result.storage_index;
+      if (result.storage_index == 0 && (used_write_mask & 0b1000)) {
+        c0_alpha_write_instr_offset_ = instr_offset;
+        if (last_c0_alpha_write_instr_offset_ != instr_offset) {
+          last_c0_alpha_write_instr_offset_ = instr_offset;
+          ++c0_alpha_write_count_;
+        }
+      }
       break;
     case InstructionStorageTarget::kDepth:
       writes_depth_ = true;
@@ -916,6 +927,7 @@ void ShaderTranslator::TranslateExecInstructions(const ParsedExecInstruction& in
           alu_instr.scalar_result.GetUsedWriteMask()) {
         eM_potentially_written_before |= uint8_t(1) << alu_instr.scalar_result.storage_index;
       }
+      PostProcessInstruction(instr_offset);
     }
   }
 

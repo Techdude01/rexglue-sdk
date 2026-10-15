@@ -163,6 +163,7 @@ void SpirvShaderTranslator::Reset() {
 
   cf_exec_conditional_merge_ = nullptr;
   cf_instruction_predicate_merge_ = nullptr;
+  alpha_test_killed_emitted_ = false;
 }
 
 uint32_t SpirvShaderTranslator::GetModificationRegisterCount() const {

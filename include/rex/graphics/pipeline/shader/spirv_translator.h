@@ -493,6 +493,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   void ProcessTextureFetchInstruction(const ParsedTextureFetchInstruction& instr) override;
   void ProcessAluInstruction(const ParsedAluInstruction& instr,
                              uint8_t memexport_eM_potentially_written_before) override;
+  void PostProcessInstruction(uint32_t instr_offset) override;
+  void EmitAlphaTestKill();
 
  private:
   struct TextureBinding {
@@ -1083,6 +1085,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // the exec-level predicate value, and can't merge two execs with the same
   // predicate condition anymore.
   bool cf_exec_predicate_written_;
+  bool alpha_test_killed_emitted_ = false;
 };
 
 }  // namespace rex::graphics
