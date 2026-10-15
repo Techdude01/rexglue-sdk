@@ -93,6 +93,11 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
   VertexFetchInstruction previous_vfetch_full;
   std::memset(&previous_vfetch_full, 0, sizeof(previous_vfetch_full));
   uint32_t unique_texture_bindings = 0;
+  reg_writes_.assign(128, {});
+  c0_alpha_copy_src_reg_ = UINT32_MAX;
+  c0_alpha_copy_src_comp_ = UINT32_MAX;
+  c0_alpha_copy_instr_offset_ = UINT32_MAX;
+  c0_alpha_copy_is_predicated_ = false;
   for (uint32_t i = 0; i < cf_pair_index_bound_; ++i) {
     ControlFlowInstruction cf_ab[2];
     UnpackControlFlowInstructions(ucode_data_.data() + i * 3, cf_ab);
@@ -310,6 +315,30 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
     }
   }
 
+  early_alpha_instr_offset_ = UINT32_MAX;
+  early_alpha_register_ = UINT32_MAX;
+  early_alpha_component_ = UINT32_MAX;
+
+  if (type() == xenos::ShaderType::kPixel && label_addresses_.empty() && !writes_depth_ &&
+      c0_alpha_write_count_ == 1) {
+    if (c0_alpha_copy_src_reg_ != UINT32_MAX && !c0_alpha_copy_is_predicated_ &&
+        c0_alpha_copy_src_reg_ < reg_writes_.size() && c0_alpha_copy_src_comp_ < 4) {
+      const auto& info = reg_writes_[c0_alpha_copy_src_reg_][c0_alpha_copy_src_comp_];
+      if (info.write_count == 1 && !info.is_predicated &&
+          info.last_write_instr < c0_alpha_copy_instr_offset_) {
+        early_alpha_instr_offset_ = info.last_write_instr;
+        early_alpha_register_ = c0_alpha_copy_src_reg_;
+        early_alpha_component_ = c0_alpha_copy_src_comp_;
+      } else {
+        early_alpha_instr_offset_ = c0_alpha_write_instr_offset_;
+      }
+    } else {
+      early_alpha_instr_offset_ = c0_alpha_write_instr_offset_;
+    }
+  }
+  reg_writes_.clear();
+  reg_writes_.shrink_to_fit();
+
   is_ucode_analyzed_ = true;
 
   // An empty shader can be created internally by shader translators as a dummy,
@@ -357,10 +386,11 @@ void Shader::GatherExecInformation(const ParsedExecInstruction& instr,
     if (sequence & 0b01) {
       auto& op = *reinterpret_cast<const FetchInstruction*>(op_ptr);
       if (op.opcode() == FetchOpcode::kVertexFetch) {
-        GatherVertexFetchInformation(op.vertex_fetch(), previous_vfetch_full, ucode_disasm_buffer);
+        GatherVertexFetchInformation(op.vertex_fetch(), previous_vfetch_full, ucode_disasm_buffer,
+                                     instr_offset);
       } else {
         GatherTextureFetchInformation(op.texture_fetch(), unique_texture_bindings,
-                                      ucode_disasm_buffer);
+                                      ucode_disasm_buffer, instr_offset);
       }
     } else {
       auto& op = *reinterpret_cast<const AluInstruction*>(op_ptr);
@@ -371,14 +401,15 @@ void Shader::GatherExecInformation(const ParsedExecInstruction& instr,
 
 void Shader::GatherVertexFetchInformation(const VertexFetchInstruction& op,
                                           VertexFetchInstruction& previous_vfetch_full,
-                                          string::StringBuffer& ucode_disasm_buffer) {
+                                          string::StringBuffer& ucode_disasm_buffer,
+                                          uint32_t instr_offset) {
   ParsedVertexFetchInstruction fetch_instr;
   if (ParseVertexFetchInstruction(op, previous_vfetch_full, fetch_instr)) {
     previous_vfetch_full = op;
   }
   fetch_instr.Disassemble(&ucode_disasm_buffer);
 
-  GatherFetchResultInformation(fetch_instr.result);
+  GatherFetchResultInformation(fetch_instr.result, instr_offset);
 
   // Mini-fetches inherit the operands from full fetches.
   if (!fetch_instr.is_mini_fetch) {
@@ -426,12 +457,13 @@ void Shader::GatherVertexFetchInformation(const VertexFetchInstruction& op,
 
 void Shader::GatherTextureFetchInformation(const TextureFetchInstruction& op,
                                            uint32_t& unique_texture_bindings,
-                                           string::StringBuffer& ucode_disasm_buffer) {
+                                           string::StringBuffer& ucode_disasm_buffer,
+                                           uint32_t instr_offset) {
   TextureBinding binding;
   ParseTextureFetchInstruction(op, binding.fetch_instr);
   binding.fetch_instr.Disassemble(&ucode_disasm_buffer);
 
-  GatherFetchResultInformation(binding.fetch_instr.result);
+  GatherFetchResultInformation(binding.fetch_instr.result, instr_offset);
   for (size_t i = 0; i < binding.fetch_instr.operand_count; ++i) {
     GatherOperandInformation(binding.fetch_instr.operands[i]);
   }
@@ -482,13 +514,62 @@ void Shader::GatherAluInstructionInformation(const AluInstruction& op, uint32_t 
                   (ucode::GetAluScalarOpcodeInfo(op.scalar_opcode()).changed_state &
                    ucode::kAluOpChangedStatePixelKill);
 
-  GatherAluResultInformation(instr.vector_and_constant_result, exec_cf_index, instr_offset);
-  GatherAluResultInformation(instr.scalar_result, exec_cf_index, instr_offset);
+  GatherAluResultInformation(instr.vector_and_constant_result, exec_cf_index, instr_offset,
+                             instr.is_predicated);
+  GatherAluResultInformation(instr.scalar_result, exec_cf_index, instr_offset,
+                             instr.is_predicated);
   for (size_t i = 0; i < instr.vector_operand_count; ++i) {
     GatherOperandInformation(instr.vector_operands[i]);
   }
   for (size_t i = 0; i < instr.scalar_operand_count; ++i) {
     GatherOperandInformation(instr.scalar_operands[i]);
+  }
+
+  // Check for identity copy from a temporary register into color 0 alpha (oC0.w).
+  if (instr.vector_and_constant_result.storage_target == InstructionStorageTarget::kColor &&
+      instr.vector_and_constant_result.storage_index == 0 &&
+      (instr.vector_and_constant_result.GetUsedWriteMask() & 0b1000)) {
+    if ((instr.vector_opcode == ucode::AluVectorOpcode::kMax ||
+         instr.vector_opcode == ucode::AluVectorOpcode::kMin) &&
+        instr.vector_operand_count >= 2 &&
+        instr.vector_operands[0].storage_source == InstructionStorageSource::kRegister &&
+        instr.vector_operands[1].storage_source == InstructionStorageSource::kRegister &&
+        instr.vector_operands[0].storage_index == instr.vector_operands[1].storage_index &&
+        instr.vector_operands[0].storage_addressing_mode ==
+            InstructionStorageAddressingMode::kAbsolute &&
+        instr.vector_operands[1].storage_addressing_mode ==
+            InstructionStorageAddressingMode::kAbsolute &&
+        !instr.vector_operands[0].is_negated && !instr.vector_operands[1].is_negated &&
+        !instr.vector_operands[0].is_absolute_value &&
+        !instr.vector_operands[1].is_absolute_value) {
+      SwizzleSource comp0 = instr.vector_operands[0].GetComponent(3);
+      SwizzleSource comp1 = instr.vector_operands[1].GetComponent(3);
+      if (comp0 == comp1 && comp0 >= SwizzleSource::kX && comp0 <= SwizzleSource::kW) {
+        c0_alpha_copy_src_reg_ = instr.vector_operands[0].storage_index;
+        c0_alpha_copy_src_comp_ = uint32_t(comp0) - uint32_t(SwizzleSource::kX);
+        c0_alpha_copy_instr_offset_ = instr_offset;
+        c0_alpha_copy_is_predicated_ = instr.is_predicated;
+      }
+    }
+  }
+  if (instr.scalar_result.storage_target == InstructionStorageTarget::kColor &&
+      instr.scalar_result.storage_index == 0 &&
+      (instr.scalar_result.GetUsedWriteMask() & 0b1000)) {
+    if ((instr.scalar_opcode == ucode::AluScalarOpcode::kMaxs ||
+         instr.scalar_opcode == ucode::AluScalarOpcode::kMins) &&
+        instr.scalar_operand_count >= 1 &&
+        instr.scalar_operands[0].storage_source == InstructionStorageSource::kRegister &&
+        instr.scalar_operands[0].storage_addressing_mode ==
+            InstructionStorageAddressingMode::kAbsolute &&
+        !instr.scalar_operands[0].is_negated && !instr.scalar_operands[0].is_absolute_value) {
+      SwizzleSource comp = instr.scalar_operands[0].GetComponent(0);
+      if (comp >= SwizzleSource::kX && comp <= SwizzleSource::kW) {
+        c0_alpha_copy_src_reg_ = instr.scalar_operands[0].storage_index;
+        c0_alpha_copy_src_comp_ = uint32_t(comp) - uint32_t(SwizzleSource::kX);
+        c0_alpha_copy_instr_offset_ = instr_offset;
+        c0_alpha_copy_is_predicated_ = instr.is_predicated;
+      }
+    }
   }
 
   // Store used memexport constants because CPU code needs addresses and sizes.
@@ -541,8 +622,9 @@ void Shader::GatherOperandInformation(const InstructionOperand& operand) {
   }
 }
 
-void Shader::GatherFetchResultInformation(const InstructionResult& result) {
-  if (!result.GetUsedWriteMask()) {
+void Shader::GatherFetchResultInformation(const InstructionResult& result, uint32_t instr_offset) {
+  uint32_t used_write_mask = result.GetUsedWriteMask();
+  if (!used_write_mask) {
     return;
   }
   // Fetch instructions can't export - don't need the current memexport count
@@ -551,13 +633,22 @@ void Shader::GatherFetchResultInformation(const InstructionResult& result) {
   if (result.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute) {
     register_static_address_bound_ =
         std::max(register_static_address_bound_, result.storage_index + uint32_t(1));
+    if (result.storage_index < reg_writes_.size()) {
+      for (uint32_t c = 0; c < 4; ++c) {
+        if (used_write_mask & (1 << c)) {
+          reg_writes_[result.storage_index][c].last_write_instr = instr_offset;
+          reg_writes_[result.storage_index][c].write_count++;
+          reg_writes_[result.storage_index][c].is_predicated = false;
+        }
+      }
+    }
   } else {
     uses_register_dynamic_addressing_ = true;
   }
 }
 
 void Shader::GatherAluResultInformation(const InstructionResult& result, uint32_t exec_cf_index,
-                                        uint32_t instr_offset) {
+                                        uint32_t instr_offset, bool is_predicated) {
   uint32_t used_write_mask = result.GetUsedWriteMask();
   if (!used_write_mask) {
     return;
@@ -567,6 +658,15 @@ void Shader::GatherAluResultInformation(const InstructionResult& result, uint32_
       if (result.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute) {
         register_static_address_bound_ =
             std::max(register_static_address_bound_, result.storage_index + uint32_t(1));
+        if (result.storage_index < reg_writes_.size()) {
+          for (uint32_t c = 0; c < 4; ++c) {
+            if (used_write_mask & (1 << c)) {
+              reg_writes_[result.storage_index][c].last_write_instr = instr_offset;
+              reg_writes_[result.storage_index][c].write_count++;
+              reg_writes_[result.storage_index][c].is_predicated = is_predicated;
+            }
+          }
+        }
       } else {
         uses_register_dynamic_addressing_ = true;
       }

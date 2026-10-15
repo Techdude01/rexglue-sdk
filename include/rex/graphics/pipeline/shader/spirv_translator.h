@@ -494,7 +494,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   void ProcessAluInstruction(const ParsedAluInstruction& instr,
                              uint8_t memexport_eM_potentially_written_before) override;
   void PostProcessInstruction(uint32_t instr_offset) override;
-  void EmitAlphaTestKill();
+  void EmitAlphaTestKill(uint32_t early_alpha_reg = UINT32_MAX,
+                         uint32_t early_alpha_comp = UINT32_MAX);
 
  private:
   struct TextureBinding {

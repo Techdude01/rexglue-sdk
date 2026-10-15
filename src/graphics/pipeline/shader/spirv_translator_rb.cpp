@@ -395,7 +395,8 @@ spv::Id SpirvShaderTranslator::Depth20e4To32(SpirvBuilder& builder, spv::Id f24_
   return f32;
 }
 
-void SpirvShaderTranslator::EmitAlphaTestKill() {
+void SpirvShaderTranslator::EmitAlphaTestKill(uint32_t early_alpha_reg,
+                                             uint32_t early_alpha_comp) {
   EnsureBuildPointAvailable();
 
   // Alpha test.
@@ -411,6 +412,23 @@ void SpirvShaderTranslator::EmitAlphaTestKill() {
           builder_->makeUintConstant(uint32_t(xenos::CompareFunction::kAlways))),
       spv::SelectionControlDontFlattenMask, *builder_);
   {
+    if (early_alpha_reg != UINT32_MAX) {
+      assert_true(var_main_registers_ != spv::NoResult);
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeIntConstant(int(early_alpha_reg)));
+      id_vector_temp_.push_back(builder_->makeIntConstant(int(early_alpha_comp)));
+      spv::Id alpha_ptr = builder_->createAccessChain(
+          spv::StorageClassFunction, var_main_registers_, id_vector_temp_);
+      spv::Id alpha_val = builder_->createLoad(alpha_ptr, spv::NoPrecision);
+
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeIntConstant(3));
+      spv::Id out_alpha_ptr = builder_->createAccessChain(
+          edram_fragment_shader_interlock_ ? spv::StorageClassFunction : spv::StorageClassOutput,
+          output_or_var_fragment_data_[0], id_vector_temp_);
+      builder_->createStore(alpha_val, out_alpha_ptr);
+    }
+
     id_vector_temp_.clear();
     id_vector_temp_.push_back(builder_->makeIntConstant(3));
     spv::Id alpha_test_alpha = builder_->createLoad(
@@ -495,8 +513,9 @@ void SpirvShaderTranslator::PostProcessInstruction(uint32_t instr_offset) {
   if (IsExecutionModeEarlyFragmentTests()) {
     return;
   }
-  // Check that this instruction wrote color 0 alpha and is the only write instruction in the shader.
-  if (shader.c0_alpha_write_count() != 1 || shader.c0_alpha_write_instr_offset() != instr_offset) {
+  // Check that this instruction is the designated early alpha-test point.
+  if (shader.early_alpha_instr_offset() == UINT32_MAX ||
+      shader.early_alpha_instr_offset() != instr_offset) {
     return;
   }
   // Must have substantial remaining work in the shader to benefit from early kill hoisting.
@@ -513,11 +532,12 @@ void SpirvShaderTranslator::PostProcessInstruction(uint32_t instr_offset) {
 
   REXGPU_INFO(
       "SpirvShaderTranslator: Hoisting early alpha-test OpKill in shader {:016X} "
-      "at instr {}/{} (saving up to {} subsequent instructions and fetches)",
+      "at instr {}/{} (saving up to {} subsequent instructions and fetches, reg={}:{})",
       shader.ucode_data_hash(), instr_offset, shader.total_instruction_count(),
-      shader.total_instruction_count() - 1 - instr_offset);
+      shader.total_instruction_count() - 1 - instr_offset,
+      shader.early_alpha_register(), shader.early_alpha_component());
 
-  EmitAlphaTestKill();
+  EmitAlphaTestKill(shader.early_alpha_register(), shader.early_alpha_component());
   alpha_test_killed_emitted_ = true;
 }
 

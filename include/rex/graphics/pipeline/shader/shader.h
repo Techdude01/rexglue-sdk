@@ -11,6 +11,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <set>
@@ -955,6 +956,13 @@ class Shader {
   // Total number of instructions in the shader ucode.
   uint32_t total_instruction_count() const { return total_instruction_count_; }
 
+  // Earliest instruction offset where alpha testing can be safely performed, or UINT32_MAX.
+  uint32_t early_alpha_instr_offset() const { return early_alpha_instr_offset_; }
+  // Temporary register index holding the alpha value at early_alpha_instr_offset, or UINT32_MAX if already in oC0.w.
+  uint32_t early_alpha_register() const { return early_alpha_register_; }
+  // Vector component index (0=X, 1=Y, 2=Z, 3=W) of the early alpha register, or UINT32_MAX.
+  uint32_t early_alpha_component() const { return early_alpha_component_; }
+
   // Host translations with the specified modification bits. Not thread-safe
   // with respect to translation creation/destruction.
   const std::unordered_map<uint64_t, Translation*>& translations() const { return translations_; }
@@ -1045,6 +1053,22 @@ class Shader {
   uint32_t total_instruction_count_ = 0;
   uint32_t last_c0_alpha_write_instr_offset_ = UINT32_MAX;
 
+  uint32_t early_alpha_instr_offset_ = UINT32_MAX;
+  uint32_t early_alpha_register_ = UINT32_MAX;
+  uint32_t early_alpha_component_ = UINT32_MAX;
+
+  uint32_t c0_alpha_copy_src_reg_ = UINT32_MAX;
+  uint32_t c0_alpha_copy_src_comp_ = UINT32_MAX;
+  uint32_t c0_alpha_copy_instr_offset_ = UINT32_MAX;
+  bool c0_alpha_copy_is_predicated_ = false;
+
+  struct RegComponentWriteInfo {
+    uint32_t last_write_instr = UINT32_MAX;
+    uint32_t write_count = 0;
+    bool is_predicated = false;
+  };
+  std::vector<std::array<RegComponentWriteInfo, 4>> reg_writes_;
+
  private:
   void GatherExecInformation(const ParsedExecInstruction& instr,
                              ucode::VertexFetchInstruction& previous_vfetch_full,
@@ -1052,17 +1076,19 @@ class Shader {
                              string::StringBuffer& ucode_disasm_buffer);
   void GatherVertexFetchInformation(const ucode::VertexFetchInstruction& op,
                                     ucode::VertexFetchInstruction& previous_vfetch_full,
-                                    string::StringBuffer& ucode_disasm_buffer);
+                                    string::StringBuffer& ucode_disasm_buffer,
+                                    uint32_t instr_offset);
   void GatherTextureFetchInformation(const ucode::TextureFetchInstruction& op,
                                      uint32_t& unique_texture_bindings,
-                                     string::StringBuffer& ucode_disasm_buffer);
+                                     string::StringBuffer& ucode_disasm_buffer,
+                                     uint32_t instr_offset);
   void GatherAluInstructionInformation(const ucode::AluInstruction& op, uint32_t exec_cf_index,
                                        uint32_t instr_offset,
                                        string::StringBuffer& ucode_disasm_buffer);
   void GatherOperandInformation(const InstructionOperand& operand);
-  void GatherFetchResultInformation(const InstructionResult& result);
+  void GatherFetchResultInformation(const InstructionResult& result, uint32_t instr_offset);
   void GatherAluResultInformation(const InstructionResult& result, uint32_t exec_cf_index,
-                                  uint32_t instr_offset);
+                                  uint32_t instr_offset, bool is_predicated);
 };
 
 }  // namespace rex::graphics
