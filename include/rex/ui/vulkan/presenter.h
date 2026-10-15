@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -414,6 +415,18 @@ class VulkanPresenter final : public Presenter {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkExtent2D swapchain_extent = {};
     bool swapchain_is_fifo = false;
+    // Previously retired swapchain kept alive until the current one commits
+    // its first image, so the layer keeps showing the last good frame
+    // (instead of black) across recreates. At most one is held. Written on the
+    // UI thread, consumed from either painting thread.
+    std::atomic<VkSwapchainKHR> retired_swapchain_pending_destroy{nullptr};
+    // Consecutive suboptimal presents against the current swapchain, for
+    // re-driving swapchain recovery when the surface size has drifted (live
+    // resize / display migration). Reset on optimal presents; only a sustained
+    // run re-arms recovery, so a driver that reports suboptimal spuriously can
+    // never cause a recreate loop.
+    // May be touched from the guest output thread as well as the UI thread.
+    std::atomic<uint32_t> swapchain_consecutive_suboptimal_presents{0};
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
   };

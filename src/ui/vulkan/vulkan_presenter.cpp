@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -770,13 +771,27 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
         old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
         paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
-    // Destroy the old swapchain that may be retired now.
-    if (old_swapchain != VK_NULL_HANDLE) {
-      dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
-    }
     if (paint_context_.swapchain == VK_NULL_HANDLE) {
       // Couldn't create the swapchain for the existing surface - start over.
+      // The unretired old swapchain goes to the deferred-destruction slot
+      // rather than leaking (it must not be used, only eventually destroyed).
+      VkSwapchainKHR previous_pending =
+          paint_context_.retired_swapchain_pending_destroy.exchange(old_swapchain);
+      if (previous_pending != VK_NULL_HANDLE) {
+        dfn.vkDestroySwapchainKHR(device, previous_pending, nullptr);
+      }
       paint_context_.DestroySwapchainAndVulkanSurface();
+    } else {
+      // Retire the old swapchain, but keep it alive until the new one commits
+      // its first image so the window keeps showing the last good frame
+      // instead of going black across the recreate.
+      if (old_swapchain != VK_NULL_HANDLE) {
+        VkSwapchainKHR previous_pending =
+            paint_context_.retired_swapchain_pending_destroy.exchange(old_swapchain);
+        if (previous_pending != VK_NULL_HANDLE) {
+          dfn.vkDestroySwapchainKHR(device, previous_pending, nullptr);
+        }
+      }
     }
   }
 
@@ -1077,6 +1092,16 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
                                           image_instance.image->view(), image_instance.version,
                                           image_instance.ever_successfully_refreshed);
   bool refresher_succeeded = refresher(context);
+  const char* visible_present_debug_env = std::getenv("COSMIC_PRESENT_DIAGNOSTICS");
+  if (visible_present_debug_env && !std::strcmp(visible_present_debug_env, "1")) {
+    static std::atomic<uint32_t> refresh_debug_call{0};
+    const uint32_t index = refresh_debug_call.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (index <= 24) {
+      REXLOG_INFO("[DEBUG-visible-present] guest_refresh={} mailbox={} size={}x{} success={} image_version={}",
+                  index, mailbox_index, frontbuffer_width, frontbuffer_height,
+                  refresher_succeeded, image_instance.version);
+    }
+  }
   if (refresher_succeeded) {
     image_instance.ever_successfully_refreshed = true;
   }
@@ -1451,6 +1476,11 @@ void VulkanPresenter::PaintContext::DestroySwapchainAndVulkanSurface() {
     vulkan_device->functions().vkDestroySwapchainKHR(vulkan_device->device(), old_swapchain,
                                                      nullptr);
   }
+  VkSwapchainKHR pending_destroy = retired_swapchain_pending_destroy.exchange(nullptr);
+  if (pending_destroy != VK_NULL_HANDLE) {
+    vulkan_device->functions().vkDestroySwapchainKHR(vulkan_device->device(), pending_destroy,
+                                                     nullptr);
+  }
   present_queue_family = UINT32_MAX;
   if (vulkan_surface != VK_NULL_HANDLE) {
     const VulkanInstance* vulkan_instance = vulkan_device->vulkan_instance();
@@ -1529,6 +1559,17 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
 }
 
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+  static std::atomic<uint32_t> visible_present_debug_call{0};
+  const char* visible_present_debug_env = std::getenv("COSMIC_PRESENT_DIAGNOSTICS");
+  const bool visible_present_debug_enabled =
+      visible_present_debug_env && !std::strcmp(visible_present_debug_env, "1");
+  const uint32_t visible_present_debug_index =
+      visible_present_debug_enabled
+          ? visible_present_debug_call.fetch_add(1, std::memory_order_relaxed) + 1
+          : 0;
+  bool log_visible_present =
+      visible_present_debug_enabled && visible_present_debug_index <= 16;
+
   // Begin the submission in place of the one not currently potentially used on
   // the GPU.
   uint64_t current_paint_submission_index =
@@ -1631,8 +1672,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   GuestOutputProperties guest_output_properties;
   GuestOutputPaintConfig guest_output_paint_config;
   std::shared_ptr<GuestOutputImage> guest_output_image;
+  uint32_t guest_output_mailbox_index = UINT32_MAX;
   {
-    uint32_t guest_output_mailbox_index;
     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
         guest_output_mailbox_index, &guest_output_properties, &guest_output_paint_config));
     if (guest_output_mailbox_index != UINT32_MAX) {
@@ -1644,6 +1685,20 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     // the new reference or is exclusively owned by main target painting (and
     // multiple threads can't paint the main target at the same time).
   }
+  log_visible_present = visible_present_debug_enabled &&
+                        (visible_present_debug_index <= 16 || guest_output_image != nullptr);
+
+  if (log_visible_present) {
+    REXLOG_INFO(
+        "[DEBUG-visible-present] paint={} swapchain={}x{} guest_image={} active={} mailbox={} "
+        "guest={}x{} surface={}x{} execute_ui={}",
+        visible_present_debug_index, paint_context_.swapchain_extent.width,
+        paint_context_.swapchain_extent.height, guest_output_image != nullptr,
+        guest_output_properties.IsActive(), guest_output_mailbox_index,
+        guest_output_properties.frontbuffer_width, guest_output_properties.frontbuffer_height,
+        paint_context_.swapchain_extent.width, paint_context_.swapchain_extent.height,
+        execute_ui_drawers);
+  }
 
   if (guest_output_image) {
     VkExtent2D max_framebuffer_extent =
@@ -1652,6 +1707,19 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         guest_output_properties, paint_context_.swapchain_extent.width,
         paint_context_.swapchain_extent.height, max_framebuffer_extent.width,
         max_framebuffer_extent.height, guest_output_paint_config);
+    if (log_visible_present) {
+      REXLOG_INFO(
+          "[DEBUG-visible-present] paint={} effects={} output={}x{} at {},{} letterbox_rects={}",
+          visible_present_debug_index, guest_output_flow.effect_count,
+          guest_output_flow.effect_count
+              ? guest_output_flow.effect_output_sizes[guest_output_flow.effect_count - 1].first
+              : 0,
+          guest_output_flow.effect_count
+              ? guest_output_flow.effect_output_sizes[guest_output_flow.effect_count - 1].second
+              : 0,
+          guest_output_flow.output_x, guest_output_flow.output_y,
+          guest_output_flow.letterbox_clear_rectangle_count);
+    }
     if (guest_output_flow.effect_count) {
       // Store the main target reference to the guest output image so it's not
       // destroyed while it's still potentially in use by main target painting
@@ -2245,11 +2313,55 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
   }
+  if (log_visible_present) {
+    REXLOG_INFO("[DEBUG-visible-present] paint={} vkQueuePresentKHR result={}",
+                visible_present_debug_index, int32_t(present_result));
+  }
   switch (present_result) {
-    case VK_SUCCESS:
+    case VK_SUCCESS: {
+      paint_context_.swapchain_consecutive_suboptimal_presents.store(0, std::memory_order_relaxed);
+      // The new swapchain has committed its first image - the previously
+      // retired one it replaced is no longer displayed and can go away.
+      VkSwapchainKHR pending_destroy =
+          paint_context_.retired_swapchain_pending_destroy.exchange(nullptr);
+      if (pending_destroy != VK_NULL_HANDLE) {
+        dfn.vkDestroySwapchainKHR(device, pending_destroy, nullptr);
+      }
       return PaintResult::kPresented;
-    case VK_SUBOPTIMAL_KHR:
+    }
+    case VK_SUBOPTIMAL_KHR: {
+      // A suboptimal present still reaches the screen, but a swapchain that
+      // stays suboptimal after a resize / display migration (the layer size
+      // can trail the window size on macOS) must be recreated once the
+      // condition persists: otherwise the connection-level latch suppresses
+      // recovery forever after the first suboptimal present. Only re-arm
+      // recovery after a sustained run, then re-check at a slower cadence, so
+      // a transient can never spin recreates and even a permanently
+      // suboptimal surface costs at most an occasional same-size rebind.
+      const uint32_t suboptimal_count =
+          paint_context_.swapchain_consecutive_suboptimal_presents.fetch_add(
+              1, std::memory_order_relaxed) +
+          1;
+      constexpr uint32_t kSuboptimalPresentsBeforeRecovery = 30;
+      constexpr uint32_t kSuboptimalPresentsRecheckInterval = 300;
+      if (suboptimal_count == kSuboptimalPresentsBeforeRecovery ||
+          (suboptimal_count > kSuboptimalPresentsBeforeRecovery &&
+           (suboptimal_count - kSuboptimalPresentsBeforeRecovery) %
+                   kSuboptimalPresentsRecheckInterval ==
+               0)) {
+        REXLOG_INFO(
+            "VulkanPresenter: {} consecutive suboptimal presents against a "
+            "{}x{} swapchain, recreating it",
+            suboptimal_count, paint_context_.swapchain_extent.width,
+            paint_context_.swapchain_extent.height);
+        // Deliberately not resetting the counter here: it restarts from
+        // optimal presents, so a fixed swapchain stops flagging entirely,
+        // while a still-broken one re-arms recovery at the slower recheck
+        // cadence above.
+        return PaintResult::kNotPresentedConnectionOutdated;
+      }
       return PaintResult::kPresentedSuboptimal;
+    }
     case VK_ERROR_DEVICE_LOST:
       REXLOG_ERROR(
           "VulkanPresenter: Failed to present the swapchain image as the "
