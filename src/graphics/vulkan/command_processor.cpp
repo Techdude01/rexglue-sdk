@@ -111,6 +111,22 @@ void LogGpuProvenanceOutput(uint64_t frame, const ui::RawImage& image) {
       "rgb_min={},{},{} rgb_max={},{},{}",
       frame, image.width, image.height, nonblack_pixels, uint64_t(image.width) * image.height,
       minimum[0], minimum[1], minimum[2], maximum[0], maximum[1], maximum[2]);
+
+  if (const char* capture_path = std::getenv("COSMIC_GPU_PROVENANCE_CAPTURE_PATH")) {
+    if (FILE* f = std::fopen(capture_path, "wb")) {
+      std::fprintf(f, "P6\n%u %u\n255\n", image.width, image.height);
+      for (uint32_t y = 0; y < image.height; ++y) {
+        const uint8_t* row = image.data.data() + size_t(y) * image.stride;
+        for (uint32_t x = 0; x < image.width; ++x) {
+          const uint8_t* pixel = row + size_t(x) * 4;
+          std::fputc(pixel[0], f);
+          std::fputc(pixel[1], f);
+          std::fputc(pixel[2], f);
+        }
+      }
+      std::fclose(f);
+    }
+  }
 }
 
 // glslang default built-in resource limits.
