@@ -19,6 +19,7 @@
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/cache.h>
+#include <rex/graphics/pipeline/texture/conversion.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
@@ -445,10 +446,128 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   // regular texture or a vertex buffer, and thus the scaled resolve version is
   // not up to date anymore.
   texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
+  UpdateTextureOpacity(texture);
   texture.LogAction("Loaded");
 
   return true;
 }
+
+void TextureCache::UpdateTextureOpacity(Texture& texture) {
+  const TextureKey& key = texture.key();
+
+  // Formats with no alpha channel are unconditionally opaque.
+  switch (key.format) {
+    case xenos::TextureFormat::k_5_6_5:
+    case xenos::TextureFormat::k_6_5_5:
+    case xenos::TextureFormat::k_10_11_11:
+    case xenos::TextureFormat::k_11_11_10:
+    case xenos::TextureFormat::k_16_16:
+    case xenos::TextureFormat::k_16_16_FLOAT:
+    case xenos::TextureFormat::k_32_32:
+    case xenos::TextureFormat::k_32_32_FLOAT:
+    case xenos::TextureFormat::k_DXN:
+      texture.set_is_opaque(true);
+      return;
+    default:
+      break;
+  }
+
+  // DXT1 (BC1): inspect 8-byte blocks for 1-bit transparency.
+  if (key.format == xenos::TextureFormat::k_DXT1 ||
+      key.format == xenos::TextureFormat::k_DXT1_AS_16_16_16_16) {
+    if (key.base_page != 0) {
+      const uint8_t* base_data =
+          shared_memory_.memory().TranslatePhysical(key.base_page << 12);
+      if (base_data != nullptr) {
+        uint32_t base_size = texture.GetGuestBaseSize();
+        bool has_transparency = false;
+        for (uint32_t offset = 0; offset + 8 <= base_size; offset += 8) {
+          uint8_t block[8];
+          texture_conversion::CopySwapBlock(key.endianness, block, base_data + offset, 8);
+          uint16_t c0 = *reinterpret_cast<const uint16_t*>(&block[0]);
+          uint16_t c1 = *reinterpret_cast<const uint16_t*>(&block[2]);
+          if (c0 <= c1) {
+            uint32_t bits = *reinterpret_cast<const uint32_t*>(&block[4]);
+            if ((bits & (bits >> 1)) & 0x55555555u) {
+              has_transparency = true;
+              break;
+            }
+          }
+        }
+        texture.set_is_opaque(!has_transparency);
+        return;
+      }
+    }
+  }
+
+  // 8_8_8_8 formats: inspect alpha component.
+  if (key.format == xenos::TextureFormat::k_8_8_8_8 ||
+      key.format == xenos::TextureFormat::k_8_8_8_8_A ||
+      key.format == xenos::TextureFormat::k_8_8_8_8_AS_16_16_16_16) {
+    if (key.base_page != 0) {
+      const uint8_t* base_data =
+          shared_memory_.memory().TranslatePhysical(key.base_page << 12);
+      if (base_data != nullptr) {
+        uint32_t base_size = texture.GetGuestBaseSize();
+        bool has_transparency = false;
+        // In RGBA8, alpha is byte 3 after byte swap.
+        for (uint32_t offset = 0; offset + 4 <= base_size; offset += 4) {
+          uint8_t pixel[4];
+          texture_conversion::CopySwapBlock(key.endianness, pixel, base_data + offset, 4);
+          if (pixel[3] <= 127) {
+            has_transparency = true;
+            break;
+          }
+        }
+        texture.set_is_opaque(!has_transparency);
+        return;
+      }
+    }
+  }
+
+  texture.set_is_opaque(false);
+}
+
+bool TextureCache::IsFetchOpaque(const xenos::xe_gpu_texture_fetch_t& fetch) const {
+  if (fetch.type == xenos::FetchConstantType::kInvalidTexture) {
+    return false;
+  }
+  // Check if fetch constant swizzle maps alpha to constant 1.0.
+  uint32_t swizzle_w = (fetch.swizzle >> 9) & 0b111;
+  if (swizzle_w == xenos::XE_GPU_TEXTURE_SWIZZLE_1) {
+    return true;
+  }
+
+  // Check formats with no alpha channel.
+  xenos::TextureFormat format = GetBaseFormat(fetch.format);
+  switch (format) {
+    case xenos::TextureFormat::k_5_6_5:
+    case xenos::TextureFormat::k_6_5_5:
+    case xenos::TextureFormat::k_10_11_11:
+    case xenos::TextureFormat::k_11_11_10:
+    case xenos::TextureFormat::k_16_16:
+    case xenos::TextureFormat::k_16_16_FLOAT:
+    case xenos::TextureFormat::k_32_32:
+    case xenos::TextureFormat::k_32_32_FLOAT:
+    case xenos::TextureFormat::k_DXN:
+      return true;
+    default:
+      break;
+  }
+
+  // Check if the texture is loaded in cache and verified opaque.
+  TextureKey key;
+  BindingInfoFromFetchConstant(fetch, key, nullptr);
+  if (!key.is_valid) {
+    return false;
+  }
+  auto it = textures_.find(key);
+  if (it != textures_.end() && it->second) {
+    return it->second->is_opaque();
+  }
+  return false;
+}
+
 
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   const auto& regs = register_file();

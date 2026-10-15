@@ -43,6 +43,7 @@
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/shader.h>
+#include <rex/graphics/vulkan/texture_cache.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
 #include <rex/logging.h>
@@ -1011,15 +1012,40 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
                                                   ? DepthStencilMode::kFloat24Rounding
                                                   : DepthStencilMode::kFloat24Truncating;
     } else {
+      bool coverage_depends_on_alpha =
+          draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>());
+      if (coverage_depends_on_alpha) {
+        auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+        if (!rb_colorcontrol.alpha_to_mask_enable &&
+            (rb_colorcontrol.alpha_func == xenos::CompareFunction::kGreater ||
+             rb_colorcontrol.alpha_func == xenos::CompareFunction::kGreaterEqual)) {
+          float alpha_ref = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
+          // Pass 212 uses ref = 127/255 (0.498039f). If ref <= 128/255:
+          if (alpha_ref <= (128.0f / 255.0f)) {
+            uint64_t ps_hash = shader.ucode_data_hash();
+            if (ps_hash == 0x2D4C010D3D75DEA5ULL || ps_hash == 0xBB76BFE616E4DF1FULL ||
+                ps_hash == 0x6E6F06115807B602ULL) {
+              float c102_w = *reinterpret_cast<const float*>(
+                  &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * 102 + 3]);
+              if (c102_w >= 0.999f) {
+                auto* tc = command_processor_.texture_cache();
+                if (tc && tc->IsFetchOpaque(regs.GetTextureFetch(0))) {
+                  coverage_depends_on_alpha = false;
+                }
+              }
+            }
+          }
+        }
+      }
       if (shader.implicit_early_z_write_allowed() &&
-          (!shader.writes_color_target(0) ||
-           !draw_util::DoesCoverageDependOnAlpha(regs.Get<reg::RB_COLORCONTROL>()))) {
+          (!shader.writes_color_target(0) || !coverage_depends_on_alpha)) {
         modification.pixel.depth_stencil_mode = DepthStencilMode::kEarlyHint;
       } else {
         modification.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;
       }
     }
   }
+
 
   return modification;
 }

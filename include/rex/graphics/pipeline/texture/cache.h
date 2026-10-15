@@ -130,6 +130,12 @@ class TextureCache {
            (binding->texture_signed && binding->texture_signed->key().scaled_resolve);
   }
 
+  // Returns true if the texture fetched by this constant is known to be 100% opaque,
+  // allowing alpha tests (such as kGreater with ref <= 127/255) to be safely bypassed
+  // and restoring hardware TBDR Hidden Surface Removal.
+  bool IsFetchOpaque(const xenos::xe_gpu_texture_fetch_t& fetch) const;
+
+
  protected:
   struct TextureKey {
     // Dimensions minus 1 are stored similarly to how they're stored in fetch
@@ -214,6 +220,9 @@ class TextureCache {
 
     uint64_t GetHostMemoryUsage() const { return host_memory_usage_; }
 
+    bool is_opaque() const { return is_opaque_; }
+    void set_is_opaque(bool opaque) { is_opaque_ = opaque; }
+
     uint64_t last_usage_submission_index() const { return last_usage_submission_index_; }
     uint64_t last_usage_time() const { return last_usage_time_; }
     static constexpr uint32_t kOutdatedBitBase = UINT32_C(1) << 0;
@@ -262,6 +271,7 @@ class TextureCache {
     Texture* used_next_;
     bool in_usage_list_;
     bool force_load_3d_tiling_ = false;
+    bool is_opaque_ = false;
 
     // These are to be accessed within the global critical region to synchronize
     // with shared memory.
@@ -561,6 +571,7 @@ class TextureCache {
                           PendingSharedMemoryRange* pending_ranges_out,
                           size_t& pending_range_count_out);
   bool CommitPreparedTextureLoad(const PendingTextureLoad& pending_load);
+  void UpdateTextureOpacity(Texture& texture);
 
   void UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t subtract);
 
