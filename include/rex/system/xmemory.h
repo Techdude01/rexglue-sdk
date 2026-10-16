@@ -337,6 +337,7 @@ class PhysicalHeap : public BaseHeap {
 
   void EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
                              bool enable_invalidation_notifications, bool enable_data_providers);
+  void UnprotectAndUnwatchRange(uint32_t physical_address, uint32_t length, bool unprotect = true);
   // Returns true if any page in the range was watched.
   bool TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                         uint32_t virtual_address, uint32_t length, bool is_write,
@@ -527,6 +528,7 @@ class Memory {
   void EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint32_t length,
                                            bool enable_invalidation_notifications,
                                            bool enable_data_providers);
+  void UnwatchPhysicalMemory(uint32_t physical_address, uint32_t length, bool unprotect = true);
 
   // Forces triggering of watch callbacks for a virtual address range if pages
   // are watched there and unwatching them. Returns whether any page was
@@ -580,6 +582,8 @@ class Memory {
   bool InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,
                                uint32_t image_size);
   bool DestroyFunctionTable(uint32_t code_base);
+  bool HasFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t table_base) const;
+  bool ClearFunctionTable(uint32_t code_base, uint32_t code_size);
   // Returns false if guest_address is outside every registered module range.
   bool SetFunction(uint32_t guest_address, PPCFunc* host_function);
   bool HasAnyFunctionTable() const;

@@ -771,6 +771,16 @@ void Memory::EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint
                                          enable_invalidation_notifications, enable_data_providers);
 }
 
+void Memory::UnwatchPhysicalMemory(uint32_t physical_address, uint32_t length, bool unprotect) {
+  if (!length) {
+    return;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  heaps_.vA0000000.UnprotectAndUnwatchRange(physical_address, length, unprotect);
+  heaps_.vC0000000.UnprotectAndUnwatchRange(physical_address, length, unprotect);
+  heaps_.vE0000000.UnprotectAndUnwatchRange(physical_address, length, unprotect);
+}
+
 uint32_t Memory::SystemHeapAlloc(uint32_t size, uint32_t alignment, uint32_t system_heap_flags) {
   // TODO(benvanik): lightweight pool.
   bool is_physical = !!(system_heap_flags & memory::kSystemHeapPhysical);
@@ -921,6 +931,58 @@ bool Memory::DestroyFunctionTable(uint32_t code_base) {
                table_base, table_size, logged_code_base, logged_code_base + logged_code_size);
 
   heaps_.v80000000.Release(table_base);
+  return true;
+}
+
+bool Memory::HasFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t table_base) const {
+  std::lock_guard lock(const_cast<std::mutex&>(function_tables_mutex_));
+  auto it = std::find_if(
+      function_tables_.begin(), function_tables_.end(),
+      [code_base, code_size, table_base](const FunctionTableEntry& entry) {
+        return entry.code_base == code_base && entry.code_size == code_size &&
+               entry.table_base == table_base;
+      });
+  if (it == function_tables_.end()) {
+    return false;
+  }
+  auto* heap = const_cast<Memory*>(this)->LookupHeap(it->table_base);
+  if (!heap) {
+    return false;
+  }
+  uint32_t protect = 0;
+  if (!heap->QueryProtect(it->table_base, &protect) ||
+      !(protect & (memory::kMemoryProtectWrite | memory::kMemoryProtectWriteCombine))) {
+    return false;
+  }
+  return true;
+}
+
+bool Memory::ClearFunctionTable(uint32_t code_base, uint32_t code_size) {
+  uint32_t table_base = 0;
+  uint32_t table_size = 0;
+  {
+    std::lock_guard lock(function_tables_mutex_);
+    auto it = std::find_if(
+        function_tables_.begin(), function_tables_.end(),
+        [code_base, code_size](const FunctionTableEntry& entry) {
+          return entry.code_base == code_base && entry.code_size == code_size;
+        });
+    if (it == function_tables_.end()) {
+      return false;
+    }
+    table_base = it->table_base;
+    table_size = (it->code_size + it->thunk_reserve) * 2;
+  }
+  auto* heap = LookupHeap(table_base);
+  if (!heap) {
+    return false;
+  }
+  uint32_t protect = 0;
+  if (!heap->QueryProtect(table_base, &protect) ||
+      !(protect & (memory::kMemoryProtectWrite | memory::kMemoryProtectWriteCombine))) {
+    return false;
+  }
+  Zero(table_base, table_size);
   return true;
 }
 
@@ -2216,6 +2278,28 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
     }
     rex::memory::PageAccess current_page_access =
         ToPageAccess(page_table_[guest_page_number].current_protect);
+    uint32_t page_phys_addr =
+        rex::sat_sub(i * system_page_size_, host_address_offset()) + physical_address_offset;
+    if (current_page_access == rex::memory::PageAccess::kNoAccess && parent_heap_) {
+      uint32_t parent_protect = 0;
+      if (parent_heap_->QueryProtect(page_phys_addr, &parent_protect) && parent_protect) {
+        current_page_access = ToPageAccess(parent_protect);
+      } else {
+        HeapAllocationInfo physical_info{};
+        if (parent_heap_->QueryRegionInfo(page_phys_addr, &physical_info) &&
+            (physical_info.state & memory::kMemoryAllocationCommit)) {
+          uint32_t eff_protect =
+              physical_info.protect ? physical_info.protect : physical_info.allocation_protect;
+          if (eff_protect) {
+            current_page_access = ToPageAccess(eff_protect);
+          } else {
+            current_page_access = rex::memory::PageAccess::kReadWrite;
+          }
+        } else {
+          current_page_access = rex::memory::PageAccess::kReadWrite;
+        }
+      }
+    }
     bool protect_system_page = false;
     // Don't do anything with inaccessible pages - don't protect, don't enable
     // callbacks - because real access violations are needed there. And don't
@@ -2253,9 +2337,102 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
   }
 }
 
-bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
-                                    uint32_t virtual_address, uint32_t length, bool is_write,
-                                    bool unwatch_exact_range, bool unprotect) {
+void PhysicalHeap::UnprotectAndUnwatchRange(uint32_t physical_address, uint32_t length,
+                                           bool unprotect) {
+  if (length == 0) {
+    return;
+  }
+  uint32_t physical_address_offset = GetPhysicalAddress(heap_base_);
+  if (physical_address < physical_address_offset) {
+    if (physical_address_offset - physical_address >= length) {
+      return;
+    }
+    length -= physical_address_offset - physical_address;
+    physical_address = physical_address_offset;
+  }
+  uint32_t heap_relative_address = physical_address - physical_address_offset;
+  if (heap_relative_address >= heap_size_) {
+    return;
+  }
+  length = std::min(length, heap_size_ - heap_relative_address);
+  if (length == 0) {
+    return;
+  }
+
+  uint32_t system_page_first = (heap_relative_address + host_address_offset()) / system_page_size_;
+  uint32_t system_page_last =
+      (heap_relative_address + length - 1 + host_address_offset()) / system_page_size_;
+  system_page_last = std::min(system_page_last, system_page_count_ - 1);
+  if (system_page_first > system_page_last) {
+    return;
+  }
+  uint32_t block_index_first = system_page_first >> 6;
+  uint32_t block_index_last = system_page_last >> 6;
+
+  // Unprotect ranges that need unprotection.
+  if (unprotect) {
+    uint8_t* protect_base = membase_ + heap_base_;
+    uint32_t unprotect_system_page_first = UINT32_MAX;
+    for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
+      // Check if need to allow writing to this page.
+      bool unprotect_page =
+          (system_page_flags_[i >> 6].notify_on_invalidation & (uint64_t(1) << (i & 63))) != 0;
+      if (unprotect_page) {
+        uint32_t guest_page_number =
+            rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
+        rex::memory::PageAccess access =
+            ToPageAccess(page_table_[guest_page_number].current_protect);
+        if (access == rex::memory::PageAccess::kNoAccess && parent_heap_) {
+          uint32_t page_phys_addr =
+              rex::sat_sub(i * system_page_size_, host_address_offset()) + physical_address_offset;
+          uint32_t parent_protect = 0;
+          if (parent_heap_->QueryProtect(page_phys_addr, &parent_protect) && parent_protect) {
+            access = ToPageAccess(parent_protect);
+          } else {
+            access = rex::memory::PageAccess::kReadWrite;
+          }
+        }
+        if (access != rex::memory::PageAccess::kReadWrite) {
+          unprotect_page = false;
+        }
+      }
+      if (unprotect_page) {
+        if (unprotect_system_page_first == UINT32_MAX) {
+          unprotect_system_page_first = i;
+        }
+      } else {
+        if (unprotect_system_page_first != UINT32_MAX) {
+          rex::memory::Protect(protect_base + unprotect_system_page_first * system_page_size_,
+                               (i - unprotect_system_page_first) * system_page_size_,
+                               rex::memory::PageAccess::kReadWrite);
+          unprotect_system_page_first = UINT32_MAX;
+        }
+      }
+    }
+    if (unprotect_system_page_first != UINT32_MAX) {
+      rex::memory::Protect(protect_base + unprotect_system_page_first * system_page_size_,
+                           (system_page_last + 1 - unprotect_system_page_first) * system_page_size_,
+                           rex::memory::PageAccess::kReadWrite);
+    }
+  }
+
+  // Mark pages as not write-watched.
+  for (uint32_t i = block_index_first; i <= block_index_last; ++i) {
+    uint64_t mask = 0;
+    if (i == block_index_first) {
+      mask |= (uint64_t(1) << (system_page_first & 63)) - 1;
+    }
+    if (i == block_index_last && (system_page_last & 63) != 63) {
+      mask |= ~((uint64_t(1) << ((system_page_last & 63) + 1)) - 1);
+    }
+    system_page_flags_[i].notify_on_invalidation &= mask;
+  }
+}
+
+bool PhysicalHeap::TriggerCallbacks(
+    [[maybe_unused]] std::unique_lock<std::recursive_mutex> global_lock_locked_once,
+    uint32_t virtual_address, uint32_t length, bool is_write, bool unwatch_exact_range,
+    bool unprotect) {
   // TODO(Triang3l): Support read watches.
   assert_true(is_write);
   if (!is_write) {
@@ -2343,69 +2520,17 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
     unwatch_first = std::max(unwatch_first, physical_address_start & ~(kMaxUnwatchExcess - 1));
     unwatch_last = std::min(
         unwatch_last, (physical_address_start + physical_length - 1) | (kMaxUnwatchExcess - 1));
-    // Convert to heap-relative addresses.
-    unwatch_first = rex::sat_sub(unwatch_first, physical_address_offset);
-    unwatch_last = rex::sat_sub(unwatch_last, physical_address_offset);
-    // Clamp to the heap upper bound.
-    unwatch_first = std::min(unwatch_first, heap_size_ - 1);
-    unwatch_last = std::min(unwatch_last, heap_size_ - 1);
-    // Convert to system pages and update the range.
-    unwatch_first += host_address_offset();
-    unwatch_last += host_address_offset();
-    assert_true(unwatch_first <= unwatch_last);
-    system_page_first = unwatch_first / system_page_size_;
-    system_page_last = unwatch_last / system_page_size_;
-    block_index_first = system_page_first >> 6;
-    block_index_last = system_page_last >> 6;
+  } else {
+    unwatch_first = physical_address_start;
+    unwatch_last = physical_address_start + physical_length - 1;
   }
 
-  // Unprotect ranges that need unprotection.
-  if (unprotect) {
-    uint8_t* protect_base = membase_ + heap_base_;
-    uint32_t unprotect_system_page_first = UINT32_MAX;
-    for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
-      // Check if need to allow writing to this page.
-      bool unprotect_page =
-          (system_page_flags_[i >> 6].notify_on_invalidation & (uint64_t(1) << (i & 63))) != 0;
-      if (unprotect_page) {
-        uint32_t guest_page_number =
-            rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
-        if (ToPageAccess(page_table_[guest_page_number].current_protect) !=
-            rex::memory::PageAccess::kReadWrite) {
-          unprotect_page = false;
-        }
-      }
-      if (unprotect_page) {
-        if (unprotect_system_page_first == UINT32_MAX) {
-          unprotect_system_page_first = i;
-        }
-      } else {
-        if (unprotect_system_page_first != UINT32_MAX) {
-          rex::memory::Protect(protect_base + unprotect_system_page_first * system_page_size_,
-                               (i - unprotect_system_page_first) * system_page_size_,
-                               rex::memory::PageAccess::kReadWrite);
-          unprotect_system_page_first = UINT32_MAX;
-        }
-      }
-    }
-    if (unprotect_system_page_first != UINT32_MAX) {
-      rex::memory::Protect(protect_base + unprotect_system_page_first * system_page_size_,
-                           (system_page_last + 1 - unprotect_system_page_first) * system_page_size_,
-                           rex::memory::PageAccess::kReadWrite);
-    }
-  }
+  uint32_t unwatch_phys_start = unwatch_first;
+  uint32_t unwatch_phys_len =
+      unwatch_last >= unwatch_first ? (unwatch_last - unwatch_first + 1) : 0;
 
-  // Mark pages as not write-watched.
-  for (uint32_t i = block_index_first; i <= block_index_last; ++i) {
-    uint64_t mask = 0;
-    if (i == block_index_first) {
-      mask |= (uint64_t(1) << (system_page_first & 63)) - 1;
-    }
-    if (i == block_index_last && (system_page_last & 63) != 63) {
-      mask |= ~((uint64_t(1) << ((system_page_last & 63) + 1)) - 1);
-    }
-    system_page_flags_[i].notify_on_invalidation &= mask;
-  }
+  // Unprotect and unwatch across all physical memory alias heaps.
+  memory_->UnwatchPhysicalMemory(unwatch_phys_start, unwatch_phys_len, unprotect);
 
   return true;
 }
