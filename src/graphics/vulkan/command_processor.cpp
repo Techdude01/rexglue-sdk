@@ -4192,7 +4192,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                       vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
           return false;
       }
-      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
+      if (!RequestSharedMemoryRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
             "memory",
@@ -4207,7 +4207,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t memexport_extent_start = UINT32_MAX, memexport_extent_end = 0;
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
     uint32_t memexport_range_base_bytes = memexport_range.base_address_dwords << 2;
-    if (!shared_memory_->RequestRange(memexport_range_base_bytes, memexport_range.size_bytes)) {
+    if (!RequestSharedMemoryRange(memexport_range_base_bytes, memexport_range.size_bytes)) {
       REXGPU_ERROR(
           "Failed to request memexport stream at 0x{:08X} (size {}) in the "
           "shared memory",
@@ -4219,7 +4219,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         std::max(memexport_extent_end, memexport_range_base_bytes + memexport_range.size_bytes);
   }
   if (memexport_writes_possible && memexport_ranges_.empty()) {
-    if (!shared_memory_->RequestRange(0, SharedMemory::kBufferSize)) {
+    if (!RequestSharedMemoryRange(0, SharedMemory::kBufferSize)) {
       REXGPU_ERROR(
           "Failed to request full shared memory residency for unresolved "
           "memexport destinations");
@@ -5391,6 +5391,8 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     last_bound_constant_buffer_handle_ = VK_NULL_HANDLE;
     last_bound_constant_buffer_dynamic_offsets_.fill(UINT32_MAX);
     current_constant_buffer_handle_ = VK_NULL_HANDLE;
+    validated_shared_memory_ranges_count_ = 0;
+    validated_shared_memory_ranges_epoch_ = 0;
 
     // Reclaim pool pages - no need to do this every small submission since some
     // may be reused.
@@ -5701,6 +5703,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       bound_index_type_ = VK_INDEX_TYPE_MAX_ENUM;
 
       shared_memory_->ClearCache();
+      validated_shared_memory_ranges_count_ = 0;
+      validated_shared_memory_ranges_epoch_ = 0;
     }
   }
 
@@ -6646,6 +6650,36 @@ VkDescriptorSet VulkanCommandProcessor::GetOrCreateDynamicConstantsDescriptorSet
 
   dynamic_constants_descriptor_sets_.push_back({buffer, descriptor_set});
   return descriptor_set;
+}
+
+bool VulkanCommandProcessor::RequestSharedMemoryRange(uint32_t start, uint32_t length) {
+  if (!length) {
+    return true;
+  }
+  uint64_t current_epoch = shared_memory_->residency_epoch();
+  if (current_epoch != validated_shared_memory_ranges_epoch_) {
+    validated_shared_memory_ranges_count_ = 0;
+    validated_shared_memory_ranges_epoch_ = current_epoch;
+  } else {
+    uint32_t req_end = start + length;
+    for (size_t i = 0; i < validated_shared_memory_ranges_count_; ++i) {
+      const auto& entry = validated_shared_memory_ranges_[i];
+      if (start >= entry.first && req_end <= entry.first + entry.second) {
+        return true;
+      }
+    }
+  }
+
+  if (!shared_memory_->RequestRange(start, length)) {
+    return false;
+  }
+
+  if (validated_shared_memory_ranges_count_ < validated_shared_memory_ranges_.size()) {
+    validated_shared_memory_ranges_[validated_shared_memory_ranges_count_++] = {start, length};
+  } else {
+    validated_shared_memory_ranges_[0] = {start, length};
+  }
+  return true;
 }
 
 bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
