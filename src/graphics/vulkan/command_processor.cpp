@@ -4038,16 +4038,33 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           pipeline_layout->descriptor_set_layout_textures_vertex_ref()) {
         descriptor_sets_kept = std::min(
             descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesVertex));
+        bound_textures_vertex_count_ = UINT32_MAX;
+        bound_samplers_vertex_count_ = UINT32_MAX;
+        current_graphics_descriptor_set_values_up_to_date_ &=
+            ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex);
       }
       if (current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref() !=
           pipeline_layout->descriptor_set_layout_textures_pixel_ref()) {
         descriptor_sets_kept = std::min(
             descriptor_sets_kept, uint32_t(SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+        bound_textures_pixel_count_ = UINT32_MAX;
+        bound_samplers_pixel_count_ = UINT32_MAX;
+        current_graphics_descriptor_set_values_up_to_date_ &=
+            ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel);
       }
+      current_graphics_descriptor_sets_bound_up_to_date_ &=
+          (UINT32_C(1) << descriptor_sets_kept) - 1;
     } else {
       // No or unknown pipeline layout previously bound - all bindings are in an
       // indeterminate state.
       current_graphics_descriptor_sets_bound_up_to_date_ = 0;
+      bound_textures_vertex_count_ = UINT32_MAX;
+      bound_samplers_vertex_count_ = UINT32_MAX;
+      bound_textures_pixel_count_ = UINT32_MAX;
+      bound_samplers_pixel_count_ = UINT32_MAX;
+      current_graphics_descriptor_set_values_up_to_date_ &=
+          ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
+            (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
     }
     current_guest_graphics_pipeline_layout_ = pipeline_layout;
   }
@@ -5348,6 +5365,10 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
         shared_memory_and_edram_descriptor_set_;
     current_graphics_descriptor_set_values_up_to_date_ =
         UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram;
+    bound_textures_vertex_count_ = UINT32_MAX;
+    bound_samplers_vertex_count_ = UINT32_MAX;
+    bound_textures_pixel_count_ = UINT32_MAX;
+    bound_samplers_pixel_count_ = UINT32_MAX;
 
     // Reclaim pool pages - no need to do this every small submission since some
     // may be reused.
@@ -6732,10 +6753,84 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     sampler_count_pixel = 0;
     texture_count_pixel = 0;
   }
-  // TODO(Triang3l): Reuse texture and sampler bindings if not changed.
-  current_graphics_descriptor_set_values_up_to_date_ &=
-      ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
+  // Reuse texture and sampler bindings if not changed.
+  bool textures_vertex_dirty =
+      !(current_graphics_descriptor_set_values_up_to_date_ &
+        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex));
+  if (!texture_count_vertex && !sampler_count_vertex) {
+    bound_textures_vertex_count_ = UINT32_MAX;
+    bound_samplers_vertex_count_ = UINT32_MAX;
+    current_graphics_descriptor_set_values_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex);
+  } else if (!textures_vertex_dirty) {
+    if (bound_textures_vertex_count_ != texture_count_vertex ||
+        bound_samplers_vertex_count_ != sampler_count_vertex ||
+        texture_count_vertex > kMaxCachedShaderTextures ||
+        sampler_count_vertex > kMaxCachedShaderSamplers) {
+      textures_vertex_dirty = true;
+    } else {
+      for (uint32_t i = 0; i < texture_count_vertex; ++i) {
+        const VulkanShader::TextureBinding& binding = textures_vertex[i];
+        VkImageView image_view = texture_cache_->GetActiveBindingOrNullImageView(
+            binding.fetch_constant, binding.dimension, bool(binding.is_signed));
+        if (bound_texture_image_views_vertex_[i] != image_view) {
+          textures_vertex_dirty = true;
+          break;
+        }
+      }
+      if (!textures_vertex_dirty) {
+        for (uint32_t i = 0; i < sampler_count_vertex; ++i) {
+          if (bound_samplers_vertex_[i] != current_samplers_vertex_[i].second) {
+            textures_vertex_dirty = true;
+            break;
+          }
+        }
+      }
+    }
+    if (textures_vertex_dirty) {
+      current_graphics_descriptor_set_values_up_to_date_ &=
+          ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex);
+    }
+  }
+
+  bool textures_pixel_dirty =
+      !(current_graphics_descriptor_set_values_up_to_date_ &
         (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+  if (!texture_count_pixel && !sampler_count_pixel) {
+    bound_textures_pixel_count_ = UINT32_MAX;
+    bound_samplers_pixel_count_ = UINT32_MAX;
+    current_graphics_descriptor_set_values_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel);
+  } else if (!textures_pixel_dirty) {
+    if (bound_textures_pixel_count_ != texture_count_pixel ||
+        bound_samplers_pixel_count_ != sampler_count_pixel ||
+        texture_count_pixel > kMaxCachedShaderTextures ||
+        sampler_count_pixel > kMaxCachedShaderSamplers) {
+      textures_pixel_dirty = true;
+    } else {
+      for (uint32_t i = 0; i < texture_count_pixel; ++i) {
+        const VulkanShader::TextureBinding& binding = (*textures_pixel)[i];
+        VkImageView image_view = texture_cache_->GetActiveBindingOrNullImageView(
+            binding.fetch_constant, binding.dimension, bool(binding.is_signed));
+        if (bound_texture_image_views_pixel_[i] != image_view) {
+          textures_pixel_dirty = true;
+          break;
+        }
+      }
+      if (!textures_pixel_dirty) {
+        for (uint32_t i = 0; i < sampler_count_pixel; ++i) {
+          if (bound_samplers_pixel_[i] != current_samplers_pixel_[i].second) {
+            textures_pixel_dirty = true;
+            break;
+          }
+        }
+      }
+    }
+    if (textures_pixel_dirty) {
+      current_graphics_descriptor_set_values_up_to_date_ &=
+          ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel);
+    }
+  }
 
   // Make sure new descriptor sets are bound to the command buffer.
 
@@ -6861,6 +6956,20 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex;
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex] =
         write_textures[0].dstSet;
+    bound_textures_vertex_count_ = texture_count_vertex;
+    bound_samplers_vertex_count_ = sampler_count_vertex;
+    if (texture_count_vertex <= kMaxCachedShaderTextures) {
+      for (uint32_t i = 0; i < texture_count_vertex; ++i) {
+        bound_texture_image_views_vertex_[i] =
+            descriptor_write_image_info_[vertex_texture_image_info_offset + i].imageView;
+      }
+    }
+    if (sampler_count_vertex <= kMaxCachedShaderSamplers) {
+      for (uint32_t i = 0; i < sampler_count_vertex; ++i) {
+        bound_samplers_vertex_[i] =
+            descriptor_write_image_info_[vertex_sampler_image_info_offset + i].sampler;
+      }
+    }
   }
   // Pixel shader textures and samplers.
   if (write_pixel_textures) {
@@ -6878,6 +6987,20 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
         write_textures[0].dstSet;
+    bound_textures_pixel_count_ = texture_count_pixel;
+    bound_samplers_pixel_count_ = sampler_count_pixel;
+    if (texture_count_pixel <= kMaxCachedShaderTextures) {
+      for (uint32_t i = 0; i < texture_count_pixel; ++i) {
+        bound_texture_image_views_pixel_[i] =
+            descriptor_write_image_info_[pixel_texture_image_info_offset + i].imageView;
+      }
+    }
+    if (sampler_count_pixel <= kMaxCachedShaderSamplers) {
+      for (uint32_t i = 0; i < sampler_count_pixel; ++i) {
+        bound_samplers_pixel_[i] =
+            descriptor_write_image_info_[pixel_sampler_image_info_offset + i].sampler;
+      }
+    }
   }
   // Write.
   if (write_descriptor_set_count) {

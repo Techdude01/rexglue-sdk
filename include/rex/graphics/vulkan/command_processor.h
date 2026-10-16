@@ -843,6 +843,19 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
+
+  // Cached texture and sampler bindings for descriptor set reuse.
+  static constexpr uint32_t kMaxCachedShaderTextures = 32;
+  static constexpr uint32_t kMaxCachedShaderSamplers = 32;
+  uint32_t bound_textures_vertex_count_ = UINT32_MAX;
+  uint32_t bound_samplers_vertex_count_ = UINT32_MAX;
+  std::array<VkImageView, kMaxCachedShaderTextures> bound_texture_image_views_vertex_{};
+  std::array<VkSampler, kMaxCachedShaderSamplers> bound_samplers_vertex_{};
+
+  uint32_t bound_textures_pixel_count_ = UINT32_MAX;
+  uint32_t bound_samplers_pixel_count_ = UINT32_MAX;
+  std::array<VkImageView, kMaxCachedShaderTextures> bound_texture_image_views_pixel_{};
+  std::array<VkSampler, kMaxCachedShaderSamplers> bound_samplers_pixel_{};
 };
 
 }  // namespace rex::graphics::vulkan
