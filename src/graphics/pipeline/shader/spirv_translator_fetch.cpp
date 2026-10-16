@@ -1455,23 +1455,11 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         }
 
         // Calculate the gradients for sampling the texture if needed.
-        // If in a pixel shader with uniform control flow and normalized 2D
-        // coordinates, implicit hardware LOD with bias can be used instead of
-        // manual gradient calculations, saving substantial ALU, register
-        // pressure, and derivative quad shuffle overhead.
-        bool can_use_implicit_lod =
-            is_pixel_shader() && use_computed_lod &&
-            !instr.attributes.use_register_gradients &&
-            !instr.attributes.unnormalized_coordinates &&
-            cf_exec_conditional_merge_ == nullptr &&
-            cf_instruction_predicate_merge_ == nullptr &&
-            main_loop_header_ == nullptr && main_switch_header_ == nullptr &&
-            instr.dimension == xenos::FetchOpDimension::k2D;
         // 2D vectors for k1D (because 1D images are emulated as 2D arrays),
         // k2D.
         // 3D vectors for k3DOrStacked, kCube.
         spv::Id gradients_h = spv::NoResult, gradients_v = spv::NoResult;
-        if (use_computed_lod && !can_use_implicit_lod) {
+        if (use_computed_lod) {
           // TODO(Triang3l): Gradient exponent adjustment is currently not done
           // in getCompTexLOD, so not doing it here too for now. Apply the
           // gradient exponent biases from the word 4 of the fetch constant in
@@ -1632,13 +1620,9 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
 
         // Sample the texture.
         spv::ImageOperandsMask image_operands_mask =
-            can_use_implicit_lod
-                ? spv::ImageOperandsMaskNone
-                : (use_computed_lod ? spv::ImageOperandsGradMask : spv::ImageOperandsLodMask);
+            use_computed_lod ? spv::ImageOperandsGradMask : spv::ImageOperandsLodMask;
         spv::Id sample_result_unsigned, sample_result_signed;
-        if (can_use_implicit_lod) {
-          texture_parameters.bias = lod;
-        } else if (!use_computed_lod) {
+        if (!use_computed_lod) {
           texture_parameters.lod = lod;
         }
         if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {
@@ -1858,7 +1842,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           sample_result_signed =
               if_data_is_3d.createMergePhi(sample_result_signed_3d, sample_result_signed_stacked);
         } else {
-          if (use_computed_lod && !can_use_implicit_lod) {
+          if (use_computed_lod) {
             texture_parameters.gradX = gradients_h;
             texture_parameters.gradY = gradients_v;
           }
