@@ -5673,6 +5673,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       // they're referenced by pipelines, which are not destroyed.
 
       primitive_processor_->ClearCache();
+      bound_index_buffer_ = VK_NULL_HANDLE;
+      bound_index_buffer_offset_ = 0;
+      bound_index_type_ = VK_INDEX_TYPE_MAX_ENUM;
 
       shared_memory_->ClearCache();
     }
