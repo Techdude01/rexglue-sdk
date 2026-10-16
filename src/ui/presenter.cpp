@@ -41,9 +41,9 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
     .range(0, 100);
 
 #if defined(REX_HAS_FIDELITYFX_SDK)
-REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
-                      "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
-    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"})
+REXCVAR_DEFINE_STRING(present_effect, "fsr", "UI/Presenter",
+                      "Guest output effect: bilinear, cas, fsr, fsr2, fsr3, metalfx")
+    .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3", "metalfx"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
@@ -96,7 +96,7 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
   if (lowered == "cas") {
     return GuestOutputPaintConfig::Effect::kCas;
   }
-  if (lowered == "fsr") {
+  if (lowered == "fsr" || lowered == "metalfx") {
     return GuestOutputPaintConfig::Effect::kFsr;
   }
   if (lowered == "fsr2") {

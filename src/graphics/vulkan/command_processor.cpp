@@ -75,6 +75,11 @@ REXCVAR_DEFINE_INT32(
     "0 disables tracing")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(
+    gpu_profile_cpu, true, "GPU/Vulkan",
+    "Profile and log CPU draw recording breakdown periodically (every 120 frames) or on provenance frames")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -3743,6 +3748,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     provenance_draw_id = ++gpu_provenance_draw_index_;
   }
 
+  bool profile_cpu = REXCVAR_GET(gpu_profile_cpu) &&
+                     (IsGpuProvenanceFrame(frame_current_) || (frame_current_ % 120 == 0));
+  auto t_draw_start = profile_cpu ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
+
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
   const ui::vulkan::VulkanDevice::Properties& device_properties = GetVulkanDevice()->properties();
@@ -3835,8 +3845,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
 
     // Process primitives.
+    auto t_prim_start = profile_cpu ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
     if (!primitive_processor_->Process(primitive_processing_result)) {
       return draw_fail("primitive_processing");
+    }
+    if (profile_cpu) {
+      frame_cpu_profiling_stats_.time_primitive_processing +=
+          std::chrono::steady_clock::now() - t_prim_start;
     }
     if (!primitive_processing_result.host_draw_vertex_count) {
       // Nothing to draw.
@@ -3966,12 +3982,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
+  auto t_rts_start = profile_cpu ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return draw_fail("render_target_update");
   }
+  if (profile_cpu) {
+    frame_cpu_profiling_stats_.time_render_target_update +=
+        std::chrono::steady_clock::now() - t_rts_start;
+  }
 
-  if (provenance_draw_id) {
+  if (provenance_draw_id &&
+      (provenance_draw_id <= 10 || provenance_draw_id % 100 == 0 || provenance_draw_id == 1000)) {
     std::array<uint32_t, 1 + xenos::kMaxColorRenderTargets> depth_and_color_formats{};
     static_assert(std::tuple_size_v<decltype(depth_and_color_formats)> ==
                   1 + xenos::kMaxColorRenderTargets);
@@ -4018,6 +4041,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // Create the pipeline (for this, need the render pass from the render target
   // cache), translating the shaders - doing this now to obtain the used
   // textures.
+  auto t_pipe_start = profile_cpu ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
   VkPipeline pipeline;
   void* pipeline_handle = nullptr;
   if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
@@ -4032,6 +4057,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // may happen between pipeline configuration and binding.
   pipeline_cache_->GetPipelineAndLayoutByHandle(pipeline_handle, pipeline, pipeline_layout_provider,
                                                 &pipeline_is_placeholder);
+  if (profile_cpu) {
+    frame_cpu_profiling_stats_.time_pipeline_configuration +=
+        std::chrono::steady_clock::now() - t_pipe_start;
+  }
   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
     frame_used_async_placeholder_pipeline_ = true;
     if (provenance_draw_id) {
@@ -4165,11 +4194,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
+  auto t_bind_start = profile_cpu ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
   if (!UpdateBindings(vertex_shader, pixel_shader)) {
     return draw_fail("update_bindings");
   }
+  if (profile_cpu) {
+    frame_cpu_profiling_stats_.time_binding_updates +=
+        std::chrono::steady_clock::now() - t_bind_start;
+  }
 
   // Ensure vertex buffers are resident.
+  auto t_shmem_start = profile_cpu ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
     uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
@@ -4231,6 +4268,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       return false;
     }
   }
+  if (profile_cpu) {
+    frame_cpu_profiling_stats_.time_shared_memory_residency +=
+        std::chrono::steady_clock::now() - t_shmem_start;
+  }
 
   ScratchBufferAcquisition guest_dma_index_scratch_buffer;
   if (primitive_processing_result.index_buffer_type ==
@@ -4291,11 +4332,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // After all commands that may dispatch, copy or insert barriers, submit
   // the barriers (may end the render pass), and (re)enter the render pass
   // before drawing.
+  auto t_bar_start = profile_cpu ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
   SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       render_target_cache_->last_update_render_pass(),
       render_target_cache_->last_update_framebuffer());
+  if (profile_cpu) {
+    frame_cpu_profiling_stats_.time_barriers_and_render_pass +=
+        std::chrono::steady_clock::now() - t_bar_start;
+  }
 
   // Draw.
+  auto t_vkdraw_start = profile_cpu ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
@@ -4341,6 +4390,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
   }
+  if (profile_cpu) {
+    frame_cpu_profiling_stats_.time_vk_draw +=
+        std::chrono::steady_clock::now() - t_vkdraw_start;
+  }
 
   // Invalidate textures in memexported memory and watch for changes.
   if (!memexport_ranges_.empty()) {
@@ -4369,9 +4422,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
 
-  if (provenance_draw_id) {
+  if (provenance_draw_id &&
+      (provenance_draw_id <= 10 || provenance_draw_id % 100 == 0 || provenance_draw_id == 1000)) {
     REXGPU_INFO("GPU provenance frame {} draw {} status=commands_recorded", frame_current_,
                 provenance_draw_id);
+  }
+  if (profile_cpu) {
+    frame_cpu_profiling_stats_.draw_count++;
+    frame_cpu_profiling_stats_.time_draw_total +=
+        std::chrono::steady_clock::now() - t_draw_start;
   }
   return true;
 }
@@ -5670,6 +5729,24 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
   }
 
   if (is_closing_frame) {
+    if (frame_cpu_profiling_stats_.draw_count > 0) {
+      double total_draw_ms = frame_cpu_profiling_stats_.time_draw_total.count() / 1e6;
+      double prim_ms = frame_cpu_profiling_stats_.time_primitive_processing.count() / 1e6;
+      double rts_ms = frame_cpu_profiling_stats_.time_render_target_update.count() / 1e6;
+      double pipe_ms = frame_cpu_profiling_stats_.time_pipeline_configuration.count() / 1e6;
+      double bind_ms = frame_cpu_profiling_stats_.time_binding_updates.count() / 1e6;
+      double shmem_ms = frame_cpu_profiling_stats_.time_shared_memory_residency.count() / 1e6;
+      double bar_rp_ms = frame_cpu_profiling_stats_.time_barriers_and_render_pass.count() / 1e6;
+      double vk_draw_ms = frame_cpu_profiling_stats_.time_vk_draw.count() / 1e6;
+      double other_ms = total_draw_ms - (prim_ms + rts_ms + pipe_ms + bind_ms + shmem_ms + bar_rp_ms + vk_draw_ms);
+      REXGPU_INFO(
+          "[Pillar 10 CPU Profile] Frame {} ({} draws): total_draw_recording={:.2f}ms "
+          "[prim={:.2f}ms rts={:.2f}ms pipe={:.2f}ms bind={:.2f}ms shmem={:.2f}ms bar_rp={:.2f}ms vk_draw={:.2f}ms other={:.2f}ms]",
+          frame_current_, frame_cpu_profiling_stats_.draw_count,
+          total_draw_ms, prim_ms, rts_ms, pipe_ms, bind_ms, shmem_ms, bar_rp_ms, vk_draw_ms, other_ms);
+      frame_cpu_profiling_stats_.Reset();
+    }
+
     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
     }

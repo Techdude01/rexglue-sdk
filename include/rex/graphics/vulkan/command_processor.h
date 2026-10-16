@@ -11,6 +11,7 @@
  */
 
 #include <array>
+#include <chrono>
 #include <climits>
 #include <cstdint>
 #include <deque>
@@ -885,6 +886,31 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t validated_shared_memory_ranges_epoch_ = 0;
 
   bool RequestSharedMemoryRange(uint32_t start, uint32_t length);
+
+  // CPU draw recording breakdown (Pillar 10).
+  struct FrameCpuProfilingStats {
+    uint64_t draw_count = 0;
+    std::chrono::nanoseconds time_primitive_processing{0};
+    std::chrono::nanoseconds time_render_target_update{0};
+    std::chrono::nanoseconds time_pipeline_configuration{0};
+    std::chrono::nanoseconds time_binding_updates{0};
+    std::chrono::nanoseconds time_shared_memory_residency{0};
+    std::chrono::nanoseconds time_barriers_and_render_pass{0};
+    std::chrono::nanoseconds time_vk_draw{0};
+    std::chrono::nanoseconds time_draw_total{0};
+
+    void Reset() {
+      draw_count = 0;
+      time_primitive_processing = std::chrono::nanoseconds{0};
+      time_render_target_update = std::chrono::nanoseconds{0};
+      time_pipeline_configuration = std::chrono::nanoseconds{0};
+      time_binding_updates = std::chrono::nanoseconds{0};
+      time_shared_memory_residency = std::chrono::nanoseconds{0};
+      time_barriers_and_render_pass = std::chrono::nanoseconds{0};
+      time_vk_draw = std::chrono::nanoseconds{0};
+      time_draw_total = std::chrono::nanoseconds{0};
+    }
+  } frame_cpu_profiling_stats_;
 };
 
 }  // namespace rex::graphics::vulkan
