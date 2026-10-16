@@ -856,6 +856,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint32_t bound_samplers_pixel_count_ = UINT32_MAX;
   std::array<VkImageView, kMaxCachedShaderTextures> bound_texture_image_views_pixel_{};
   std::array<VkSampler, kMaxCachedShaderSamplers> bound_samplers_pixel_{};
+
+  // Cached index buffer binding for avoiding redundant CmdVkBindIndexBuffer calls.
+  VkBuffer bound_index_buffer_ = VK_NULL_HANDLE;
+  VkDeviceSize bound_index_buffer_offset_ = 0;
+  VkIndexType bound_index_type_ = VK_INDEX_TYPE_MAX_ENUM;
 };
 
 }  // namespace rex::graphics::vulkan

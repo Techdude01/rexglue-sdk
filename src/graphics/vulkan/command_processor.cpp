@@ -4312,11 +4312,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         assert_unhandled_case(primitive_processing_result.index_buffer_type);
         return draw_fail("unexpected_index_buffer_type");
     }
-    deferred_command_buffer_.CmdVkBindIndexBuffer(
-        index_buffer.first, index_buffer.second,
+    VkIndexType index_type =
         primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
             ? VK_INDEX_TYPE_UINT16
-            : VK_INDEX_TYPE_UINT32);
+            : VK_INDEX_TYPE_UINT32;
+    if (bound_index_buffer_ != index_buffer.first ||
+        bound_index_buffer_offset_ != index_buffer.second ||
+        bound_index_type_ != index_type) {
+      deferred_command_buffer_.CmdVkBindIndexBuffer(index_buffer.first, index_buffer.second,
+                                                    index_type);
+      bound_index_buffer_ = index_buffer.first;
+      bound_index_buffer_offset_ = index_buffer.second;
+      bound_index_type_ = index_type;
+    }
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
   }
@@ -5343,6 +5351,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     current_external_compute_pipeline_ = VK_NULL_HANDLE;
     current_guest_graphics_pipeline_layout_ = nullptr;
     current_graphics_descriptor_sets_bound_up_to_date_ = 0;
+    bound_index_buffer_ = VK_NULL_HANDLE;
+    bound_index_buffer_offset_ = 0;
+    bound_index_type_ = VK_INDEX_TYPE_MAX_ENUM;
 
     primitive_processor_->BeginSubmission();
 
