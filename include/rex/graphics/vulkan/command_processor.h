@@ -861,6 +861,22 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkBuffer bound_index_buffer_ = VK_NULL_HANDLE;
   VkDeviceSize bound_index_buffer_offset_ = 0;
   VkIndexType bound_index_type_ = VK_INDEX_TYPE_MAX_ENUM;
+
+  // Dynamic uniform buffer descriptor set and offsets for Set 1 (constants - Pillar 7).
+  VkDescriptorPool dynamic_constants_descriptor_pool_ = VK_NULL_HANDLE;
+  struct DynamicConstantsDescriptorSet {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+  };
+  std::vector<DynamicConstantsDescriptorSet> dynamic_constants_descriptor_sets_;
+  std::array<uint32_t, SpirvShaderTranslator::kConstantBufferCount>
+      current_constant_buffer_dynamic_offsets_{};
+  std::array<uint32_t, SpirvShaderTranslator::kConstantBufferCount>
+      last_bound_constant_buffer_dynamic_offsets_{};
+  VkBuffer current_constant_buffer_handle_ = VK_NULL_HANDLE;
+  VkBuffer last_bound_constant_buffer_handle_ = VK_NULL_HANDLE;
+
+  VkDescriptorSet GetOrCreateDynamicConstantsDescriptorSet(VkBuffer buffer);
 };
 
 }  // namespace rex::graphics::vulkan
