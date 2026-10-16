@@ -3204,11 +3204,14 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   bool needs_stencil =
       (render_target_cache_->last_update_render_pass_key().depth_and_color_used & 0b1) &&
       normalized_depth_control.stencil_enable;
+  uint32_t expected_color_count =
+      32 - rex::lzcnt(uint32_t(render_target_cache_->last_update_render_pass_key().depth_and_color_used >> 1));
 
   if (use_dynamic_rendering) {
     if (in_render_pass_ && current_framebuffer_ == framebuffer &&
         current_render_pass_ == VK_NULL_HANDLE &&
-        current_dynamic_rendering_has_stencil_ == needs_stencil) {
+        current_dynamic_rendering_has_stencil_ == needs_stencil &&
+        current_dynamic_rendering_color_count_ == expected_color_count) {
       return;
     }
   } else {
@@ -3239,6 +3242,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     bool has_depth = depth_attachment.sType == VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     bool has_stencil = stencil_attachment.sType == VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     current_dynamic_rendering_has_stencil_ = has_stencil;
+    current_dynamic_rendering_color_count_ = color_attachment_count;
 
     VkRenderingInfo rendering_info = {};
     rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
@@ -3379,6 +3383,7 @@ void VulkanCommandProcessor::EndRenderPass() {
   current_framebuffer_ = nullptr;
   in_render_pass_ = false;
   current_dynamic_rendering_has_stencil_ = false;
+  current_dynamic_rendering_color_count_ = 0;
 }
 
 VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
@@ -5354,6 +5359,8 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     current_render_pass_ = VK_NULL_HANDLE;
     current_framebuffer_ = nullptr;
     in_render_pass_ = false;
+    current_dynamic_rendering_has_stencil_ = false;
+    current_dynamic_rendering_color_count_ = 0;
     current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
     current_external_compute_pipeline_ = VK_NULL_HANDLE;

@@ -1316,8 +1316,42 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           clear_values[0] = resolve_info.rb_depth_clear;
           clear_values[1] =
               resolve_info.rb_color_clear | (uint64_t(resolve_info.rb_color_clear_lo) << 32);
-          PerformTransfersAndResolveClears(2, clear_render_targets, clear_transfers_, clear_values,
-                                           &clear_rectangle);
+
+          bool can_promote = (clear_transfers_[0].empty() && clear_transfers_[1].empty() &&
+                              clear_rectangle.x_pixels == 0 && clear_rectangle.y_pixels == 0);
+          if (can_promote) {
+            for (uint32_t i = 0; i < 2; ++i) {
+              if (!clear_render_targets[i]) {
+                continue;
+              }
+              auto* target_rt = static_cast<VulkanRenderTarget*>(clear_render_targets[i]);
+              RenderTargetKey target_key = target_rt->key();
+              uint32_t msaa_samples_x_log2 =
+                  uint32_t(target_key.msaa_samples >= xenos::MsaaSamples::k4X);
+              uint32_t pitch_pixels = target_key.pitch_tiles_at_32bpp *
+                                      (xenos::kEdramTileWidthSamples >> msaa_samples_x_log2);
+              uint32_t height_pixels = GetRenderTargetHeight(target_key.pitch_tiles_at_32bpp,
+                                                             target_key.msaa_samples);
+              if (clear_rectangle.width_pixels < pitch_pixels ||
+                  clear_rectangle.height_pixels < height_pixels) {
+                can_promote = false;
+                break;
+              }
+            }
+          }
+
+          if (can_promote) {
+            for (uint32_t i = 0; i < 2; ++i) {
+              if (!clear_render_targets[i]) {
+                continue;
+              }
+              auto* target_rt = static_cast<VulkanRenderTarget*>(clear_render_targets[i]);
+              target_rt->SetPendingClear(ConvertClearValue(target_rt->key(), clear_values[i], false));
+            }
+          } else {
+            PerformTransfersAndResolveClears(2, clear_render_targets, clear_transfers_, clear_values,
+                                             &clear_rectangle);
+          }
         }
         cleared = true;
       } break;
@@ -1374,6 +1408,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     cleared = true;
   }
 
+  ResetAccumulatedRenderTargets();
   return copied && cleared;
 }
 
@@ -1530,9 +1565,15 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
     depth_attachment->resolveMode = VK_RESOLVE_MODE_NONE;
     depth_attachment->resolveImageView = VK_NULL_HANDLE;
     depth_attachment->resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    depth_attachment->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    if (vulkan_rt->has_pending_clear()) {
+      depth_attachment->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+      depth_attachment->clearValue = vulkan_rt->pending_clear_value();
+      const_cast<VulkanRenderTarget*>(vulkan_rt)->ClearPendingClear();
+    } else {
+      depth_attachment->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      depth_attachment->clearValue = {};
+    }
     depth_attachment->storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    depth_attachment->clearValue = {};
 
     auto depth_control = draw_util::GetNormalizedDepthControl(register_file());
     if (depth_control.stencil_enable) {
@@ -1556,9 +1597,15 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
       color_attachment.resolveMode = VK_RESOLVE_MODE_NONE;
       color_attachment.resolveImageView = VK_NULL_HANDLE;
       color_attachment.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-      color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      if (vulkan_rt->has_pending_clear()) {
+        color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        color_attachment.clearValue = vulkan_rt->pending_clear_value();
+        const_cast<VulkanRenderTarget*>(vulkan_rt)->ClearPendingClear();
+      } else {
+        color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        color_attachment.clearValue = {};
+      }
       color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-      color_attachment.clearValue = {};
       color_attachment_count = i + 1;
     }
   }
@@ -4552,6 +4599,116 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(TransferPipeline
   return transfer_pipelines_.emplace(key, pipelines).first->second.data();
 }
 
+VkClearValue VulkanRenderTargetCache::ConvertClearValue(RenderTargetKey dest_rt_key,
+                                                       uint64_t clear_value,
+                                                       bool is_transfer_format) const {
+  VkClearValue out_clear_value = {};
+  if (dest_rt_key.is_depth) {
+    uint32_t depth_guest_clear_value = (uint32_t(clear_value) >> 8) & 0xFFFFFF;
+    switch (dest_rt_key.GetDepthFormat()) {
+      case xenos::DepthRenderTargetFormat::kD24S8:
+        out_clear_value.depthStencil.depth = xenos::UNorm24To32(depth_guest_clear_value);
+        break;
+      case xenos::DepthRenderTargetFormat::kD24FS8:
+        // Taking [0, 2) -> [0, 1) remapping into account.
+        out_clear_value.depthStencil.depth =
+            xenos::Float20e4To32(depth_guest_clear_value) * 0.5f;
+        break;
+    }
+    out_clear_value.depthStencil.stencil = uint32_t(clear_value) & 0xFF;
+  } else {
+    bool dest_color_transfer_is_uint = false;
+    if (is_transfer_format) {
+      GetColorOwnershipTransferVulkanFormat(
+          dest_rt_key.GetColorFormat(), dest_rt_key.msaa_samples, &dest_color_transfer_is_uint);
+    }
+    switch (dest_rt_key.GetColorFormat()) {
+      case xenos::ColorRenderTargetFormat::k_8_8_8_8:
+      case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
+        for (uint32_t j = 0; j < 4; ++j) {
+          out_clear_value.color.float32[j] =
+              ((clear_value >> (j * 8)) & 0xFF) * (1.0f / 0xFF);
+        }
+        if (dest_rt_key.GetColorFormat() == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA &&
+            gamma_render_target_as_unorm16_) {
+          for (uint32_t j = 0; j < 3; ++j) {
+            out_clear_value.color.float32[j] =
+                xenos::PWLGammaToLinear(out_clear_value.color.float32[j]);
+          }
+        }
+      } break;
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10:
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10: {
+        for (uint32_t j = 0; j < 3; ++j) {
+          out_clear_value.color.float32[j] =
+              ((clear_value >> (j * 10)) & 0x3FF) * (1.0f / 0x3FF);
+        }
+        out_clear_value.color.float32[3] =
+            ((clear_value >> 30) & 0x3) * (1.0f / 0x3);
+      } break;
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16: {
+        for (uint32_t j = 0; j < 3; ++j) {
+          out_clear_value.color.float32[j] =
+              xenos::Float7e3To32((clear_value >> (j * 10)) & 0x3FF);
+        }
+        out_clear_value.color.float32[3] =
+            ((clear_value >> 30) & 0x3) * (1.0f / 0x3);
+      } break;
+      case xenos::ColorRenderTargetFormat::k_16_16:
+      case xenos::ColorRenderTargetFormat::k_16_16_FLOAT: {
+        for (uint32_t j = 0; j < 2; ++j) {
+          uint16_t component = uint16_t((clear_value >> (j * 16)) & 0xFFFF);
+          if (dest_color_transfer_is_uint) {
+            out_clear_value.color.uint32[j] = component;
+          } else if (IsColor16FormatFloatLike(dest_rt_key.GetColorFormat())) {
+            out_clear_value.color.float32[j] =
+                rex::xenos_half_to_float(component);
+          } else {
+            out_clear_value.color.float32[j] =
+                std::max(float(int16_t(component)) * (1.0f / 32767.0f), -1.0f);
+          }
+        }
+      } break;
+      case xenos::ColorRenderTargetFormat::k_16_16_16_16:
+      case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT: {
+        for (uint32_t j = 0; j < 4; ++j) {
+          uint16_t component = uint16_t((clear_value >> (j * 16)) & 0xFFFF);
+          if (dest_color_transfer_is_uint) {
+            out_clear_value.color.uint32[j] = component;
+          } else if (IsColor16FormatFloatLike(dest_rt_key.GetColorFormat())) {
+            out_clear_value.color.float32[j] =
+                rex::xenos_half_to_float(component);
+          } else {
+            out_clear_value.color.float32[j] =
+                std::max(float(int16_t(component)) * (1.0f / 32767.0f), -1.0f);
+          }
+        }
+      } break;
+      case xenos::ColorRenderTargetFormat::k_32_FLOAT: {
+        uint32_t component = uint32_t(clear_value);
+        if (dest_color_transfer_is_uint) {
+          out_clear_value.color.uint32[0] = component;
+        } else {
+          std::memcpy(&out_clear_value.color.float32[0], &component, sizeof(component));
+        }
+      } break;
+      case xenos::ColorRenderTargetFormat::k_32_32_FLOAT: {
+        uint32_t component_0 = uint32_t(clear_value);
+        uint32_t component_1 = uint32_t(clear_value >> 32);
+        if (dest_color_transfer_is_uint) {
+          out_clear_value.color.uint32[0] = component_0;
+          out_clear_value.color.uint32[1] = component_1;
+        } else {
+          std::memcpy(&out_clear_value.color.float32[0], &component_0, sizeof(component_0));
+          std::memcpy(&out_clear_value.color.float32[1], &component_1, sizeof(component_1));
+        }
+      } break;
+    }
+  }
+  return out_clear_value;
+}
+
 void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     uint32_t render_target_count, RenderTarget* const* render_targets,
     const std::vector<Transfer>* render_target_transfers,
@@ -5290,124 +5447,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       std::memset(&resolve_clear_attachment.clearValue, 0,
                   sizeof(resolve_clear_attachment.clearValue));
       uint64_t clear_value = render_target_resolve_clear_values[i];
-      if (dest_rt_key.is_depth) {
-        resolve_clear_attachment.aspectMask =
-            VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-        uint32_t depth_guest_clear_value = (uint32_t(clear_value) >> 8) & 0xFFFFFF;
-        switch (dest_rt_key.GetDepthFormat()) {
-          case xenos::DepthRenderTargetFormat::kD24S8:
-            resolve_clear_attachment.clearValue.depthStencil.depth =
-                xenos::UNorm24To32(depth_guest_clear_value);
-            break;
-          case xenos::DepthRenderTargetFormat::kD24FS8:
-            // Taking [0, 2) -> [0, 1) remapping into account.
-            resolve_clear_attachment.clearValue.depthStencil.depth =
-                xenos::Float20e4To32(depth_guest_clear_value) * 0.5f;
-            break;
-        }
-        resolve_clear_attachment.clearValue.depthStencil.stencil = uint32_t(clear_value) & 0xFF;
-      } else {
-        resolve_clear_attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        bool dest_color_transfer_is_uint = false;
-        GetColorOwnershipTransferVulkanFormat(
-            dest_rt_key.GetColorFormat(), dest_rt_key.msaa_samples, &dest_color_transfer_is_uint);
-        switch (dest_rt_key.GetColorFormat()) {
-          case xenos::ColorRenderTargetFormat::k_8_8_8_8:
-          case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA: {
-            for (uint32_t j = 0; j < 4; ++j) {
-              resolve_clear_attachment.clearValue.color.float32[j] =
-                  ((clear_value >> (j * 8)) & 0xFF) * (1.0f / 0xFF);
-            }
-            if (dest_rt_key.GetColorFormat() == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA &&
-                gamma_render_target_as_unorm16_) {
-              // 8_8_8_8_GAMMA is represented by linear stored in
-              // R16G16B16A16_UNORM.
-              for (uint32_t j = 0; j < 3; ++j) {
-                resolve_clear_attachment.clearValue.color.float32[j] =
-                    xenos::PWLGammaToLinear(resolve_clear_attachment.clearValue.color.float32[j]);
-              }
-            }
-          } break;
-          case xenos::ColorRenderTargetFormat::k_2_10_10_10:
-          case xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10: {
-            for (uint32_t j = 0; j < 3; ++j) {
-              resolve_clear_attachment.clearValue.color.float32[j] =
-                  ((clear_value >> (j * 10)) & 0x3FF) * (1.0f / 0x3FF);
-            }
-            resolve_clear_attachment.clearValue.color.float32[3] =
-                ((clear_value >> 30) & 0x3) * (1.0f / 0x3);
-          } break;
-          case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
-          case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16: {
-            for (uint32_t j = 0; j < 3; ++j) {
-              resolve_clear_attachment.clearValue.color.float32[j] =
-                  xenos::Float7e3To32((clear_value >> (j * 10)) & 0x3FF);
-            }
-            resolve_clear_attachment.clearValue.color.float32[3] =
-                ((clear_value >> 30) & 0x3) * (1.0f / 0x3);
-          } break;
-          case xenos::ColorRenderTargetFormat::k_16_16:
-          case xenos::ColorRenderTargetFormat::k_16_16_FLOAT: {
-            // Using uint for transfers and clears of both. Disregarding the
-            // current -32...32 vs. -1...1 settings for consistency with color
-            // clear via depth aliasing.
-            for (uint32_t j = 0; j < 2; ++j) {
-              uint16_t component = uint16_t((clear_value >> (j * 16)) & 0xFFFF);
-              if (dest_color_transfer_is_uint) {
-                resolve_clear_attachment.clearValue.color.uint32[j] = component;
-              } else if (IsColor16FormatFloatLike(dest_rt_key.GetColorFormat())) {
-                resolve_clear_attachment.clearValue.color.float32[j] =
-                    rex::xenos_half_to_float(component);
-              } else {
-                resolve_clear_attachment.clearValue.color.float32[j] =
-                    std::max(float(int16_t(component)) * (1.0f / 32767.0f), -1.0f);
-              }
-            }
-          } break;
-          case xenos::ColorRenderTargetFormat::k_16_16_16_16:
-          case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT: {
-            // Using uint for transfers and clears of both. Disregarding the
-            // current -32...32 vs. -1...1 settings for consistency with color
-            // clear via depth aliasing.
-            for (uint32_t j = 0; j < 4; ++j) {
-              uint16_t component = uint16_t((clear_value >> (j * 16)) & 0xFFFF);
-              if (dest_color_transfer_is_uint) {
-                resolve_clear_attachment.clearValue.color.uint32[j] = component;
-              } else if (IsColor16FormatFloatLike(dest_rt_key.GetColorFormat())) {
-                resolve_clear_attachment.clearValue.color.float32[j] =
-                    rex::xenos_half_to_float(component);
-              } else {
-                resolve_clear_attachment.clearValue.color.float32[j] =
-                    std::max(float(int16_t(component)) * (1.0f / 32767.0f), -1.0f);
-              }
-            }
-          } break;
-          case xenos::ColorRenderTargetFormat::k_32_FLOAT: {
-            uint32_t component = uint32_t(clear_value);
-            if (dest_color_transfer_is_uint) {
-              // Using uint for proper denormal and NaN handling.
-              resolve_clear_attachment.clearValue.color.uint32[0] = component;
-            } else {
-              std::memcpy(&resolve_clear_attachment.clearValue.color.float32[0], &component,
-                          sizeof(component));
-            }
-          } break;
-          case xenos::ColorRenderTargetFormat::k_32_32_FLOAT: {
-            uint32_t component_0 = uint32_t(clear_value);
-            uint32_t component_1 = uint32_t(clear_value >> 32);
-            if (dest_color_transfer_is_uint) {
-              // Using uint for proper denormal and NaN handling.
-              resolve_clear_attachment.clearValue.color.uint32[0] = component_0;
-              resolve_clear_attachment.clearValue.color.uint32[1] = component_1;
-            } else {
-              std::memcpy(&resolve_clear_attachment.clearValue.color.float32[0], &component_0,
-                          sizeof(component_0));
-              std::memcpy(&resolve_clear_attachment.clearValue.color.float32[1], &component_1,
-                          sizeof(component_1));
-            }
-          } break;
-        }
-      }
+      resolve_clear_attachment.aspectMask =
+          dest_rt_key.is_depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                               : VK_IMAGE_ASPECT_COLOR_BIT;
+      resolve_clear_attachment.clearValue = ConvertClearValue(dest_rt_key, clear_value, true);
       command_buffer.CmdVkClearAttachments(1, &resolve_clear_attachment, 1, &resolve_clear_rect);
     }
   }
