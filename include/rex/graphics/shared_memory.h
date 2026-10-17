@@ -10,7 +10,6 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <utility>
@@ -100,10 +99,6 @@ class SharedMemory {
   void LogGuestMemoryProtectionSnapshot(uint32_t guest_address) const;
 
   memory::Memory& memory() const { return memory_; }
-
-  uint64_t residency_epoch() const {
-    return residency_epoch_.load(std::memory_order_acquire);
-  }
 
  protected:
   SharedMemory(memory::Memory& memory);
@@ -244,9 +239,6 @@ class SharedMemory {
   // Unlinks and frees the range and its nodes. Call this in the global critical
   // region.
   void UnlinkWatchRange(WatchRange* range);
-
-  // Residency epoch counter incremented whenever memory is invalidated by CPU write-watch (Pillar 8).
-  std::atomic<uint64_t> residency_epoch_{1};
 };
 
 }  // namespace rex::graphics

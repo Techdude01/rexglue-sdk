@@ -115,7 +115,6 @@ void SharedMemory::ShutdownCommon() {
 
 void SharedMemory::InvalidateAllPages() {
   auto global_lock = global_critical_region_.Acquire();
-  residency_epoch_.fetch_add(1, std::memory_order_release);
 
   std::fill(system_page_flags_valid_.begin(), system_page_flags_valid_.end(), uint64_t(0));
   std::fill(system_page_flags_valid_and_gpu_written_.begin(),
@@ -124,7 +123,6 @@ void SharedMemory::InvalidateAllPages() {
 
 void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
   auto global_lock = global_critical_region_.Acquire();
-  residency_epoch_.fetch_add(1, std::memory_order_release);
 
   // Pages that are valid only because the CPU uploaded them lose their valid
   // bit here, so the next frame re-reads them from guest memory.
@@ -368,78 +366,6 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     return true;
   }
 
-  // Fast path for single range (avoids heap vector allocation and sorting - Pillar 8).
-  if (count == 1) {
-    uint32_t start = ranges[0].first;
-    uint32_t length = ranges[0].second;
-    if (!length) {
-      return true;
-    }
-    if (start > kBufferSize || (kBufferSize - start) < length) {
-      return false;
-    }
-    if (!EnsureHostGpuMemoryAllocated(start, length)) {
-      return false;
-    }
-    upload_ranges_.clear();
-    auto append_upload_range = [this](uint32_t page_start, uint32_t page_count) {
-      if (!page_count) {
-        return;
-      }
-      if (!upload_ranges_.empty()) {
-        std::pair<uint32_t, uint32_t>& last_upload_range = upload_ranges_.back();
-        if (last_upload_range.first + last_upload_range.second == page_start) {
-          last_upload_range.second += page_count;
-          return;
-        }
-      }
-      upload_ranges_.emplace_back(page_start, page_count);
-    };
-    {
-      auto global_lock = global_critical_region_.Acquire();
-      uint32_t page_first = start >> page_size_log2_;
-      uint32_t page_last = (start + length - 1) >> page_size_log2_;
-      uint32_t block_first = page_first >> 6;
-      uint32_t block_last = page_last >> 6;
-      uint32_t range_start = UINT32_MAX;
-      for (uint32_t i = block_first; i <= block_last; ++i) {
-        uint64_t block_valid = system_page_flags_valid_[i];
-        if (i == block_first) {
-          uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
-          block_valid |= block_before;
-        }
-        if (i == block_last && (page_last & 63) != 63) {
-          uint64_t block_inside = (uint64_t(1) << ((page_last & 63) + 1)) - 1;
-          block_valid |= ~block_inside;
-        }
-        while (true) {
-          uint32_t block_page;
-          if (range_start == UINT32_MAX) {
-            if (!rex::bit_scan_forward(~block_valid, &block_page)) {
-              break;
-            }
-            range_start = (i << 6) + block_page;
-          } else {
-            uint64_t block_valid_from_start = block_valid;
-            if (i == (range_start >> 6)) {
-              block_valid_from_start &= ~((uint64_t(1) << (range_start & 63)) - 1);
-            }
-            if (!rex::bit_scan_forward(block_valid_from_start, &block_page)) {
-              break;
-            }
-            append_upload_range(range_start, (i << 6) + block_page - range_start);
-            block_valid |= (uint64_t(1) << block_page) - 1;
-            range_start = UINT32_MAX;
-          }
-        }
-      }
-      if (range_start != UINT32_MAX) {
-        append_upload_range(range_start, page_last + 1 - range_start);
-      }
-    }
-    return UploadRanges(upload_ranges_);
-  }
-
   // Some texture or buffer is empty, for example - safe to draw in this case.
   std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
   merged_ranges.reserve(count);
@@ -591,7 +517,6 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   uint32_t block_last = page_last >> 6;
 
   auto global_lock = global_critical_region_.Acquire();
-  residency_epoch_.fetch_add(1, std::memory_order_release);
 
   if (!exact_range) {
     // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be

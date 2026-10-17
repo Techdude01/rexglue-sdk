@@ -879,13 +879,6 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   VkDescriptorSet GetOrCreateDynamicConstantsDescriptorSet(VkBuffer buffer);
 
-  // Lock-free cache of verified resident shared memory ranges (Pillar 8).
-  std::array<std::pair<uint32_t, uint32_t>, 16> validated_shared_memory_ranges_{};
-  size_t validated_shared_memory_ranges_count_ = 0;
-  uint64_t validated_shared_memory_ranges_epoch_ = 0;
-
-  bool RequestSharedMemoryRange(uint32_t start, uint32_t length);
-
   // CPU draw recording breakdown (Pillar 10).
   struct FrameCpuProfilingStats {
     uint64_t draw_count = 0;
