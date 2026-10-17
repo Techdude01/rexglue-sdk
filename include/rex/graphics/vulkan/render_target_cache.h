@@ -163,8 +163,6 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       xenos::ColorRenderTargetFormat format,
       xenos::MsaaSamples msaa_samples = xenos::MsaaSamples::k1X,
       bool* is_integer_out = nullptr) const;
-  VkClearValue ConvertClearValue(RenderTargetKey dest_rt_key, uint64_t clear_value,
-                                 bool is_transfer_format = false) const;
 
  protected:
   uint32_t GetMaxRenderTargetWidth() const override;
@@ -363,19 +361,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     uint32_t temporary_sort_index() const { return temporary_sort_index_; }
     void SetTemporarySortIndex(uint32_t index) { temporary_sort_index_ = index; }
 
-    bool has_pending_clear() const { return has_pending_clear_; }
-    VkClearValue pending_clear_value() const { return pending_clear_value_; }
-    void SetPendingClear(VkClearValue clear_value) {
-      has_pending_clear_ = true;
-      pending_clear_value_ = clear_value;
-    }
-    void ClearPendingClear() { has_pending_clear_ = false; }
-
    private:
     VulkanRenderTargetCache& render_target_cache_;
-
-    bool has_pending_clear_ = false;
-    VkClearValue pending_clear_value_{};
 
     VkImage image_;
     VkDeviceMemory memory_;

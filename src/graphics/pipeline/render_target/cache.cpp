@@ -726,12 +726,6 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
           break;
         }
       } else {
-        // If the current draw has no color render targets bound at all (depth-only pass),
-        // do not keep dummy accumulated color attachments (Pillar 6 TBDR pruning).
-        if (i >= 1 && (depth_and_color_rts_used_bits & ~uint32_t(1)) == 0) {
-          are_accumulated_render_targets_valid_ = false;
-          break;
-        }
         RenderTargetKey accumulated_rt_key = accumulated_rt->key();
         if (accumulated_rt_key.pitch_tiles_at_32bpp != pitch_tiles_at_32bpp ||
             accumulated_rt_key.msaa_samples != msaa_samples) {

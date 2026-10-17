@@ -799,7 +799,6 @@ class VulkanCommandProcessor : public CommandProcessor {
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
   bool in_render_pass_ = false;
   bool current_dynamic_rendering_has_stencil_ = false;
-  uint32_t current_dynamic_rendering_color_count_ = 0;
 
   // Currently bound graphics pipeline, either from the pipeline cache (with
   // potentially deferred creation - current_external_graphics_pipeline_ is
