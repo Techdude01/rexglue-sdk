@@ -41,7 +41,7 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
     .range(0, 100);
 
 #if defined(REX_HAS_FIDELITYFX_SDK)
-REXCVAR_DEFINE_STRING(present_effect, "fsr", "UI/Presenter",
+REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas, fsr, fsr2, fsr3, metalfx")
     .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3", "metalfx"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
