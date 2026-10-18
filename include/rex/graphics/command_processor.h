@@ -129,6 +129,14 @@ class CommandProcessor {
   bool Save(::rex::stream::ByteStream* stream);
   bool Restore(::rex::stream::ByteStream* stream);
 
+  struct GuestFrameStats {
+    std::atomic<uint64_t> frame_count{0};
+    std::atomic<double> fps{0.0};
+    std::atomic<double> frame_time_ms{0.0};
+  };
+
+  const GuestFrameStats& guest_frame_stats() const { return guest_frame_stats_; }
+
  protected:
   struct IndexBufferInfo {
     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
@@ -276,6 +284,8 @@ class CommandProcessor {
   // Set by backend command processors to their legacy memexport readback cvar
   // name (for explicit-override compatibility).
   const char* legacy_readback_memexport_cvar_name_ = nullptr;
+
+  GuestFrameStats guest_frame_stats_;
 
  private:
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};

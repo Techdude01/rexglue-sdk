@@ -75,6 +75,11 @@ REXCVAR_DEFINE_INT32(
     "0 disables tracing")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_INT32(
+    gpu_provenance_frame_window, 0, "GPU/Vulkan",
+    "Trace additional five-frame samples around gpu_provenance_frame; 0 disables window sampling")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(
     gpu_profile_cpu, true, "GPU/Vulkan",
     "Profile and log CPU draw recording breakdown periodically (every 120 frames) or on provenance frames")
@@ -84,9 +89,27 @@ namespace rex::graphics::vulkan {
 
 namespace {
 
-bool IsGpuProvenanceFrame(uint64_t frame) {
+bool IsGpuProvenanceTargetFrame(uint64_t frame) {
   int32_t selected_frame = REXCVAR_GET(gpu_provenance_frame);
   return selected_frame > 0 && frame == uint64_t(selected_frame);
+}
+
+bool IsGpuProvenanceFrame(uint64_t frame) {
+  if (IsGpuProvenanceTargetFrame(frame)) {
+    return true;
+  }
+  int32_t selected_frame = REXCVAR_GET(gpu_provenance_frame);
+  if (selected_frame <= 0) {
+    return false;
+  }
+  int32_t window = std::max(0, REXCVAR_GET(gpu_provenance_frame_window));
+  if (!window) {
+    return false;
+  }
+  uint64_t selected = uint64_t(selected_frame);
+  uint64_t lower = selected > uint64_t(window) ? selected - uint64_t(window) : 1;
+  uint64_t upper = selected + uint64_t(window);
+  return frame >= lower && frame <= upper && frame % 5 == 0;
 }
 
 void LogGpuProvenanceOutput(uint64_t frame, const ui::RawImage& image) {
@@ -117,19 +140,37 @@ void LogGpuProvenanceOutput(uint64_t frame, const ui::RawImage& image) {
       frame, image.width, image.height, nonblack_pixels, uint64_t(image.width) * image.height,
       minimum[0], minimum[1], minimum[2], maximum[0], maximum[1], maximum[2]);
 
-  if (const char* capture_path = std::getenv("COSMIC_GPU_PROVENANCE_CAPTURE_PATH")) {
-    if (FILE* f = std::fopen(capture_path, "wb")) {
-      std::fprintf(f, "P6\n%u %u\n255\n", image.width, image.height);
-      for (uint32_t y = 0; y < image.height; ++y) {
-        const uint8_t* row = image.data.data() + size_t(y) * image.stride;
-        for (uint32_t x = 0; x < image.width; ++x) {
-          const uint8_t* pixel = row + size_t(x) * 4;
-          std::fputc(pixel[0], f);
-          std::fputc(pixel[1], f);
-          std::fputc(pixel[2], f);
-        }
+  char auto_ppm_path[128];
+  snprintf(auto_ppm_path, sizeof(auto_ppm_path), "/tmp/frame_%llu.ppm", (unsigned long long)frame);
+  if (FILE* f = std::fopen(auto_ppm_path, "wb")) {
+    std::fprintf(f, "P6\n%u %u\n255\n", image.width, image.height);
+    for (uint32_t y = 0; y < image.height; ++y) {
+      const uint8_t* row = image.data.data() + size_t(y) * image.stride;
+      for (uint32_t x = 0; x < image.width; ++x) {
+        const uint8_t* pixel = row + size_t(x) * 4;
+        std::fputc(pixel[0], f);
+        std::fputc(pixel[1], f);
+        std::fputc(pixel[2], f);
       }
-      std::fclose(f);
+    }
+    std::fclose(f);
+  }
+
+  if (IsGpuProvenanceTargetFrame(frame)) {
+    if (const char* capture_path = std::getenv("COSMIC_GPU_PROVENANCE_CAPTURE_PATH")) {
+      if (FILE* f = std::fopen(capture_path, "wb")) {
+        std::fprintf(f, "P6\n%u %u\n255\n", image.width, image.height);
+        for (uint32_t y = 0; y < image.height; ++y) {
+          const uint8_t* row = image.data.data() + size_t(y) * image.stride;
+          for (uint32_t x = 0; x < image.width; ++x) {
+            const uint8_t* pixel = row + size_t(x) * 4;
+            std::fputc(pixel[0], f);
+            std::fputc(pixel[1], f);
+            std::fputc(pixel[2], f);
+          }
+        }
+        std::fclose(f);
+      }
     }
   }
 }
@@ -889,7 +930,7 @@ bool VulkanCommandProcessor::SetupContext() {
   for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
     VkDescriptorSetLayoutBinding& constants_binding = descriptor_set_layout_bindings_constants[i];
     constants_binding.binding = i;
-    constants_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    constants_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     constants_binding.descriptorCount = 1;
     constants_binding.pImmutableSamplers = nullptr;
   }
@@ -914,6 +955,20 @@ bool VulkanCommandProcessor::SetupContext() {
     REXGPU_ERROR(
         "Failed to create a Vulkan descriptor set layout for guest draw "
         "constant buffers");
+    return false;
+  }
+  // Dedicated descriptor pool for dynamic constants descriptor sets (Pillar 7).
+  VkDescriptorPoolSize pool_size_constants;
+  pool_size_constants.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+  pool_size_constants.descriptorCount = SpirvShaderTranslator::kConstantBufferCount * 64;
+  VkDescriptorPoolCreateInfo pool_info_constants = {};
+  pool_info_constants.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_info_constants.maxSets = 64;
+  pool_info_constants.poolSizeCount = 1;
+  pool_info_constants.pPoolSizes = &pool_size_constants;
+  if (dfn.vkCreateDescriptorPool(device, &pool_info_constants, nullptr,
+                                 &dynamic_constants_descriptor_pool_) != VK_SUCCESS) {
+    REXGPU_ERROR("Failed to create a Vulkan descriptor pool for dynamic constants");
     return false;
   }
   // Transient: storage buffer for compute shaders.
@@ -2107,6 +2162,12 @@ void VulkanCommandProcessor::ShutdownContext() {
     ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
                                            descriptor_set_layout_single_transient);
   }
+  if (dynamic_constants_descriptor_pool_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyDescriptorPool(device, dynamic_constants_descriptor_pool_, nullptr);
+    dynamic_constants_descriptor_pool_ = VK_NULL_HANDLE;
+  }
+  dynamic_constants_descriptor_sets_.clear();
+
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
                                          descriptor_set_layout_constants_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
@@ -2185,6 +2246,12 @@ void VulkanCommandProcessor::ShutdownContext() {
 }
 
 void VulkanCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  if (frame_current_ >= 8670 && frame_current_ <= 8685) {
+    if (index == XE_GPU_REG_RB_COLORCONTROL || index == XE_GPU_REG_RB_ALPHA_REF ||
+        index == XE_GPU_REG_RB_DEPTHCONTROL || index == XE_GPU_REG_RB_BLENDCONTROL0) {
+      REXGPU_INFO("[RegTrace] frame {} WriteRegister 0x{:04X} = 0x{:08X}", frame_current_, index, value);
+    }
+  }
   CommandProcessor::WriteRegister(index, value);
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
@@ -2334,9 +2401,32 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
   const uint64_t provenance_frame = frame_current_;
-  const bool provenance_frame_selected = IsGpuProvenanceFrame(provenance_frame);
+  const bool provenance_frame_sampled = IsGpuProvenanceFrame(provenance_frame);
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
+
+  {
+    static uint64_t s_swap_count = 0;
+    static auto s_last_time = std::chrono::steady_clock::now();
+    static uint64_t s_last_swap_count = 0;
+
+    ++s_swap_count;
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed_ms = std::chrono::duration<double, std::milli>(now - s_last_time).count();
+    if (elapsed_ms >= 1000.0) {
+      uint64_t frames = s_swap_count - s_last_swap_count;
+      double fps = (frames * 1000.0) / elapsed_ms;
+      double avg_frame_time = elapsed_ms / frames;
+      guest_frame_stats_.fps.store(fps, std::memory_order_relaxed);
+      guest_frame_stats_.frame_time_ms.store(avg_frame_time, std::memory_order_relaxed);
+      guest_frame_stats_.frame_count.store(s_swap_count, std::memory_order_relaxed);
+      if (REXCVAR_GET(gpu_profile_cpu)) {
+        REXGPU_INFO("[Guest Swap Rate] {:.1f} swaps/s, {:.2f} ms/swap", fps, avg_frame_time);
+      }
+      s_last_time = now;
+      s_last_swap_count = s_swap_count;
+    }
+  }
 
   if (!graphics_system_)
     return;
@@ -2356,7 +2446,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
                                             frame_used_async_placeholder_pipeline_;
   if (skip_present_due_async_placeholder) {
-    if (provenance_frame_selected) {
+    if (provenance_frame_sampled) {
       REXGPU_INFO("GPU provenance frame {} status=skipped_async_placeholder", provenance_frame);
     }
     static bool skipped_incomplete_frame_logged = false;
@@ -2384,7 +2474,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
       &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap,
       &swap_source_guest_base);
   if (swap_texture_view == VK_NULL_HANDLE) {
-    if (provenance_frame_selected) {
+    if (provenance_frame_sampled) {
       REXGPU_INFO("GPU provenance frame {} slot0_guest_base=0x{:08X} status=no_swap_source",
                   provenance_frame, swap_source_guest_base);
     }
@@ -2996,7 +3086,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         return true;
       });
 
-  if (provenance_frame_selected) {
+  if (provenance_frame_sampled) {
     REXGPU_INFO(
         "GPU provenance frame {} swap slot0_guest_base=0x{:08X} frontbuffer_ptr=0x{:08X} "
         "image_view={:p} size={}x{} format={} output_refreshed={}",
@@ -3189,11 +3279,14 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   bool needs_stencil =
       (render_target_cache_->last_update_render_pass_key().depth_and_color_used & 0b1) &&
       normalized_depth_control.stencil_enable;
+  uint32_t expected_color_count =
+      32 - rex::lzcnt(uint32_t(render_target_cache_->last_update_render_pass_key().depth_and_color_used >> 1));
 
   if (use_dynamic_rendering) {
     if (in_render_pass_ && current_framebuffer_ == framebuffer &&
         current_render_pass_ == VK_NULL_HANDLE &&
-        current_dynamic_rendering_has_stencil_ == needs_stencil) {
+        current_dynamic_rendering_has_stencil_ == needs_stencil &&
+        current_dynamic_rendering_color_count_ == expected_color_count) {
       return;
     }
   } else {
@@ -3224,6 +3317,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     bool has_depth = depth_attachment.sType == VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     bool has_stencil = stencil_attachment.sType == VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
     current_dynamic_rendering_has_stencil_ = has_stencil;
+    current_dynamic_rendering_color_count_ = color_attachment_count;
 
     VkRenderingInfo rendering_info = {};
     rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
@@ -3364,6 +3458,7 @@ void VulkanCommandProcessor::EndRenderPass() {
   current_framebuffer_ = nullptr;
   in_render_pass_ = false;
   current_dynamic_rendering_has_stencil_ = false;
+  current_dynamic_rendering_color_count_ = 0;
 }
 
 VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
@@ -3781,6 +3876,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       return true;
     }
   }
+
+
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   if (memexport_used_pixel) {
     if (!device_properties.fragmentStoresAndAtomics) {
@@ -4036,6 +4133,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     frame_cpu_profiling_stats_.time_pipeline_configuration +=
         std::chrono::steady_clock::now() - t_pipe_start;
   }
+
   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
     frame_used_async_placeholder_pipeline_ = true;
     if (provenance_draw_id) {
@@ -4218,6 +4316,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       }
     }
   }
+
 
   // Synchronize the memory pages backing memory scatter export streams, and
   // calculate the range that includes the streams for the buffer barrier.
@@ -5212,9 +5311,19 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // defined by vkQueueSubmit additionally include in the first
     // synchronization scope all commands that occur earlier in submission
     // order."
+    // FrameCpuProfilingStats is accumulated until its 120-frame log point, so
+    // include every blocking wait in that interval rather than sampling only
+    // the wait that happens to land on the log frame.
+    bool profile_wait = REXCVAR_GET(gpu_profile_cpu);
+    auto wait_start = profile_wait ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
     VkResult wait_result =
         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    if (profile_wait) {
+      frame_cpu_profiling_stats_.fence_wait_count++;
+      frame_cpu_profiling_stats_.time_fence_waits += std::chrono::steady_clock::now() - wait_start;
+    }
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
@@ -5393,6 +5502,8 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     current_render_pass_ = VK_NULL_HANDLE;
     current_framebuffer_ = nullptr;
     in_render_pass_ = false;
+    current_dynamic_rendering_has_stencil_ = false;
+    current_dynamic_rendering_color_count_ = 0;
     current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
     current_external_compute_pipeline_ = VK_NULL_HANDLE;
@@ -5427,6 +5538,11 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     bound_samplers_vertex_count_ = UINT32_MAX;
     bound_textures_pixel_count_ = UINT32_MAX;
     bound_samplers_pixel_count_ = UINT32_MAX;
+    last_bound_constant_buffer_handle_ = VK_NULL_HANDLE;
+    last_bound_constant_buffer_dynamic_offsets_.fill(UINT32_MAX);
+    current_constant_buffer_handle_ = VK_NULL_HANDLE;
+    validated_shared_memory_ranges_count_ = 0;
+    validated_shared_memory_ranges_epoch_ = 0;
 
     // Reclaim pool pages - no need to do this every small submission since some
     // may be reused.
@@ -5706,12 +5822,15 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       double shmem_ms = frame_cpu_profiling_stats_.time_shared_memory_residency.count() / 1e6;
       double bar_rp_ms = frame_cpu_profiling_stats_.time_barriers_and_render_pass.count() / 1e6;
       double vk_draw_ms = frame_cpu_profiling_stats_.time_vk_draw.count() / 1e6;
+      double fence_wait_ms = frame_cpu_profiling_stats_.time_fence_waits.count() / 1e6;
       double other_ms = total_draw_ms - (prim_ms + rts_ms + pipe_ms + bind_ms + shmem_ms + bar_rp_ms + vk_draw_ms);
       REXGPU_INFO(
           "[Pillar 10 CPU Profile] Frame {} ({} draws): total_draw_recording={:.2f}ms "
-          "[prim={:.2f}ms rts={:.2f}ms pipe={:.2f}ms bind={:.2f}ms shmem={:.2f}ms bar_rp={:.2f}ms vk_draw={:.2f}ms other={:.2f}ms]",
+          "[prim={:.2f}ms rts={:.2f}ms pipe={:.2f}ms bind={:.2f}ms shmem={:.2f}ms "
+          "bar_rp={:.2f}ms vk_draw={:.2f}ms fence_wait={:.2f}ms/{} other={:.2f}ms]",
           frame_current_, frame_cpu_profiling_stats_.draw_count,
-          total_draw_ms, prim_ms, rts_ms, pipe_ms, bind_ms, shmem_ms, bar_rp_ms, vk_draw_ms, other_ms);
+          total_draw_ms, prim_ms, rts_ms, pipe_ms, bind_ms, shmem_ms, bar_rp_ms, vk_draw_ms,
+          fence_wait_ms, frame_cpu_profiling_stats_.fence_wait_count, other_ms);
       frame_cpu_profiling_stats_.Reset();
     }
 
@@ -5755,6 +5874,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       bound_index_type_ = VK_INDEX_TYPE_MAX_ENUM;
 
       shared_memory_->ClearCache();
+      validated_shared_memory_ranges_count_ = 0;
+      validated_shared_memory_ranges_epoch_ = 0;
     }
   }
 
@@ -5768,6 +5889,16 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
 
   constants_transient_descriptors_free_.clear();
   constants_transient_descriptors_used_.clear();
+  dynamic_constants_descriptor_sets_.clear();
+  if (dynamic_constants_descriptor_pool_ != VK_NULL_HANDLE) {
+    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+    const VkDevice device = vulkan_device->device();
+    dfn.vkResetDescriptorPool(device, dynamic_constants_descriptor_pool_, 0);
+  }
+  last_bound_constant_buffer_handle_ = VK_NULL_HANDLE;
+  last_bound_constant_buffer_dynamic_offsets_.fill(UINT32_MAX);
+
   for (std::vector<VkDescriptorSet>& transient_descriptors_free :
        single_transient_descriptors_free_) {
     transient_descriptors_free.clear();
@@ -6632,6 +6763,70 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
   }
 }
 
+VkDescriptorSet VulkanCommandProcessor::GetOrCreateDynamicConstantsDescriptorSet(VkBuffer buffer) {
+  for (const auto& entry : dynamic_constants_descriptor_sets_) {
+    if (entry.buffer == buffer) {
+      return entry.descriptor_set;
+    }
+  }
+
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  VkDescriptorSetAllocateInfo alloc_info = {};
+  alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  alloc_info.descriptorPool = dynamic_constants_descriptor_pool_;
+  alloc_info.descriptorSetCount = 1;
+  alloc_info.pSetLayouts = &descriptor_set_layout_constants_;
+
+  VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+  if (dfn.vkAllocateDescriptorSets(device, &alloc_info, &descriptor_set) != VK_SUCCESS) {
+    REXGPU_ERROR("Failed to allocate dynamic constants descriptor set");
+    return VK_NULL_HANDLE;
+  }
+
+  VkDescriptorBufferInfo buffer_infos[SpirvShaderTranslator::kConstantBufferCount] = {};
+  buffer_infos[SpirvShaderTranslator::kConstantBufferSystem].buffer = buffer;
+  buffer_infos[SpirvShaderTranslator::kConstantBufferSystem].offset = 0;
+  buffer_infos[SpirvShaderTranslator::kConstantBufferSystem].range =
+      sizeof(SpirvShaderTranslator::SystemConstants);
+
+  buffer_infos[SpirvShaderTranslator::kConstantBufferFloatVertex].buffer = buffer;
+  buffer_infos[SpirvShaderTranslator::kConstantBufferFloatVertex].offset = 0;
+  buffer_infos[SpirvShaderTranslator::kConstantBufferFloatVertex].range = sizeof(float) * 4 * 256;
+
+  buffer_infos[SpirvShaderTranslator::kConstantBufferFloatPixel].buffer = buffer;
+  buffer_infos[SpirvShaderTranslator::kConstantBufferFloatPixel].offset = 0;
+  buffer_infos[SpirvShaderTranslator::kConstantBufferFloatPixel].range = sizeof(float) * 4 * 256;
+
+  buffer_infos[SpirvShaderTranslator::kConstantBufferBoolLoop].buffer = buffer;
+  buffer_infos[SpirvShaderTranslator::kConstantBufferBoolLoop].offset = 0;
+  buffer_infos[SpirvShaderTranslator::kConstantBufferBoolLoop].range = sizeof(uint32_t) * (8 + 32);
+
+  buffer_infos[SpirvShaderTranslator::kConstantBufferFetch].buffer = buffer;
+  buffer_infos[SpirvShaderTranslator::kConstantBufferFetch].offset = 0;
+  buffer_infos[SpirvShaderTranslator::kConstantBufferFetch].range = sizeof(uint32_t) * 6 * 32;
+
+  VkWriteDescriptorSet writes[SpirvShaderTranslator::kConstantBufferCount] = {};
+  for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[i].dstSet = descriptor_set;
+    writes[i].dstBinding = i;
+    writes[i].descriptorCount = 1;
+    writes[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+    writes[i].pBufferInfo = &buffer_infos[i];
+  }
+  dfn.vkUpdateDescriptorSets(device, SpirvShaderTranslator::kConstantBufferCount, writes, 0, nullptr);
+
+  dynamic_constants_descriptor_sets_.push_back({buffer, descriptor_set});
+  return descriptor_set;
+}
+
+bool VulkanCommandProcessor::RequestSharedMemoryRange(uint32_t start, uint32_t length) {
+  return shared_memory_->RequestRange(start, length);
+}
+
 bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
                                             const VulkanShader* pixel_shader) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -6692,8 +6887,6 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferCount) - 1;
   assert_zero(current_constant_buffers_up_to_date_ & ~kAllConstantBuffersMask);
   if ((current_constant_buffers_up_to_date_ & kAllConstantBuffersMask) != kAllConstantBuffersMask) {
-    current_graphics_descriptor_set_values_up_to_date_ &=
-        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
     size_t uniform_buffer_alignment =
         size_t(vulkan_device->properties().minUniformBufferOffsetAlignment);
     // System constants.
@@ -6711,6 +6904,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       std::memcpy(mapping, &system_constants_, sizeof(SpirvShaderTranslator::SystemConstants));
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferSystem;
+      current_constant_buffer_dynamic_offsets_[SpirvShaderTranslator::kConstantBufferSystem] =
+          uint32_t(buffer_info.offset);
+      current_constant_buffer_handle_ = buffer_info.buffer;
     }
     // Vertex shader float constants.
     if (!(current_constant_buffers_up_to_date_ &
@@ -6745,6 +6941,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferFloatVertex;
+      current_constant_buffer_dynamic_offsets_[SpirvShaderTranslator::kConstantBufferFloatVertex] =
+          uint32_t(buffer_info.offset);
+      current_constant_buffer_handle_ = buffer_info.buffer;
     }
     // Pixel shader float constants.
     if (!(current_constant_buffers_up_to_date_ &
@@ -6774,6 +6973,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferFloatPixel;
+      current_constant_buffer_dynamic_offsets_[SpirvShaderTranslator::kConstantBufferFloatPixel] =
+          uint32_t(buffer_info.offset);
+      current_constant_buffer_handle_ = buffer_info.buffer;
     }
     // Bool and loop constants.
     if (!(current_constant_buffers_up_to_date_ &
@@ -6791,6 +6993,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], kBoolLoopConstantsSize);
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferBoolLoop;
+      current_constant_buffer_dynamic_offsets_[SpirvShaderTranslator::kConstantBufferBoolLoop] =
+          uint32_t(buffer_info.offset);
+      current_constant_buffer_handle_ = buffer_info.buffer;
     }
     // Fetch constants.
     if (!(current_constant_buffers_up_to_date_ &
@@ -6808,7 +7013,17 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], kFetchConstantsSize);
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferFetch;
+      current_constant_buffer_dynamic_offsets_[SpirvShaderTranslator::kConstantBufferFetch] =
+          uint32_t(buffer_info.offset);
+      current_constant_buffer_handle_ = buffer_info.buffer;
     }
+  }
+
+  if (current_constant_buffer_handle_ != VK_NULL_HANDLE) {
+    current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetConstants] =
+        GetOrCreateDynamicConstantsDescriptorSet(current_constant_buffer_handle_);
+    current_graphics_descriptor_set_values_up_to_date_ |=
+        UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants;
   }
 
   // Textures and samplers.
@@ -6974,51 +7189,12 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   // Write the new descriptor sets.
 
   // Consecutive bindings updated via a single VkWriteDescriptorSet must have
-  // identical stage flags, but for the constants they vary. Plus vertex and
-  // pixel texture images and samplers.
-  std::array<VkWriteDescriptorSet, SpirvShaderTranslator::kConstantBufferCount + 2 * 2>
-      write_descriptor_sets;
+  // identical stage flags. Plus vertex and pixel texture images and samplers.
+  std::array<VkWriteDescriptorSet, 2 * 2> write_descriptor_sets;
   uint32_t write_descriptor_set_count = 0;
   uint32_t write_descriptor_set_bits = 0;
   assert_not_zero(current_graphics_descriptor_set_values_up_to_date_ &
                   (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram));
-  // Constant buffers.
-  if (!(current_graphics_descriptor_set_values_up_to_date_ &
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants))) {
-    VkDescriptorSet constants_descriptor_set;
-    if (!constants_transient_descriptors_free_.empty()) {
-      constants_descriptor_set = constants_transient_descriptors_free_.back();
-      constants_transient_descriptors_free_.pop_back();
-    } else {
-      VkDescriptorPoolSize constants_descriptor_count;
-      constants_descriptor_count.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-      constants_descriptor_count.descriptorCount = SpirvShaderTranslator::kConstantBufferCount;
-      constants_descriptor_set = transient_descriptor_allocator_uniform_buffer_.Allocate(
-          descriptor_set_layout_constants_, &constants_descriptor_count, 1);
-      if (constants_descriptor_set == VK_NULL_HANDLE) {
-        return false;
-      }
-    }
-    constants_transient_descriptors_used_.emplace_back(frame_current_, constants_descriptor_set);
-    // Consecutive bindings updated via a single VkWriteDescriptorSet must have
-    // identical stage flags, but for the constants they vary.
-    for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
-      VkWriteDescriptorSet& write_constants = write_descriptor_sets[write_descriptor_set_count++];
-      write_constants.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-      write_constants.pNext = nullptr;
-      write_constants.dstSet = constants_descriptor_set;
-      write_constants.dstBinding = i;
-      write_constants.dstArrayElement = 0;
-      write_constants.descriptorCount = 1;
-      write_constants.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-      write_constants.pImageInfo = nullptr;
-      write_constants.pBufferInfo = &current_constant_buffer_infos_[i];
-      write_constants.pTexelBufferView = nullptr;
-    }
-    write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants;
-    current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetConstants] =
-        constants_descriptor_set;
-  }
   // Vertex shader textures and samplers.
   if (write_vertex_textures) {
     VkWriteDescriptorSet* write_textures =
@@ -7090,8 +7266,37 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   // successfully.
   current_graphics_descriptor_set_values_up_to_date_ |= write_descriptor_set_bits;
 
-  // Bind the new descriptor sets.
+  // Dynamic uniform buffers for Set 1 (constants - Pillar 7).
+  if (current_constant_buffer_handle_ != VK_NULL_HANDLE) {
+    bool bind_constants = false;
+    if (!(current_graphics_descriptor_sets_bound_up_to_date_ &
+          (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants))) {
+      bind_constants = true;
+    } else if (last_bound_constant_buffer_handle_ != current_constant_buffer_handle_) {
+      bind_constants = true;
+    } else if (last_bound_constant_buffer_dynamic_offsets_ !=
+               current_constant_buffer_dynamic_offsets_) {
+      bind_constants = true;
+    }
+
+    if (bind_constants) {
+      deferred_command_buffer_.CmdVkBindDescriptorSets(
+          VK_PIPELINE_BIND_POINT_GRAPHICS,
+          current_guest_graphics_pipeline_layout_->GetPipelineLayout(),
+          SpirvShaderTranslator::kDescriptorSetConstants, 1,
+          &current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetConstants],
+          uint32_t(current_constant_buffer_dynamic_offsets_.size()),
+          current_constant_buffer_dynamic_offsets_.data());
+      last_bound_constant_buffer_handle_ = current_constant_buffer_handle_;
+      last_bound_constant_buffer_dynamic_offsets_ = current_constant_buffer_dynamic_offsets_;
+      current_graphics_descriptor_sets_bound_up_to_date_ |=
+          UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants;
+    }
+  }
+
+  // Bind the new descriptor sets (excluding Set 1 which was bound with dynamic offsets above).
   uint32_t descriptor_sets_needed = (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetCount) - 1;
+  descriptor_sets_needed &= ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
   if (!texture_count_vertex && !sampler_count_vertex) {
     descriptor_sets_needed &= ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex);
   }

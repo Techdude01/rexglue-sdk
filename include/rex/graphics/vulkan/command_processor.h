@@ -799,6 +799,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
   bool in_render_pass_ = false;
   bool current_dynamic_rendering_has_stencil_ = false;
+  uint32_t current_dynamic_rendering_color_count_ = 0;
 
   // Currently bound graphics pipeline, either from the pipeline cache (with
   // potentially deferred creation - current_external_graphics_pipeline_ is
@@ -862,6 +863,30 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkBuffer bound_index_buffer_ = VK_NULL_HANDLE;
   VkDeviceSize bound_index_buffer_offset_ = 0;
   VkIndexType bound_index_type_ = VK_INDEX_TYPE_MAX_ENUM;
+
+  // Dynamic uniform buffer descriptor set and offsets for Set 1 (constants - Pillar 7).
+  VkDescriptorPool dynamic_constants_descriptor_pool_ = VK_NULL_HANDLE;
+  struct DynamicConstantsDescriptorSet {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+  };
+  std::vector<DynamicConstantsDescriptorSet> dynamic_constants_descriptor_sets_;
+  std::array<uint32_t, SpirvShaderTranslator::kConstantBufferCount>
+      current_constant_buffer_dynamic_offsets_{};
+  std::array<uint32_t, SpirvShaderTranslator::kConstantBufferCount>
+      last_bound_constant_buffer_dynamic_offsets_{};
+  VkBuffer current_constant_buffer_handle_ = VK_NULL_HANDLE;
+  VkBuffer last_bound_constant_buffer_handle_ = VK_NULL_HANDLE;
+
+  VkDescriptorSet GetOrCreateDynamicConstantsDescriptorSet(VkBuffer buffer);
+
+  // Lock-free cache of verified resident shared memory ranges (Pillar 8).
+  std::array<std::pair<uint32_t, uint32_t>, 16> validated_shared_memory_ranges_{};
+  size_t validated_shared_memory_ranges_count_ = 0;
+  uint64_t validated_shared_memory_ranges_epoch_ = 0;
+
+  bool RequestSharedMemoryRange(uint32_t start, uint32_t length);
+
   // CPU draw recording breakdown (Pillar 10).
   struct FrameCpuProfilingStats {
     uint64_t draw_count = 0;
@@ -872,6 +897,8 @@ class VulkanCommandProcessor : public CommandProcessor {
     std::chrono::nanoseconds time_shared_memory_residency{0};
     std::chrono::nanoseconds time_barriers_and_render_pass{0};
     std::chrono::nanoseconds time_vk_draw{0};
+    uint64_t fence_wait_count = 0;
+    std::chrono::nanoseconds time_fence_waits{0};
     std::chrono::nanoseconds time_draw_total{0};
 
     void Reset() {
@@ -883,6 +910,8 @@ class VulkanCommandProcessor : public CommandProcessor {
       time_shared_memory_residency = std::chrono::nanoseconds{0};
       time_barriers_and_render_pass = std::chrono::nanoseconds{0};
       time_vk_draw = std::chrono::nanoseconds{0};
+      fence_wait_count = 0;
+      time_fence_waits = std::chrono::nanoseconds{0};
       time_draw_total = std::chrono::nanoseconds{0};
     }
   } frame_cpu_profiling_stats_;
