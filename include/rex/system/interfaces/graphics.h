@@ -15,6 +15,7 @@
 #include <filesystem>
 
 #include <rex/system/xtypes.h>
+#include <rex/ui/frame_stats.h>
 
 // Forward declarations
 namespace rex::runtime {
@@ -56,6 +57,9 @@ class IGraphicsSystem {
   // leave these null.
   virtual ui::GraphicsProvider* provider() const { return nullptr; }
   virtual ui::Presenter* presenter() const { return nullptr; }
+
+  // Guest frame stats snapshot (FPS and frame time)
+  virtual ui::FrameStats GetGuestFrameStats() const { return {}; }
 
   // Guest GPU services reached from the xboxkrnl Vd* exports.
   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data) {

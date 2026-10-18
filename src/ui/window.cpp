@@ -622,6 +622,15 @@ void Window::OnPaint(bool force_paint) {
     return;
   }
   is_painting_ = true;
+  {
+    UIEvent e(this);
+    WindowDestructionReceiver destruction_receiver(this);
+    SendEventToListeners([&e](auto listener) { listener->OnPaint(e); }, destruction_receiver);
+    if (destruction_receiver.IsWindowDestroyedOrListenersUncallable()) {
+      is_painting_ = false;
+      return;
+    }
+  }
   if (presenter_surface_) {
     presenter_->PaintFromUIThread(force_paint);
   }

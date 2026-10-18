@@ -41,6 +41,7 @@
 
 #include <fmt/format.h>
 #include <imgui.h>
+#include <SDL3/SDL_timer.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -381,6 +382,24 @@ bool ReXApp::SetupPresentation() {
     }
   }
 
+  SetGuestFrameStats([this]() {
+    auto* graphics = runtime_ ? runtime_->graphics_system() : nullptr;
+    if (!graphics) {
+      graphics = config_.graphics.get();
+    }
+    return graphics ? graphics->GetGuestFrameStats() : ui::FrameStats{};
+  });
+
+  fps_timer_ = SDL_AddTimer(
+      1000,
+      [](void* userdata, SDL_TimerID timer_id, Uint32 interval) -> Uint32 {
+        (void)timer_id;
+        auto* app = static_cast<ReXApp*>(userdata);
+        app->app_context().CallInUIThreadDeferred([app] { app->UpdateWindowTitleFps(); });
+        return interval;
+      },
+      this);
+
   return true;
 }
 
@@ -598,6 +617,10 @@ void ReXApp::OnDestroy() {
   if (module_thread_.joinable()) {
     module_thread_.join();
   }
+  if (fps_timer_ != 0) {
+    SDL_RemoveTimer(fps_timer_);
+    fps_timer_ = 0;
+  }
   if (window_) {
     window_->RemoveInputListener(this);
     window_->RemoveListener(this);
@@ -610,6 +633,31 @@ void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provi
   frame_stats_provider_ = provider;
   if (debug_overlay_) {
     debug_overlay_->SetStatsProvider(provider);
+  }
+}
+
+void ReXApp::UpdateWindowTitleFps() {
+  if (!window_) {
+    return;
+  }
+  ui::FrameStats stats{};
+  if (frame_stats_provider_) {
+    stats = frame_stats_provider_();
+  } else if (config_.graphics) {
+    stats = config_.graphics->GetGuestFrameStats();
+  }
+  if (stats.frame_count > 0 && stats.fps > 0.0) {
+    std::string title = fmt::format("{} {} - {:.1f} FPS ({:.2f} ms)",
+                                    GetName(), REXGLUE_BUILD_TITLE, stats.fps, stats.frame_time_ms);
+    window_->SetTitle(title);
+  }
+}
+
+void ReXApp::OnPaint(ui::UIEvent& e) {
+  auto now = std::chrono::steady_clock::now();
+  if (now - last_fps_title_update_ >= std::chrono::seconds(1)) {
+    last_fps_title_update_ = now;
+    UpdateWindowTitleFps();
   }
 }
 

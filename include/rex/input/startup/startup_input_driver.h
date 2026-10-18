@@ -19,6 +19,8 @@ class StartupInputDriver final : public InputDriver {
     uint16_t button;
     int16_t thumb_lx;
     int16_t thumb_ly;
+    int16_t thumb_rx;
+    int16_t thumb_ry;
   };
 
   StartupInputDriver(std::string sequence, uint32_t cutoff_poll);
@@ -45,6 +47,8 @@ class StartupInputDriver final : public InputDriver {
   uint16_t last_buttons_ = 0;
   int16_t last_thumb_lx_ = 0;
   int16_t last_thumb_ly_ = 0;
+  int16_t last_thumb_rx_ = 0;
+  int16_t last_thumb_ry_ = 0;
   uint16_t state_buttons_ = 0;
 };
 

@@ -386,4 +386,17 @@ bool GraphicsSystem::Restore(::rex::stream::ByteStream* stream) {
   return command_processor_->Restore(stream);
 }
 
+::rex::ui::FrameStats GraphicsSystem::GetGuestFrameStats() const {
+  if (command_processor_) {
+    const auto& s = command_processor_->guest_frame_stats();
+    ::rex::ui::FrameStats stats{
+        s.frame_time_ms.load(std::memory_order_relaxed),
+        s.fps.load(std::memory_order_relaxed),
+        s.frame_count.load(std::memory_order_relaxed),
+    };
+    return stats;
+  }
+  return {};
+}
+
 }  // namespace rex::graphics

@@ -64,6 +64,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
   bool has_presentation() const override { return presenter_ != nullptr; }
   void Shutdown() override;
 
+  ::rex::ui::FrameStats GetGuestFrameStats() const override;
+
   // May be called from any thread any number of times, even during recovery
   // from a device loss.
   void OnHostGpuLossFromAnyThread(bool is_responsible);

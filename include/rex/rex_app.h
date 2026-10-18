@@ -282,6 +282,7 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   void OnLostFocus(ui::UISetupEvent& e) override;
   void OnMinimized(ui::UIEvent& e) override;
   void OnRestored(ui::UIEvent& e) override;
+  void OnPaint(ui::UIEvent& e) override;
 
   // WindowInputListener overrides
   void OnKeyDown(ui::KeyEvent& e) override;
@@ -309,7 +310,11 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   std::unique_ptr<ui::ImGuiDialog> achievements_overlay_;
   std::shared_ptr<ui::AchievementNotificationDialog> achievement_notification_;
   uint64_t achievement_notification_listener_ = 0;
+  void UpdateWindowTitleFps();
+
   ui::DebugOverlayDialog::FrameStatsProvider frame_stats_provider_;
+  std::chrono::steady_clock::time_point last_fps_title_update_{};
+  uint32_t fps_timer_ = 0;
   std::filesystem::path config_path_;
 };
 

@@ -42,6 +42,8 @@ class WindowListener {
   virtual void OnGotFocus(UISetupEvent&) {}
   virtual void OnLostFocus(UISetupEvent&) {}
 
+  virtual void OnPaint(UIEvent&) {}
+
   virtual void OnFileDrop(FileDropEvent&) {}
 };
 
