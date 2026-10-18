@@ -112,7 +112,103 @@ bool IsGpuProvenanceFrame(uint64_t frame) {
   return frame >= lower && frame <= upper && frame % 5 == 0;
 }
 
-void LogGpuProvenanceOutput(uint64_t frame, const ui::RawImage& image) {
+namespace {
+
+void DrawGlyph(uint8_t* rgba, uint32_t width, uint32_t height, uint32_t stride,
+               int x, int y, char c, int scale) {
+  static const uint8_t glyphs[128][8] = {
+      [' '] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+      ['('] = {0x0C, 0x18, 0x30, 0x30, 0x30, 0x18, 0x0C, 0x00},
+      [')'] = {0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x18, 0x30, 0x00},
+      ['-'] = {0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00},
+      ['.'] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00},
+      [':'] = {0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00},
+      ['|'] = {0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00},
+      ['0'] = {0x3C, 0x66, 0x6E, 0x76, 0x66, 0x66, 0x3C, 0x00},
+      ['1'] = {0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00},
+      ['2'] = {0x3C, 0x66, 0x06, 0x1C, 0x30, 0x66, 0x7E, 0x00},
+      ['3'] = {0x3C, 0x66, 0x06, 0x1C, 0x06, 0x66, 0x3C, 0x00},
+      ['4'] = {0x0C, 0x1C, 0x34, 0x64, 0x7E, 0x04, 0x0E, 0x00},
+      ['5'] = {0x7E, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3C, 0x00},
+      ['6'] = {0x1C, 0x30, 0x60, 0x7C, 0x66, 0x66, 0x3C, 0x00},
+      ['7'] = {0x7E, 0x66, 0x06, 0x0C, 0x18, 0x18, 0x18, 0x00},
+      ['8'] = {0x3C, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x3C, 0x00},
+      ['9'] = {0x3C, 0x66, 0x66, 0x3E, 0x06, 0x0C, 0x38, 0x00},
+      ['F'] = {0x7E, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x00},
+      ['P'] = {0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00},
+      ['S'] = {0x3C, 0x66, 0x60, 0x3C, 0x06, 0x66, 0x3C, 0x00},
+      ['r'] = {0x00, 0x00, 0x36, 0x3E, 0x30, 0x30, 0x30, 0x00},
+      ['a'] = {0x00, 0x00, 0x3C, 0x06, 0x3E, 0x66, 0x3E, 0x00},
+      ['e'] = {0x00, 0x00, 0x3C, 0x66, 0x7E, 0x60, 0x3C, 0x00},
+      ['m'] = {0x00, 0x00, 0x7C, 0x54, 0x54, 0x54, 0x54, 0x00},
+      ['s'] = {0x00, 0x00, 0x3C, 0x60, 0x3C, 0x06, 0x7C, 0x00},
+  };
+  const uint8_t* rows = glyphs[static_cast<uint8_t>(c) < 128 ? static_cast<uint8_t>(c) : 0];
+  for (int row = 0; row < 8; ++row) {
+    uint8_t bits = rows[row];
+    for (int col = 0; col < 8; ++col) {
+      if ((bits << col) & 0x80) {
+        for (int dy = 0; dy < scale; ++dy) {
+          int py = y + row * scale + dy;
+          if (py < 0 || py >= int(height)) continue;
+          for (int dx = 0; dx < scale; ++dx) {
+            int px = x + col * scale + dx;
+            if (px < 0 || px >= int(width)) continue;
+            uint8_t* p = rgba + size_t(py) * stride + size_t(px) * 4;
+            p[0] = 255;
+            p[1] = 255;
+            p[2] = 255;
+          }
+        }
+      }
+    }
+  }
+}
+
+void StampFpsOverlay(ui::RawImage& image, uint64_t frame, double fps, double frame_time_ms) {
+  if (image.width < 320 || image.height < 100 || !image.data.data()) {
+    return;
+  }
+  char text[64];
+  if (fps > 0.0) {
+    std::snprintf(text, sizeof(text), "Frame %llu | %.1f FPS (%.2f ms)",
+                  (unsigned long long)frame, fps, frame_time_ms);
+  } else {
+    std::snprintf(text, sizeof(text), "Frame %llu", (unsigned long long)frame);
+  }
+
+  const int scale = 2;
+  const int char_width = 8 * scale;
+  const int char_height = 8 * scale;
+  const int text_len = int(std::strlen(text));
+  const int pad_x = 10;
+  const int pad_y = 6;
+  const int badge_w = text_len * char_width + pad_x * 2;
+  const int badge_h = char_height + pad_y * 2;
+  const int start_x = int(image.width) - badge_w - 20;
+  const int start_y = 16;
+
+  // Dark translucent background box
+  for (int y = start_y; y < start_y + badge_h && y < int(image.height); ++y) {
+    uint8_t* row = image.data.data() + size_t(y) * image.stride;
+    for (int x = start_x; x < start_x + badge_w && x < int(image.width); ++x) {
+      uint8_t* p = row + size_t(x) * 4;
+      p[0] = p[0] / 4;
+      p[1] = p[1] / 4;
+      p[2] = p[2] / 4;
+    }
+  }
+
+  // Draw white text
+  for (int i = 0; i < text_len; ++i) {
+    DrawGlyph(image.data.data(), image.width, image.height, uint32_t(image.stride),
+              start_x + pad_x + i * char_width, start_y + pad_y, text[i], scale);
+  }
+}
+
+}  // namespace
+
+void LogGpuProvenanceOutput(uint64_t frame, ui::RawImage& image, double fps, double frame_time_ms) {
   if (!image.width || !image.height || image.stride < size_t(image.width) * 4 ||
       image.data.size() < image.stride * image.height) {
     REXGPU_WARN("GPU provenance frame {} output capture has invalid dimensions/storage", frame);
@@ -136,9 +232,13 @@ void LogGpuProvenanceOutput(uint64_t frame, const ui::RawImage& image) {
   }
   REXGPU_INFO(
       "GPU provenance frame {} captured guest output {}x{} nonblack_pixels={}/{} "
-      "rgb_min={},{},{} rgb_max={},{},{}",
+      "rgb_min={},{},{} rgb_max={},{},{} FPS={:.1f} ({:.2f} ms)",
       frame, image.width, image.height, nonblack_pixels, uint64_t(image.width) * image.height,
-      minimum[0], minimum[1], minimum[2], maximum[0], maximum[1], maximum[2]);
+      minimum[0], minimum[1], minimum[2], maximum[0], maximum[1], maximum[2],
+      fps, frame_time_ms);
+
+  // Stamp on-screen FPS and frame watermark for headless verification.
+  StampFpsOverlay(image, frame, fps, frame_time_ms);
 
   char auto_ppm_path[128];
   snprintf(auto_ppm_path, sizeof(auto_ppm_path), "/tmp/frame_%llu.ppm", (unsigned long long)frame);
@@ -3096,7 +3196,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     if (guest_output_refreshed) {
       ui::RawImage captured_output;
       if (presenter->CaptureGuestOutput(captured_output)) {
-        LogGpuProvenanceOutput(provenance_frame, captured_output);
+        LogGpuProvenanceOutput(provenance_frame, captured_output,
+                               guest_frame_stats_.fps.load(std::memory_order_relaxed),
+                               guest_frame_stats_.frame_time_ms.load(std::memory_order_relaxed));
       } else {
         REXGPU_WARN("GPU provenance frame {} guest output capture failed", provenance_frame);
       }
