@@ -369,11 +369,18 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                                                              : view_depth_color_;
     }
     VkDescriptorSet GetDescriptorSetTransferSource() const {
+      const_cast<VulkanRenderTarget*>(this)->is_sampled_ = true;
       ui::vulkan::SingleLayoutDescriptorSetPool& descriptor_set_pool =
           key().is_depth ? *render_target_cache_.descriptor_set_pool_sampled_image_x2_
                          : *render_target_cache_.descriptor_set_pool_sampled_image_;
       return descriptor_set_pool.Get(descriptor_set_index_transfer_source_);
     }
+
+    bool is_resolve_source() const { return is_resolve_source_; }
+    void MarkResolveSource() { is_resolve_source_ = true; }
+
+    bool is_sampled() const { return is_sampled_; }
+    void MarkSampled() { is_sampled_ = true; }
 
     static void GetDrawUsage(bool is_depth, VkPipelineStageFlags* stage_mask_out,
                              VkAccessFlags* access_mask_out, VkImageLayout* layout_out) {
@@ -417,6 +424,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     bool has_pending_clear_ = false;
     VkClearValue pending_clear_value_{};
+
+    bool is_resolve_source_ = false;
+    bool is_sampled_ = false;
 
     VkImage image_;
     VkDeviceMemory memory_;

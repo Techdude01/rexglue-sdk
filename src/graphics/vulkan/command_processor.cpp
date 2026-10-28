@@ -107,6 +107,12 @@ REXCVAR_DEFINE_BOOL(
     "render passes, avoiding render pass splits.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(
+    vulkan_prune_unused_attachment_load_store, false, "GPU/Vulkan",
+    "Prune redundant load and store memory operations (DONT_CARE) for unneeded or "
+    "transient attachments that are cleared before load and never resolved or sampled.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(
     gpu_provenance_frame, 0, "GPU/Vulkan",
     "Trace this guest frame through draws, resolve, slot-0 swap, and output capture; "

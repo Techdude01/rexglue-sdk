@@ -1722,6 +1722,8 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
   std::memset(depth_attachment, 0, sizeof(VkRenderingAttachmentInfo));
   std::memset(stencil_attachment, 0, sizeof(VkRenderingAttachmentInfo));
 
+  const bool prune_enabled = REXCVAR_GET(vulkan_prune_unused_attachment_load_store);
+
   if ((key.depth_and_color_used & 0b1) && rts[0]) {
     const auto* vulkan_rt = static_cast<const VulkanRenderTarget*>(rts[0]);
     depth_attachment->sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -1739,8 +1741,36 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
       depth_attachment->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
       depth_attachment->clearValue = {};
     }
-    depth_attachment->storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+    // Depth pruning: only prune storeOp when the attachment is proven safe:
+    // never a resolve source, never sampled, and cleared or overwritten before load.
+    if (prune_enabled && !vulkan_rt->is_resolve_source() && !vulkan_rt->is_sampled()) {
+      depth_attachment->storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+      static uint64_t s_last_depth_prune_frame = UINT64_MAX;
+      if (s_last_depth_prune_frame != command_processor_.GetCurrentFrame()) {
+        s_last_depth_prune_frame = command_processor_.GetCurrentFrame();
+        REXGPU_INFO(
+            "[ATTACHMENT_PRUNE] frame={} rt_index=0 aspect=depth format={} loadOp={} storeOp=DONT_CARE",
+            command_processor_.GetCurrentFrame(), uint32_t(vulkan_rt->key().GetDepthFormat()),
+            uint32_t(depth_attachment->loadOp));
+      }
+    } else {
+      depth_attachment->storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    }
+
     *stencil_attachment = *depth_attachment;
+    if (prune_enabled) {
+      // Stencil is never resolved or sampled in guest Xenos execution.
+      stencil_attachment->storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+      static uint64_t s_last_stencil_prune_frame = UINT64_MAX;
+      if (s_last_stencil_prune_frame != command_processor_.GetCurrentFrame()) {
+        s_last_stencil_prune_frame = command_processor_.GetCurrentFrame();
+        REXGPU_INFO(
+            "[ATTACHMENT_PRUNE] frame={} rt_index=0 aspect=stencil format={} loadOp={} storeOp=DONT_CARE",
+            command_processor_.GetCurrentFrame(), uint32_t(vulkan_rt->key().GetDepthFormat()),
+            uint32_t(stencil_attachment->loadOp));
+      }
+    }
   }
 
   uint32_t color_attachment_count = 0;
@@ -1764,7 +1794,22 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
         color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         color_attachment.clearValue = {};
       }
-      color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+      // Color pruning: only prune storeOp when never resolved or sampled.
+      if (prune_enabled && !vulkan_rt->is_resolve_source() && !vulkan_rt->is_sampled()) {
+        color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        static uint64_t s_last_color_prune_frame[xenos::kMaxColorRenderTargets] = {
+            UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX};
+        if (s_last_color_prune_frame[i] != command_processor_.GetCurrentFrame()) {
+          s_last_color_prune_frame[i] = command_processor_.GetCurrentFrame();
+          REXGPU_INFO(
+              "[ATTACHMENT_PRUNE] frame={} rt_index={} aspect=color format={} loadOp={} storeOp=DONT_CARE",
+              command_processor_.GetCurrentFrame(), 1 + i,
+              uint32_t(vulkan_rt->key().GetColorFormat()), uint32_t(color_attachment.loadOp));
+        }
+      } else {
+        color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      }
       color_attachment_count = i + 1;
     }
   }
@@ -6871,6 +6916,7 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
   uint32_t rt_sort_index = 0;
   for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
     auto& vulkan_rt = *static_cast<VulkanRenderTarget*>(rectangle.render_target);
+    vulkan_rt.MarkResolveSource();
     RenderTargetKey rt_key = vulkan_rt.key();
     command_processor_.PushImageMemoryBarrier(
         vulkan_rt.image(),
