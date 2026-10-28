@@ -40,6 +40,7 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/frame_capture_schedule.h>
+#include <rex/graphics/vulkan/scope_profile_timing.h>
 #include <rex/graphics/vulkan/transfer_scope_reuse.h>
 #include <rex/graphics/vulkan/vertex_input_diagnostic.h>
 #include <rex/graphics/vulkan/quad_partner_marker.h>
@@ -4015,8 +4016,15 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     rendering_info.pStencilAttachment = has_stencil ? &stencil_attachment : nullptr;
 
     std::string format_str;
-    if ((rpk.depth_and_color_used >> 1) != 0) {
-      format_str = xenos::GetColorRenderTargetFormatName(rpk.color_0_view_format);
+    const xenos::ColorRenderTargetFormat color_formats[] = {
+        rpk.color_0_view_format, rpk.color_1_view_format,
+        rpk.color_2_view_format, rpk.color_3_view_format};
+    for (uint32_t i = 0; i < color_attachment_count; ++i) {
+      if (!(rpk.depth_and_color_used & (2u << i))) continue;
+      if (!format_str.empty()) format_str += "+";
+      format_str += fmt::format("C{}:{}[load={},store={}]", i,
+          xenos::GetColorRenderTargetFormatName(color_formats[i]),
+          int(color_attachments[i].loadOp), int(color_attachments[i].storeOp));
     }
     if (rpk.depth_and_color_used & 1) {
       if (!format_str.empty()) format_str += "+";
@@ -4671,7 +4679,7 @@ bool VulkanCommandProcessor::InitializeGpuTimingResources() {
       transfer_profile_pool_ = VK_NULL_HANDLE;
   }
 
-  if (REXCVAR_GET(gpu_profile_scope_timestamps)) {
+  if (REXCVAR_GET(gpu_profile_scope_timestamps) && timestamp_valid_bits_) {
     pool_info.queryCount = kMaxTimestampFramesInFlight * kScopeQueriesPerFrame;
     if (dfn.vkCreateQueryPool(device, &pool_info, nullptr, &scope_profile_pool_) != VK_SUCCESS) {
       REXGPU_WARN("Failed to create Vulkan scope profile query pool");
@@ -4705,7 +4713,8 @@ uint32_t VulkanCommandProcessor::BeginScopeProfile(
     VkAttachmentLoadOp color_load, VkAttachmentStoreOp color_store,
     VkAttachmentLoadOp depth_load, VkAttachmentStoreOp depth_store,
     const std::string& description) {
-  if (!REXCVAR_GET(gpu_profile_scope_timestamps) || !frame_open_ ||
+  if (!REXCVAR_GET(gpu_profile_scope_timestamps) ||
+      !REXCVAR_GET(gpu_frame_audit_enable) || !frame_open_ ||
       !ShouldProfileFrameDraws(frame_current_)) {
     return UINT32_MAX;
   }
@@ -4737,7 +4746,9 @@ uint32_t VulkanCommandProcessor::BeginScopeProfile(
 
   uint32_t scope_idx = uint32_t(scopes.size());
   scopes.push_back(std::move(record));
-  active_scope_index_ = scope_idx;
+  // Resolve envelopes and compute spans must not replace the live render scope.
+  if (category == ScopeCategory::kMainPass || category == ScopeCategory::kTransferPass)
+    active_scope_index_ = scope_idx;
   return scope_idx;
 }
 
@@ -4745,7 +4756,8 @@ void VulkanCommandProcessor::EndScopeProfile(uint32_t scope_index) {
   if (scope_index == UINT32_MAX) return;
   uint32_t slot = frame_current_ % kMaxTimestampFramesInFlight;
   auto& scopes = frame_scopes_[slot];
-  if (scope_index < scopes.size()) {
+  if (scope_index < scopes.size() && !scopes[scope_index].ended) {
+    scopes[scope_index].ended = true;
     if (scope_profile_pool_ && scopes[scope_index].query_end != UINT32_MAX) {
       deferred_command_buffer_.CmdProfileTimestamp(scope_profile_pool_, scopes[scope_index].query_end);
     }
@@ -4882,6 +4894,53 @@ void VulkanCommandProcessor::LogTopBarrierTuples() {
   REXGPU_INFO("=========================================================================");
 }
 
+void VulkanCommandProcessor::LogScopeProfileAggregateSummary() {
+  if (!accum_scope_frames_) return;
+  const double frames = double(accum_scope_frames_);
+  const double scope_ms = accum_scope_main_ms_ + accum_scope_transfer_ms_ +
+      accum_scope_resolve_ms_ + accum_scope_compute_ms_;
+  const bool timed = accum_scope_records_ && accum_scope_timed_records_ == accum_scope_records_ &&
+      scope_ms > 0.0;
+  REXGPU_INFO("SCOPE_SUMMARY frames={} timed={}/{} saturated_frames={} timing={} "
+              "gpu_frame_ms={} gpu_complete_interval_ms={} completion_samples={}/{} swap_interval_ms={:.6f}",
+      accum_scope_frames_, accum_scope_timed_records_, accum_scope_records_,
+      accum_scope_saturated_frames_, timed ? "available" : "unavailable_partial_or_zero_spans",
+      timestamp_valid_bits_ ? fmt::format("{:.6f}", accum_scope_gpu_frame_ms_ / frames) : "N/A",
+      accum_scope_complete_samples_ ? fmt::format("{:.6f}", accum_scope_complete_interval_ms_ /
+          double(accum_scope_complete_samples_)) : "N/A",
+      accum_scope_complete_samples_, accum_scope_frames_, accum_scope_swap_interval_ms_ / frames);
+  const char* names[] = {"Main", "Transfer", "Resolve(inclusive)", "Compute"};
+  const double counts[] = {accum_scope_main_count_, accum_scope_transfer_count_,
+      accum_scope_resolve_count_, accum_scope_compute_count_};
+  const double times[] = {accum_scope_main_ms_, accum_scope_transfer_ms_,
+      accum_scope_resolve_ms_, accum_scope_compute_ms_};
+  for (size_t i = 0; i < 4; ++i) {
+    REXGPU_INFO("SCOPE_CATEGORY category={} count_total={} count_per_frame={:.6f} ms_per_frame={}",
+        names[i], counts[i], counts[i] / frames,
+        timed ? fmt::format("{:.6f}", times[i] / frames) : "N/A");
+  }
+  // Resolve is an inclusive envelope, not additive to its nested transfer/compute work.
+  std::vector<std::pair<std::string, ScopeArchetype>> sorted(scope_archetypes_.begin(), scope_archetypes_.end());
+  std::sort(sorted.begin(), sorted.end(), [timed](const auto& a, const auto& b) {
+    if (timed && a.second.total_gpu_time_ms != b.second.total_gpu_time_ms)
+      return a.second.total_gpu_time_ms > b.second.total_gpu_time_ms;
+    if (a.second.occurrence_count != b.second.occurrence_count)
+      return a.second.occurrence_count > b.second.occurrence_count;
+    if (a.second.total_draws != b.second.total_draws)
+      return a.second.total_draws > b.second.total_draws;
+    return a.first < b.first;
+  });
+  for (size_t i = 0; i < std::min<size_t>(15, sorted.size()); ++i) {
+    const auto& s = sorted[i].second;
+    REXGPU_INFO("SCOPE_TOP rank={} category={} size={}x{} format={} color_load/store={}/{} "
+                "depth_load/store={}/{} count={} draws={} ms_per_frame={} description={}",
+        i + 1, names[size_t(s.category)], s.width, s.height, s.format,
+        int(s.color_load_op), int(s.color_store_op), int(s.depth_load_op), int(s.depth_store_op),
+        s.occurrence_count, s.total_draws,
+        timed ? fmt::format("{:.6f}", s.total_gpu_time_ms / frames) : "N/A", s.description);
+  }
+}
+
 void VulkanCommandProcessor::FlushCompletedAuditRows(bool force) {
   if (pending_audit_rows_.empty()) return;
 
@@ -4971,7 +5030,71 @@ void VulkanCommandProcessor::FlushCompletedAuditRows(bool force) {
     }
 
     double gpu_complete_interval_ms = 0.0;
-    gpu_completion_tracker_.GetCompletionInterval(row.frame, &gpu_complete_interval_ms);
+    const bool completion_available =
+        gpu_completion_tracker_.GetCompletionInterval(row.frame, &gpu_complete_interval_ms);
+
+    if (REXCVAR_GET(gpu_profile_scope_timestamps)) {
+      ++accum_scope_frames_;
+      accum_scope_gpu_frame_ms_ += gpu_frame_ms;
+      if (completion_available) {
+        accum_scope_complete_interval_ms_ += gpu_complete_interval_ms;
+        ++accum_scope_complete_samples_;
+      }
+      accum_scope_swap_interval_ms_ += row.swap_interval_ms;
+      accum_scope_saturated_frames_ += row.scopes.size() == kMaxScopesPerFrame;
+      // Availability is queried without WAIT: unsupported or incomplete queries
+      // must never block the audit or masquerade as zero-cost GPU work.
+      std::vector<uint64_t> values(row.scopes.size() * 4, 0);
+      VkResult result = VK_NOT_READY;
+      if (scope_profile_pool_ && timestamp_valid_bits_ && !values.empty()) {
+        result = dfn.vkGetQueryPoolResults(device, scope_profile_pool_,
+            (row.frame % kMaxTimestampFramesInFlight) * kScopeQueriesPerFrame,
+            uint32_t(row.scopes.size() * 2), values.size() * sizeof(uint64_t),
+            values.data(), 2 * sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+      }
+      double counts[4] = {}, times[4] = {};
+      uint64_t timed = 0;
+      for (size_t i = 0; i < row.scopes.size(); ++i) {
+        const auto& scope = row.scopes[i];
+        const bool readable = (result == VK_SUCCESS || result == VK_NOT_READY) &&
+            scope.query_start != UINT32_MAX;
+        const auto duration = ScopeProfileMilliseconds(timestamp_valid_bits_, timestamp_period_ns_,
+            scope.ended && readable, values[i * 4], values[i * 4 + 1],
+            values[i * 4 + 2], values[i * 4 + 3]);
+        bool available = duration.has_value();
+        double ms = duration.value_or(0.0);
+        timed += available;
+        size_t category = size_t(scope.category);
+        ++counts[category];
+        times[category] += ms;
+        std::string key = fmt::format("{}:{}x{}:{}:{}:{}:{}:{}:{}",
+            category, scope.width, scope.height, scope.format,
+            int(scope.color_load_op), int(scope.color_store_op),
+            int(scope.depth_load_op), int(scope.depth_store_op), scope.description);
+        auto& archetype = scope_archetypes_[key];
+        archetype.category = scope.category;
+        archetype.width = scope.width;
+        archetype.height = scope.height;
+        archetype.format = scope.format;
+        archetype.color_load_op = scope.color_load_op;
+        archetype.color_store_op = scope.color_store_op;
+        archetype.depth_load_op = scope.depth_load_op;
+        archetype.depth_store_op = scope.depth_store_op;
+        archetype.description = scope.description;
+        archetype.total_gpu_time_ms += ms;
+        archetype.total_draws += scope.draw_count;
+        ++archetype.occurrence_count;
+      }
+      accum_scope_records_ += row.scopes.size();
+      accum_scope_timed_records_ += timed;
+      accum_scope_main_count_ += counts[0]; accum_scope_main_ms_ += times[0];
+      accum_scope_transfer_count_ += counts[1]; accum_scope_transfer_ms_ += times[1];
+      accum_scope_resolve_count_ += counts[2]; accum_scope_resolve_ms_ += times[2];
+      accum_scope_compute_count_ += counts[3]; accum_scope_compute_ms_ += times[3];
+      REXGPU_INFO("SCOPE_PROFILE frame={} main={} transfer={} resolve={} compute={} timed={}/{}",
+          row.frame, counts[0], counts[1], counts[2], counts[3], timed, row.scopes.size());
+    }
 
     uint64_t lag = frame_current_ > row.frame ? (frame_current_ - row.frame) : 0;
     REXGPU_INFO(
@@ -5119,6 +5242,7 @@ void VulkanCommandProcessor::RecordFrameAuditRow(uint64_t frame, double wall_ms)
   pending.closing_submission = GetCurrentSubmission() - 1;
   pending.submission_count = frame_submission_counts_[frame % kMaxTimestampFramesInFlight];
   pending.transfer_profile_count = transfer_profile_counts_[frame % kMaxTimestampFramesInFlight];
+  pending.scopes = frame_scopes_[frame % kMaxTimestampFramesInFlight];
   pending.wall_ms = wall_ms;
   pending.cpu_stats = frame_cpu_profiling_stats_;
   pending.work_counters = frame_work_counters_;
@@ -5161,7 +5285,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
   FrameCpuTimeline::Scope audit_draw(GetFrameCpuTimeline(), FrameCpuTimeline::Bucket::kDraw);
-  NoteScopeDraw();
   bool diagnostic_capture_active = false;
   bool diagnostic_vertex_output_capture_active = false;
   bool diagnostic_draw_recorded = false;
@@ -7272,6 +7395,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
+    NoteScopeDraw();
     deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
   } else {
     std::pair<VkBuffer, VkDeviceSize> index_buffer;
@@ -7311,6 +7435,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       bound_index_buffer_offset_ = index_buffer.second;
       bound_index_type_ = index_type;
     }
+    NoteScopeDraw();
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
   }
@@ -9001,6 +9126,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     FlushCompletedAuditRows(false);
     if (audit_end != 0 && frame_current_ == audit_end) {
       FlushCompletedAuditRows(true);
+      LogScopeProfileAggregateSummary();
       LogTopBarrierTuples();
     }
     if (IsGpuProvenanceFrame(frame_current_)) {

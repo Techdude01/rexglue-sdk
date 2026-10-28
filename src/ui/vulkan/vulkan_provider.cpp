@@ -17,6 +17,12 @@
 #include <rex/ui/vulkan/immediate_drawer.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
+#include <rex/ui/vulkan/driver_fallback.h>
+
+#if REX_PLATFORM_MAC
+#include "vulkan_moltenvk.h"
+REXCVAR_DECLARE(std::string, vulkan_driver);
+#endif
 
 REXCVAR_DEFINE_BOOL(vulkan_validation_enabled, false, "UI/Vulkan",
                     "Enable Vulkan validation layers")
@@ -46,10 +52,27 @@ namespace vulkan {
 
 std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emulation,
                                                        const bool with_presentation) {
+#if REX_PLATFORM_MAC
+  return CreateWithMacOSDriverFallback(
+      REXCVAR_GET(vulkan_driver) == "kosmickrisp", IsMacOSKosmicKrispAvailable(),
+      [=](bool force_moltenvk) {
+        return CreateWithRuntime(with_gpu_emulation, with_presentation, force_moltenvk);
+      },
+      [](const char* reason) {
+        REXLOG_WARN("KosmicKrisp unavailable ({}); falling back to MoltenVK", reason);
+      });
+#else
+  return CreateWithRuntime(with_gpu_emulation, with_presentation, false);
+#endif
+}
+
+std::unique_ptr<VulkanProvider> VulkanProvider::CreateWithRuntime(
+    bool with_gpu_emulation, bool with_presentation, bool force_moltenvk) {
   std::unique_ptr<VulkanProvider> provider(new VulkanProvider());
 
   provider->vulkan_instance_ =
-      VulkanInstance::Create(with_presentation, REXCVAR_GET(vulkan_validation_enabled));
+      VulkanInstance::Create(with_presentation, REXCVAR_GET(vulkan_validation_enabled),
+                             force_moltenvk);
   if (!provider->vulkan_instance_) {
     return nullptr;
   }

@@ -24,7 +24,8 @@ namespace vulkan {
 
 class VulkanInstance {
  public:
-  static std::unique_ptr<VulkanInstance> Create(bool with_surface, bool try_enable_validation);
+  static std::unique_ptr<VulkanInstance> Create(bool with_surface, bool try_enable_validation,
+                                               bool force_moltenvk = false);
 
   VulkanInstance(const VulkanInstance&) = delete;
   VulkanInstance& operator=(const VulkanInstance&) = delete;

@@ -243,6 +243,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t query_start = UINT32_MAX;
     uint32_t query_end = UINT32_MAX;
     double gpu_time_ms = 0.0;
+    bool ended = false;
     std::string description;
   };
 
@@ -1211,7 +1212,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t occurrence_count = 0;
   };
 
-  static constexpr uint32_t kMaxScopesPerFrame = 256;
+  // 16 frame slots * 128 scopes * 2 queries * 8 bytes = 32 KiB,
+  // the Metal counter sample buffer limit on the benchmark device.
+  static constexpr uint32_t kMaxScopesPerFrame = 128;
   static constexpr uint32_t kScopeQueriesPerFrame = kMaxScopesPerFrame * 2;
   VkQueryPool scope_profile_pool_ = VK_NULL_HANDLE;
   uint32_t scope_profile_counts_[kMaxTimestampFramesInFlight] = {};
@@ -1221,6 +1224,10 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   // Window aggregation stats
   uint64_t accum_scope_frames_ = 0;
+  uint64_t accum_scope_timed_records_ = 0;
+  uint64_t accum_scope_records_ = 0;
+  uint64_t accum_scope_saturated_frames_ = 0;
+  uint64_t accum_scope_complete_samples_ = 0;
   double accum_scope_main_count_ = 0.0;
   double accum_scope_main_ms_ = 0.0;
   double accum_scope_transfer_count_ = 0.0;
@@ -1322,6 +1329,7 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint64_t closing_submission = 0;
     uint32_t submission_count = 0;
     uint32_t transfer_profile_count = 0;
+    std::vector<ScopeProfileRecord> scopes;
     double wall_ms = 0.0;
     FrameCpuProfilingStats cpu_stats;
     FrameWorkCounters work_counters;

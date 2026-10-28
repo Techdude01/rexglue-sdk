@@ -38,6 +38,8 @@ class VulkanProvider : public GraphicsProvider {
   std::unique_ptr<ImmediateDrawer> CreateImmediateDrawer() override;
 
  private:
+  static std::unique_ptr<VulkanProvider> CreateWithRuntime(
+      bool with_gpu_emulation, bool with_presentation, bool force_moltenvk);
   explicit VulkanProvider() = default;
 
   std::unique_ptr<VulkanInstance> vulkan_instance_;

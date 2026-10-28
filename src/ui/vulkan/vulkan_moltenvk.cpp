@@ -31,8 +31,13 @@ REXCVAR_DEFINE_BOOL(
     "Configure MoltenVK for asynchronous queue submits (MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=0)");
 
 REXCVAR_DEFINE_STRING(
-    vulkan_driver, "moltenvk", "UI/Vulkan",
-    "Select active Vulkan driver on macOS ('moltenvk' [default] or 'kosmickrisp')");
+    vulkan_driver, "kosmickrisp", "UI/Vulkan",
+    "Select active Vulkan driver on macOS ('kosmickrisp' [default] or 'moltenvk' override)");
+
+REXCVAR_DEFINE_STRING(
+    vulkan_kosmickrisp_icd,
+    "/Users/Kushal/Projects/cosmicR/out/kosmickrisp-trial-20261028/trial-icd.json", "UI/Vulkan",
+    "Path to the pinned KosmicKrisp ICD manifest");
 
 namespace rex::ui::vulkan {
 namespace {
@@ -196,19 +201,19 @@ MacOSVulkanRuntimePaths DetectMacOSVulkanRuntimePaths() {
   return paths;
 }
 
-void ConfigureMacOSVulkanEnvironment(const MacOSVulkanRuntimePaths& paths) {
+bool IsMacOSKosmicKrispAvailable() {
+  return PathExists(REXCVAR_GET(vulkan_kosmickrisp_icd));
+}
+
+void ConfigureMacOSVulkanEnvironment(const MacOSVulkanRuntimePaths& paths,
+                                    bool force_moltenvk) {
   const std::string driver_choice = REXCVAR_GET(vulkan_driver);
-  if (driver_choice == "kosmickrisp") {
-    constexpr const char* kKosmicKrispManifest =
-        "/Users/Kushal/Projects/cosmicR/out/kosmickrisp-trial-20261028/trial-icd.json";
-    if (fs::exists(kKosmicKrispManifest)) {
-      setenv("VK_DRIVER_FILES", kKosmicKrispManifest, 1);
-      setenv("VK_ICD_FILENAMES", kKosmicKrispManifest, 1);
-      REXLOG_INFO("Configured Vulkan environment for KosmicKrisp via cvar: {}", kKosmicKrispManifest);
-      return;
-    } else {
-      REXLOG_WARN("KosmicKrisp manifest not found at {}; falling back to MoltenVK", kKosmicKrispManifest);
-    }
+  if (!force_moltenvk && driver_choice == "kosmickrisp") {
+    const std::string manifest = REXCVAR_GET(vulkan_kosmickrisp_icd);
+    setenv("VK_DRIVER_FILES", manifest.c_str(), 1);
+    setenv("VK_ICD_FILENAMES", manifest.c_str(), 1);
+    REXLOG_INFO("Configured Vulkan environment for KosmicKrisp: {}", manifest);
+    return;
   }
 
   if (!paths.sdk_root.empty()) {
@@ -221,15 +226,14 @@ void ConfigureMacOSVulkanEnvironment(const MacOSVulkanRuntimePaths& paths) {
 
   if (!paths.moltenvk_icd.empty()) {
     std::string moltenvk_icd = paths.moltenvk_icd.string();
-    const char* vk_driver_files = std::getenv("VK_DRIVER_FILES");
-    if (!vk_driver_files || !vk_driver_files[0]) {
-      setenv("VK_DRIVER_FILES", moltenvk_icd.c_str(), 1);
-    }
-
-    const char* vk_icd_filenames = std::getenv("VK_ICD_FILENAMES");
-    if (!vk_icd_filenames || !vk_icd_filenames[0]) {
-      setenv("VK_ICD_FILENAMES", moltenvk_icd.c_str(), 1);
-    }
+    // Explicit override and retry must replace stale KosmicKrisp selection.
+    setenv("VK_DRIVER_FILES", moltenvk_icd.c_str(), 1);
+    setenv("VK_ICD_FILENAMES", moltenvk_icd.c_str(), 1);
+  } else {
+    // Let the loader discover an installed MoltenVK rather than retaining the
+    // failed KosmicKrisp manifest from the first attempt.
+    unsetenv("VK_DRIVER_FILES");
+    unsetenv("VK_ICD_FILENAMES");
   }
 
   const char* sync_queue_submits = std::getenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS");

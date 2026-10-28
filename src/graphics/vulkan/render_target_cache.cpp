@@ -1257,6 +1257,22 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     return true;
   }
 
+  // Inclusive resolve envelope; nested transfer/compute timings are not additive.
+  // ResolveInfo dimensions are in guest 8-pixel units; report host dimensions.
+  const uint32_t profile_scope = command_processor_.BeginScopeProfile(
+      VulkanCommandProcessor::ScopeCategory::kResolve,
+      uint32_t(resolve_info.coordinate_info.width_div_8) * 8u * draw_resolution_scale_x(),
+      resolve_info.height_div_8 * 8u * draw_resolution_scale_y(),
+      fmt::format("dest:{}", uint32_t(resolve_info.copy_dest_info.copy_dest_format)),
+      VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+      VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+      resolve_info.IsCopyingDepth() ? "resolve_depth_inclusive" : "resolve_color_inclusive");
+  struct EndResolveProfile {
+    VulkanCommandProcessor& processor;
+    uint32_t scope;
+    ~EndResolveProfile() { processor.EndScopeProfile(scope); }
+  } end_resolve_profile{command_processor_, profile_scope};
+
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -6281,6 +6297,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
               command_buffer.CmdVkSetStencilWriteMask(VK_STENCIL_FACE_FRONT_AND_BACK,
                                                       transfer_stencil_bit);
             }
+            command_processor_.NoteScopeDraw();
             command_buffer.CmdVkDraw(transfer_vertex_count, 1, 0, 0);
           }
         }

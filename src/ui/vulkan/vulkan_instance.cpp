@@ -32,7 +32,8 @@ namespace ui {
 namespace vulkan {
 
 std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
-                                                       const bool try_enable_validation) {
+                                                       const bool try_enable_validation,
+                                                       [[maybe_unused]] const bool force_moltenvk) {
   std::unique_ptr<VulkanInstance> vulkan_instance(new VulkanInstance());
 
   // Load the RenderDoc API if connected.
@@ -47,7 +48,7 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   bool loader_loaded = false;
 #if REX_PLATFORM_MAC
   const MacOSVulkanRuntimePaths macos_runtime_paths = DetectMacOSVulkanRuntimePaths();
-  ConfigureMacOSVulkanEnvironment(macos_runtime_paths);
+  ConfigureMacOSVulkanEnvironment(macos_runtime_paths, force_moltenvk);
 
   std::vector<std::filesystem::path> loader_candidates = macos_runtime_paths.loader_candidates;
   loader_candidates.emplace_back(platform::lib_names::kVulkanLoader);

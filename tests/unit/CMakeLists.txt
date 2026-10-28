@@ -1,4 +1,10 @@
 # Unit Tests for ReXGlue core components
+add_executable(driver_fallback_tests ui/driver_fallback_test.cpp)
+target_include_directories(driver_fallback_tests PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(driver_fallback_tests PRIVATE Catch2::Catch2WithMain)
+add_executable(scope_profile_timing_tests graphics/vulkan/scope_profile_timing_test.cpp)
+target_include_directories(scope_profile_timing_tests PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(scope_profile_timing_tests PRIVATE Catch2::Catch2WithMain)
 add_executable(transfer_scope_reuse_tests graphics/vulkan/transfer_scope_reuse_test.cpp)
 target_include_directories(transfer_scope_reuse_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/thirdparty/vulkan-headers/include)

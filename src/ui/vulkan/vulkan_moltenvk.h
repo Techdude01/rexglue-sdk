@@ -28,7 +28,9 @@ struct MacOSVulkanRuntimePaths {
 };
 
 MacOSVulkanRuntimePaths DetectMacOSVulkanRuntimePaths();
-void ConfigureMacOSVulkanEnvironment(const MacOSVulkanRuntimePaths& paths);
+bool IsMacOSKosmicKrispAvailable();
+void ConfigureMacOSVulkanEnvironment(const MacOSVulkanRuntimePaths& paths,
+                                    bool force_moltenvk = false);
 
 #endif  // REX_PLATFORM_MAC
 
