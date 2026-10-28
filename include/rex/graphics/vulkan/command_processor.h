@@ -223,6 +223,37 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint32_t BeginTransferProfile();
   void EndTransferProfile(uint32_t query);
 
+  enum class ScopeCategory : uint8_t {
+    kMainPass,
+    kTransferPass,
+    kResolve,
+    kCompute,
+  };
+
+  struct ScopeProfileRecord {
+    ScopeCategory category = ScopeCategory::kMainPass;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::string format;
+    uint32_t draw_count = 0;
+    VkAttachmentLoadOp color_load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    VkAttachmentStoreOp color_store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    VkAttachmentLoadOp depth_load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    VkAttachmentStoreOp depth_store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    uint32_t query_start = UINT32_MAX;
+    uint32_t query_end = UINT32_MAX;
+    double gpu_time_ms = 0.0;
+    std::string description;
+  };
+
+  uint32_t BeginScopeProfile(ScopeCategory category, uint32_t width, uint32_t height,
+                             const std::string& format,
+                             VkAttachmentLoadOp color_load, VkAttachmentStoreOp color_store,
+                             VkAttachmentLoadOp depth_load, VkAttachmentStoreOp depth_store,
+                             const std::string& description);
+  void EndScopeProfile(uint32_t scope_index);
+  void NoteScopeDraw();
+
   uint64_t GetCurrentSubmission() const {
     return submission_completed_ + uint64_t(submissions_in_flight_fences_.size()) + 1;
   }
@@ -1164,6 +1195,46 @@ class VulkanCommandProcessor : public CommandProcessor {
   float timestamp_period_ns_ = 1.0f;
   uint32_t timestamp_valid_bits_ = 0;
   uint32_t frame_submission_counts_[kMaxTimestampFramesInFlight] = {};
+
+  struct ScopeArchetype {
+    ScopeCategory category = ScopeCategory::kMainPass;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::string format;
+    VkAttachmentLoadOp color_load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    VkAttachmentStoreOp color_store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    VkAttachmentLoadOp depth_load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    VkAttachmentStoreOp depth_store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    std::string description;
+    double total_gpu_time_ms = 0.0;
+    uint64_t total_draws = 0;
+    uint32_t occurrence_count = 0;
+  };
+
+  static constexpr uint32_t kMaxScopesPerFrame = 256;
+  static constexpr uint32_t kScopeQueriesPerFrame = kMaxScopesPerFrame * 2;
+  VkQueryPool scope_profile_pool_ = VK_NULL_HANDLE;
+  uint32_t scope_profile_counts_[kMaxTimestampFramesInFlight] = {};
+  uint32_t scope_profile_reset_count_ = 0;
+  std::vector<ScopeProfileRecord> frame_scopes_[kMaxTimestampFramesInFlight];
+  uint32_t active_scope_index_ = UINT32_MAX;
+
+  // Window aggregation stats
+  uint64_t accum_scope_frames_ = 0;
+  double accum_scope_main_count_ = 0.0;
+  double accum_scope_main_ms_ = 0.0;
+  double accum_scope_transfer_count_ = 0.0;
+  double accum_scope_transfer_ms_ = 0.0;
+  double accum_scope_resolve_count_ = 0.0;
+  double accum_scope_resolve_ms_ = 0.0;
+  double accum_scope_compute_count_ = 0.0;
+  double accum_scope_compute_ms_ = 0.0;
+  double accum_scope_gpu_frame_ms_ = 0.0;
+  double accum_scope_complete_interval_ms_ = 0.0;
+  double accum_scope_swap_interval_ms_ = 0.0;
+  std::unordered_map<std::string, ScopeArchetype> scope_archetypes_;
+
+  void LogScopeProfileAggregateSummary();
 
   bool InitializeGpuTimingResources();
   void ShutdownGpuTimingResources();

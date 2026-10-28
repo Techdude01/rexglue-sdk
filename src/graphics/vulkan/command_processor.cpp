@@ -140,6 +140,11 @@ REXCVAR_DEFINE_BOOL(
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(
+    gpu_profile_scope_timestamps, false, "GPU/Vulkan",
+    "Diagnostic GPU timestamps around each render-pass scope, transfer scope, resolve and compute dispatch")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
     gpu_frame_audit_enable, false, "GPU/Vulkan",
     "Enable machine-readable frame-time audit logging and CSV export for matched A/B measurement")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -3369,7 +3374,13 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           BindExternalComputePipeline(swap_apply_gamma_compute_pipeline);
           uint32_t group_count_x = (guest_output_width + 15) / 16;
           uint32_t group_count_y = (guest_output_height + 7) / 8;
+          uint32_t gamma_scope = BeginScopeProfile(
+              ScopeCategory::kCompute, guest_output_width, guest_output_height, "GAMMA",
+              VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+              VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+              "swap_gamma");
           deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+          EndScopeProfile(gamma_scope);
 
           if (use_fxaa) {
             // Make the FXAA source image readable and bind a separate
@@ -3440,7 +3451,13 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             BindExternalComputePipeline(swap_post_effect == SwapPostEffect::kFxaaExtreme
                                             ? swap_fxaa_extreme_pipeline_
                                             : swap_fxaa_pipeline_);
+            uint32_t fxaa_scope = BeginScopeProfile(
+                ScopeCategory::kCompute, guest_output_width, guest_output_height, "FXAA",
+                VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                "swap_fxaa");
             deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+            EndScopeProfile(fxaa_scope);
           }
 
           // Insert the release barrier.
@@ -3936,6 +3953,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     } else {
       deferred_command_buffer_.CmdVkEndRenderPass();
     }
+    EndScopeProfile(active_scope_index_);
     in_render_pass_ = false;
   }
 
@@ -3995,6 +4013,24 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     rendering_info.pColorAttachments = color_attachment_count ? color_attachments : nullptr;
     rendering_info.pDepthAttachment = has_depth ? &depth_attachment : nullptr;
     rendering_info.pStencilAttachment = has_stencil ? &stencil_attachment : nullptr;
+
+    std::string format_str;
+    if ((rpk.depth_and_color_used >> 1) != 0) {
+      format_str = xenos::GetColorRenderTargetFormatName(rpk.color_0_view_format);
+    }
+    if (rpk.depth_and_color_used & 1) {
+      if (!format_str.empty()) format_str += "+";
+      format_str += xenos::GetDepthRenderTargetFormatName(rpk.depth_format);
+    }
+    if (format_str.empty()) format_str = "NONE";
+
+    VkAttachmentLoadOp c_load = color_attachment_count ? color_attachments[0].loadOp : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    VkAttachmentStoreOp c_store = color_attachment_count ? color_attachments[0].storeOp : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    VkAttachmentLoadOp d_load = has_depth ? depth_attachment.loadOp : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    VkAttachmentStoreOp d_store = has_depth ? depth_attachment.storeOp : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+
+    BeginScopeProfile(ScopeCategory::kMainPass, render_area.extent.width, render_area.extent.height,
+                      format_str, c_load, c_store, d_load, d_store, "main_pass");
     deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
   } else {
     VkRenderPassBeginInfo render_pass_begin_info;
@@ -4009,6 +4045,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
     render_pass_begin_info.clearValueCount = 0;
     render_pass_begin_info.pClearValues = nullptr;
+    BeginScopeProfile(ScopeCategory::kMainPass, framebuffer->host_extent.width, framebuffer->host_extent.height,
+                      "CLASSIC_RP", VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE,
+                      VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE, "main_pass_classic");
     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
                                                   VK_SUBPASS_CONTENTS_INLINE);
   }
@@ -4054,6 +4093,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     } else {
       deferred_command_buffer_.CmdVkEndRenderPass();
     }
+    EndScopeProfile(active_scope_index_);
     in_render_pass_ = false;
   }
 
@@ -4110,6 +4150,13 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     rendering_info.pColorAttachments = transfer_dest_is_depth ? nullptr : &color_attachment;
     rendering_info.pDepthAttachment = transfer_dest_is_depth ? &depth_attachment : nullptr;
     rendering_info.pStencilAttachment = transfer_dest_is_depth ? &stencil_attachment : nullptr;
+    BeginScopeProfile(ScopeCategory::kTransferPass, framebuffer->host_extent.width, framebuffer->host_extent.height,
+                      transfer_dest_is_depth ? "DEPTH_TRANSFER" : "COLOR_TRANSFER",
+                      transfer_dest_is_depth ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD,
+                      transfer_dest_is_depth ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE,
+                      transfer_dest_is_depth ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                      transfer_dest_is_depth ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                      "transfer_pass");
     deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
   } else {
     VkRenderPassBeginInfo render_pass_begin_info;
@@ -4122,6 +4169,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
     render_pass_begin_info.clearValueCount = 0;
     render_pass_begin_info.pClearValues = nullptr;
+    BeginScopeProfile(ScopeCategory::kTransferPass, framebuffer->host_extent.width, framebuffer->host_extent.height,
+                      "CLASSIC_TRANSFER", VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE,
+                      VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE, "transfer_pass_classic");
     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
                                                   VK_SUBPASS_CONTENTS_INLINE);
   }
@@ -4140,6 +4190,7 @@ void VulkanCommandProcessor::EndRenderPass() {
   } else {
     deferred_command_buffer_.CmdVkEndRenderPass();
   }
+  EndScopeProfile(active_scope_index_);
   current_render_pass_ = VK_NULL_HANDLE;
   current_framebuffer_ = nullptr;
   in_render_pass_ = false;
@@ -4485,7 +4536,7 @@ bool VulkanCommandProcessor::ShouldProfileFrameDraws(uint64_t frame) const {
   if (IsGpuProvenanceFrame(frame)) {
     return true;
   }
-  if (REXCVAR_GET(gpu_frame_audit_enable)) {
+  if (REXCVAR_GET(gpu_frame_audit_enable) || REXCVAR_GET(gpu_profile_scope_timestamps)) {
     uint64_t start = REXCVAR_GET(gpu_frame_audit_window_start);
     uint64_t end = REXCVAR_GET(gpu_frame_audit_window_end);
     if ((start == 0 || frame >= start) && (end == 0 || frame <= end)) {
@@ -4619,6 +4670,14 @@ bool VulkanCommandProcessor::InitializeGpuTimingResources() {
     if (dfn.vkCreateQueryPool(device, &pool_info, nullptr, &transfer_profile_pool_) != VK_SUCCESS)
       transfer_profile_pool_ = VK_NULL_HANDLE;
   }
+
+  if (REXCVAR_GET(gpu_profile_scope_timestamps)) {
+    pool_info.queryCount = kMaxTimestampFramesInFlight * kScopeQueriesPerFrame;
+    if (dfn.vkCreateQueryPool(device, &pool_info, nullptr, &scope_profile_pool_) != VK_SUCCESS) {
+      REXGPU_WARN("Failed to create Vulkan scope profile query pool");
+      scope_profile_pool_ = VK_NULL_HANDLE;
+    }
+  }
   gpu_completion_tracker_.Start(device, &dfn);
   return true;
 }
@@ -4640,6 +4699,72 @@ void VulkanCommandProcessor::EndTransferProfile(uint32_t query) {
     deferred_command_buffer_.CmdProfileTimestamp(transfer_profile_pool_, query + 1);
 }
 
+uint32_t VulkanCommandProcessor::BeginScopeProfile(
+    ScopeCategory category, uint32_t width, uint32_t height,
+    const std::string& format,
+    VkAttachmentLoadOp color_load, VkAttachmentStoreOp color_store,
+    VkAttachmentLoadOp depth_load, VkAttachmentStoreOp depth_store,
+    const std::string& description) {
+  if (!REXCVAR_GET(gpu_profile_scope_timestamps) || !frame_open_ ||
+      !ShouldProfileFrameDraws(frame_current_)) {
+    return UINT32_MAX;
+  }
+  uint32_t slot = frame_current_ % kMaxTimestampFramesInFlight;
+  auto& scopes = frame_scopes_[slot];
+  if (scopes.size() >= kMaxScopesPerFrame) return UINT32_MAX;
+
+  uint32_t& query_count = scope_profile_counts_[slot];
+  uint32_t query_start = UINT32_MAX;
+  if (scope_profile_pool_ && query_count + 2 <= kScopeQueriesPerFrame) {
+    query_start = slot * kScopeQueriesPerFrame + query_count;
+    query_count += 2;
+    deferred_command_buffer_.CmdProfileTimestamp(scope_profile_pool_, query_start);
+  }
+
+  ScopeProfileRecord record{};
+  record.category = category;
+  record.width = width;
+  record.height = height;
+  record.format = format;
+  record.draw_count = 0;
+  record.color_load_op = color_load;
+  record.color_store_op = color_store;
+  record.depth_load_op = depth_load;
+  record.depth_store_op = depth_store;
+  record.query_start = query_start;
+  record.query_end = (query_start != UINT32_MAX) ? query_start + 1 : UINT32_MAX;
+  record.description = description;
+
+  uint32_t scope_idx = uint32_t(scopes.size());
+  scopes.push_back(std::move(record));
+  active_scope_index_ = scope_idx;
+  return scope_idx;
+}
+
+void VulkanCommandProcessor::EndScopeProfile(uint32_t scope_index) {
+  if (scope_index == UINT32_MAX) return;
+  uint32_t slot = frame_current_ % kMaxTimestampFramesInFlight;
+  auto& scopes = frame_scopes_[slot];
+  if (scope_index < scopes.size()) {
+    if (scope_profile_pool_ && scopes[scope_index].query_end != UINT32_MAX) {
+      deferred_command_buffer_.CmdProfileTimestamp(scope_profile_pool_, scopes[scope_index].query_end);
+    }
+  }
+  if (active_scope_index_ == scope_index) {
+    active_scope_index_ = UINT32_MAX;
+  }
+}
+
+void VulkanCommandProcessor::NoteScopeDraw() {
+  if (active_scope_index_ != UINT32_MAX) {
+    uint32_t slot = frame_current_ % kMaxTimestampFramesInFlight;
+    auto& scopes = frame_scopes_[slot];
+    if (active_scope_index_ < scopes.size()) {
+      scopes[active_scope_index_].draw_count++;
+    }
+  }
+}
+
 void VulkanCommandProcessor::ShutdownGpuTimingResources() {
   gpu_completion_tracker_.Stop();
 
@@ -4647,6 +4772,10 @@ void VulkanCommandProcessor::ShutdownGpuTimingResources() {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   VkDevice device = vulkan_device->device();
 
+  if (scope_profile_pool_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyQueryPool(device, scope_profile_pool_, nullptr);
+    scope_profile_pool_ = VK_NULL_HANDLE;
+  }
   if (transfer_profile_pool_) {
     dfn.vkDestroyQueryPool(device, transfer_profile_pool_, nullptr);
     transfer_profile_pool_ = VK_NULL_HANDLE;
@@ -5032,6 +5161,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
   FrameCpuTimeline::Scope audit_draw(GetFrameCpuTimeline(), FrameCpuTimeline::Bucket::kDraw);
+  NoteScopeDraw();
   bool diagnostic_capture_active = false;
   bool diagnostic_vertex_output_capture_active = false;
   bool diagnostic_draw_recorded = false;
@@ -7755,7 +7885,13 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
                                                      resolve_downscale_pipeline_layout_, 0, 1,
                                                      &descriptor_set, 0, nullptr);
+    uint32_t downscale_scope = BeginScopeProfile(
+        ScopeCategory::kCompute, tile_count * 32, 32, "DOWNSCALE",
+        VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        "resolve_downscale");
     deferred_command_buffer_.CmdVkDispatch(tile_count, 1, 1);
+    EndScopeProfile(downscale_scope);
 
     VkBufferMemoryBarrier downscale_barrier = {};
     downscale_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -8371,6 +8507,11 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     frame_submission_counts_[frame_current_ % kMaxTimestampFramesInFlight] = 0;
     transfer_profile_counts_[frame_current_ % kMaxTimestampFramesInFlight] = 0;
     transfer_profile_reset_count_ = 0;
+    uint32_t scope_slot = frame_current_ % kMaxTimestampFramesInFlight;
+    scope_profile_counts_[scope_slot] = 0;
+    scope_profile_reset_count_ = 0;
+    frame_scopes_[scope_slot].clear();
+    active_scope_index_ = UINT32_MAX;
     frame_start_time_ = std::chrono::steady_clock::now();
     if (REXCVAR_GET(gpu_frame_audit_enable) && REXCVAR_GET(gpu_frame_timeline_enable))
       GetFrameCpuTimeline().Start(frame_start_time_);
@@ -8668,6 +8809,13 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
           timestamp_slot * kTransferQueriesPerFrame + transfer_profile_reset_count_,
           transfer_count - transfer_profile_reset_count_);
       transfer_profile_reset_count_ = transfer_count;
+    }
+    uint32_t scope_count = scope_profile_counts_[timestamp_slot];
+    if (scope_profile_pool_ && scope_count > scope_profile_reset_count_) {
+      dfn.vkCmdResetQueryPool(command_buffer.buffer, scope_profile_pool_,
+          timestamp_slot * kScopeQueriesPerFrame + scope_profile_reset_count_,
+          scope_count - scope_profile_reset_count_);
+      scope_profile_reset_count_ = scope_count;
     }
     const bool audit_submission = REXCVAR_GET(gpu_frame_audit_enable) && frame_open_;
     auto audit_submit_start = audit_submission ? std::chrono::steady_clock::now()

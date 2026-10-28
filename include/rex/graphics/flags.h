@@ -75,6 +75,7 @@ REXCVAR_DECLARE(std::string, dump_shaders);
 REXCVAR_DECLARE(std::string, swap_post_effect);
 
 #if REX_HAS_VULKAN
+REXCVAR_DECLARE(bool, gpu_profile_scope_timestamps);
 REXCVAR_DECLARE(bool, vulkan_sparse_shared_memory);
 REXCVAR_DECLARE(bool, vulkan_hoist_shared_memory_uploads);
 REXCVAR_DECLARE(bool, vulkan_prune_unused_attachment_load_store);
