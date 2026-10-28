@@ -76,6 +76,7 @@ REXCVAR_DECLARE(std::string, swap_post_effect);
 
 #if REX_HAS_VULKAN
 REXCVAR_DECLARE(bool, vulkan_sparse_shared_memory);
+REXCVAR_DECLARE(bool, vulkan_hoist_shared_memory_uploads);
 REXCVAR_DECLARE(bool, vulkan_submit_on_primary_buffer_end);
 REXCVAR_DECLARE(bool, vulkan_dynamic_rendering);
 REXCVAR_DECLARE(bool, vulkan_async_skip_incomplete_frames);

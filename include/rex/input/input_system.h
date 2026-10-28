@@ -11,11 +11,14 @@
  */
 
 #include <memory>
+#include <chrono>
+#include <mutex>
 #include <vector>
 
 #include <rex/input/device_assignment.h>
 #include <rex/input/input.h>
 #include <rex/input/input_driver.h>
+#include <rex/input/input_trace.h>
 #include <rex/input/state_merge.h>
 #include <rex/system/interfaces/input.h>
 
@@ -53,6 +56,8 @@ class InputSystem : public system::IInputSystem {
   void RefreshDevices();
   InputDriver* DriverForDevice(DeviceId id);
   const DeviceInfo* DeviceInfoFor(DeviceId id) const;
+  uint64_t TraceMicros();  // Called under trace_mutex_.
+  void RecordInputState(uint32_t user_index, X_RESULT result, const X_INPUT_STATE& state);
 
   rex::ui::Window* window_ = nullptr;
 
@@ -66,6 +71,12 @@ class InputSystem : public system::IInputSystem {
   std::vector<DeviceInfo> devices_;
   std::vector<InputDriver*> device_owners_;
   uint16_t last_test_guest_buttons_ = 0;
+  std::unique_ptr<InputTrace> trace_;
+  std::mutex trace_mutex_;
+  std::chrono::steady_clock::time_point trace_start_{};
+  std::filesystem::path trace_stop_path_;
+  uint64_t trace_polls_ = 0;
+  bool trace_finish_requested_ = false, trace_reported_ = false;
 };
 
 /// Create a default InputSystem with SDL + NOP drivers.

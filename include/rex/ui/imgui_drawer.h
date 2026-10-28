@@ -48,9 +48,12 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   void AddDialog(ImGuiDialog* dialog);
   void RemoveDialog(ImGuiDialog* dialog);
 
-  // Whether Draw would render anything, so a caller that has to marshal to the
-  // UI thread can skip the round trip entirely.
+  // Registration includes listeners whose UI may currently be dormant.
   bool HasDialogs() const { return !dialogs_.empty(); }
+  bool NeedsPaint() const override;
+  // Wake the UI when dormant content becomes active, including from a guest
+  // thread. Pending requests are harmless after this drawer is destroyed.
+  void RequestPaint();
 
   // SetPresenter may be called from the destructor.
   void SetPresenter(Presenter* new_presenter);
@@ -92,6 +95,11 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   std::optional<ImGuiKey> VirtualKeyToImGuiKey(VirtualKey vkey);
 
   Window* window_;
+  struct PaintRequest {
+    Window* window;
+    WindowedAppContext* context;
+  };
+  std::shared_ptr<PaintRequest> paint_request_;
   size_t z_order_;
   FontSetupCallback font_setup_;
   StyleSetupCallback style_setup_;

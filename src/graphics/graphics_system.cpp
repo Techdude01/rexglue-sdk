@@ -24,6 +24,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
+#include <rex/memory/utils.h>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
@@ -57,6 +58,8 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
   return rex::graphics::CommandProcessor::SwapPostEffect::kNone;
 }
 }  // namespace
+
+REXCVAR_DECLARE(bool, gpu_wait_correlation);
 
 namespace rex::graphics {
 
@@ -160,8 +163,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
-          uint64_t interval_ticks =
-              REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+          uint64_t interval_ticks = vsync_interval_ticks;
           while (current_time - last_frame_time >= interval_ticks) {
             MarkVblank();
             last_frame_time += interval_ticks;
@@ -328,7 +330,26 @@ void GraphicsSystem::MarkVblank() {
   // TODO(benvanik): we shouldn't need to do the dispatch here, but there's
   //     something wrong and the CP will block waiting for code that
   //     needs to be run in the interrupt.
+  const bool trace = REXCVAR_GET(gpu_wait_correlation);
+  static std::atomic<uint64_t> diagnostic_vblank_sequence{0};
+  const uint64_t diagnostic_sequence = trace ? ++diagnostic_vblank_sequence : 0;
+  if (trace) {
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    REXGPU_INFO("[WAIT_CORRELATION] event=vblank_start ts_ns={} sequence={}", ns, diagnostic_sequence);
+  }
   DispatchInterruptCallback(0, 2);
+  if (trace) {
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (interrupt_callback_ == 0x82481728 && interrupt_callback_data_) {
+      // The guest callback reads this same field before reaching its vblank path.
+      uint32_t pointer = memory::load_and_swap<uint32_t>(
+          memory_->TranslateVirtual(interrupt_callback_data_ + 10900));
+      REXGPU_INFO("[WAIT_CORRELATION] event=vblank_end ts_ns={} sequence={} guest_pointer={}",
+                  ns, diagnostic_sequence, pointer);
+    } else {
+      REXGPU_INFO("[WAIT_CORRELATION] event=vblank_end ts_ns={} sequence={} guest_pointer=0", ns, diagnostic_sequence);
+    }
+  }
 }
 
 void GraphicsSystem::ClearCaches() {

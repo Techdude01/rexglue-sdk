@@ -47,6 +47,11 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
     stream_remaining -= kCommandHeaderSizeElements;
 
     switch (header.command) {
+      case Command::kProfileTimestamp: {
+        auto& args = *reinterpret_cast<const ArgsProfileTimestamp*>(stream);
+        dfn.vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                               args.pool, args.query);
+      } break;
       case Command::kVkBeginRenderPass: {
         auto& args = *reinterpret_cast<const ArgsVkBeginRenderPass*>(stream);
         size_t offset_bytes = sizeof(ArgsVkBeginRenderPass);

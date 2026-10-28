@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <rex/graphics/frame_cpu_timeline.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>

@@ -33,7 +33,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 14;
+    static constexpr uint32_t kVersion = 16;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -70,6 +70,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
       // For domain host vertex shader types only, xenos::TessellationMode.
       uint32_t tessellation_mode : 2;
+      // Gated post-vertex output capture for a diagnostic-only shader variant.
+      uint32_t diagnostic_storage_version : 4;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -92,6 +94,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
       DepthStencilMode depth_stencil_mode : 3;
       // All texture fetch constants used by this shader select unsigned data.
       uint32_t texture_signs_all_unsigned : 1;
+      // Diagnostic ABI revision, zero when disabled. Bumping this distinguishes
+      // cached diagnostic SPIR-V from earlier implementations without changing
+      // ordinary shader cache keys.
+      uint32_t diagnostic_storage_version : 4;
     } pixel;
     uint64_t value = 0;
 
@@ -311,6 +317,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
     uint32_t vertex_index_max;
     float tessellation_factor_range_min;
     float tessellation_factor_range_max;
+    // [DEBUG-face-stage] Temporary component diagnostic, zero in ordinary runs.
+    uint32_t face_stage_mode;
+    // [DEBUG-face-stage] 1 = re-sample the head texture at explicit LOD 0.
+    uint32_t face_stage_lod0;
   };
 
   enum ConstantBuffer : uint32_t {
@@ -886,6 +896,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramRTKeepMask,
     kSystemConstantEdramRTClamp,
     kSystemConstantEdramBlendConstant,
+    kSystemConstantFaceStageMode,
+    kSystemConstantFaceStageLod0,
   };
   spv::Id uniform_system_constants_;
   spv::Id uniform_float_constants_;
@@ -974,6 +986,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // `base + index * stride` in dwords from the last vfetch_full as it may be
   // needed by vfetch_mini - int.
   spv::Id var_main_vfetch_address_;
+  // Diagnostic-only decoded vfetch snapshots for the frame-6000 G-buffer skinning audit.
+  std::array<spv::Id, 22> var_main_diagnostic_vertex_fetch_inputs_;
   // float.
   spv::Id var_main_tfetch_lod_;
   // float3.
@@ -1023,6 +1037,21 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // execution path, don't export according to Direct3D 9 register documentation
   // (some games rely on this behavior).
   spv::Id var_main_fsi_color_written_;
+  // [DEBUG-face-stage] Actual sampled tf0/tf2/tf14 values plus probe data for the head PS.
+  // 0:3 - last tf0 diffuse, tf2 scalar, tf14 light, last 2D tf0 coordinates.
+  // 4 - coordinates and green from the same 2D tf0 fetch.
+  // 5:8 - coordinates and green from the 1st..4th slot-0 fetch of any dimension.
+  // 9 - tf0 coordinates with the fractional part of the 8-bit value, 10 - raw RGBA sample.
+  // 11:13 - normalized UVs, 14:16 - validity flags, 17:19 - paired 2D RGBA for tf0/tf2/tf14.
+  // 20/21 retain the exact tf0/tf14 sample gradients in diagnostic revision 10.
+  std::array<spv::Id, 44> face_stage_samples_{};
+  // Mode 19 retains only existing tf0 Grad operands and their coordinate in
+  // function locals, including when storage diagnostics are disabled.
+  std::array<spv::Id, 3> quad_partner_values_{};
+  spv::Id quad_partner_valid_ = spv::NoResult;
+  spv::Id diagnostic_storage_buffer_ = spv::NoResult;
+  // Translation-time index of the slot-0 fetch being emitted, for the head PS.
+  uint32_t face_stage_slot0_fetch_index_ = 0;
   // Loaded by FSI_LoadSampleMask.
   // Can be modified on the outermost control flow level in the main function.
   // 0:3 - Per-sample coverage at the current stage of the shader's execution.

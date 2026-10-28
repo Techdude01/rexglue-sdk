@@ -421,7 +421,12 @@ class Presenter {
       display_aspect_ratio_x = 0;
       display_aspect_ratio_y = 0;
       is_8bpc = false;
+      publish_serial = 0;
     }
+
+    // Monotonic id of the guest-output publish that wrote this mailbox slot.
+    // 0 means no publish has been stored in the slot yet.
+    uint64_t publish_serial = 0;
   };
 
   enum class GuestOutputPaintEffect {
@@ -668,6 +673,14 @@ class Presenter {
   [[nodiscard]] std::unique_lock<std::mutex> ConsumeGuestOutput(
       uint32_t& mailbox_index_or_max_if_inactive_out, GuestOutputProperties* properties_out,
       GuestOutputPaintConfig* paint_config_out);
+
+  // UI-thread and guest-output-thread paints. True only when
+  // present_skip_unchanged_guest_output is on, a successful present has already
+  // happened, no surface/UI invalidation needs a fresh image, no UI drawer
+  // needs painting, and the acquired guest output is the one last presented.
+  bool ShouldSkipUnchangedGuestOutputPaint(bool execute_ui_drawers);
+  void NoteSwapchainNeedsPresent();
+  void NoteGuestOutputPresented(uint64_t publish_serial);
   // The properties are passed explicitly, not taken from the current acquired
   // image, so it can be called for a copy of the acquired image's properties
   // outside the consumer lock if the implementation has its own synchronization
@@ -976,6 +989,11 @@ class Presenter {
   // Accessible only by refreshing, whether the last refresh contained an image
   // rather than being blank.
   bool guest_output_active_last_refresh_ = false;
+  // Producer thread only. Bumped on every mailbox publish.
+  uint64_t guest_output_publish_serial_ = 0;
+  std::atomic<uint64_t> last_presented_publish_serial_{0};
+  std::atomic<bool> has_presented_{false};
+  std::atomic<bool> present_after_swapchain_create_{false};
 
   // Ordered by the Z order, and then by the time of addition.
   // Note: All the iteration logic involving this Z ordering must be the same as

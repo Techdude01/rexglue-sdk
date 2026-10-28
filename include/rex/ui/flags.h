@@ -26,6 +26,7 @@ REXCVAR_DECLARE(std::string, present_fsr_quality_mode);
 REXCVAR_DECLARE(bool, present_dither);
 REXCVAR_DECLARE(bool, present_allow_overscan_cutoff);
 REXCVAR_DECLARE(bool, host_present_from_non_ui_thread);
+REXCVAR_DECLARE(bool, present_skip_unchanged_guest_output);
 REXCVAR_DECLARE(int32_t, window_width);
 REXCVAR_DECLARE(int32_t, window_height);
 REXCVAR_DECLARE(bool, fullscreen);
@@ -49,9 +50,11 @@ REXCVAR_DECLARE(bool, d3d12_allow_variable_refresh_rate_and_tearing);
 
 #if REX_HAS_VULKAN
 REXCVAR_DECLARE(bool, vulkan_log_debug_messages);
+REXCVAR_DECLARE(std::string, vulkan_driver);
 REXCVAR_DECLARE(bool, vulkan_allow_present_mode_immediate);
 REXCVAR_DECLARE(bool, vulkan_allow_present_mode_mailbox);
 REXCVAR_DECLARE(bool, vulkan_allow_present_mode_fifo_relaxed);
+REXCVAR_DECLARE(bool, vulkan_presenter_dedicated_queue);
 REXCVAR_DECLARE(bool, vulkan_validation_enabled);
 REXCVAR_DECLARE(int32_t, vulkan_device);
 REXCVAR_DECLARE(bool, vulkan_prefer_geometry_shader);

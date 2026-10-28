@@ -655,6 +655,45 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_c
           is_signed ? vulkan_binding.image_view_signed : vulkan_binding.image_view_unsigned;
     }
   }
+  // Share the latched fragment diagnostic gate, and bound both duplicates and
+  // total output (at most 32 entries for this texture cache's lifetime).
+  if ((fetch_constant_index == 11 || fetch_constant_index == 13 || fetch_constant_index == 14) &&
+      diagnostic_descriptor_log_.ShouldLog(
+          command_processor_.diagnostic_storage_enabled(),
+          {fetch_constant_index, binding ? uint32_t(binding->key.base_page) : 0u,
+           binding ? uint32_t(binding->key.format) : 0,
+           binding ? uint32_t(binding->key.dimension) : 0, is_signed, binding != nullptr})) {
+    VulkanTexture* texture_unsigned =
+        binding ? static_cast<VulkanTexture*>(binding->texture) : nullptr;
+    VulkanTexture* texture_signed =
+        binding ? static_cast<VulkanTexture*>(binding->texture_signed) : nullptr;
+    const VulkanTextureBinding& views = vulkan_texture_bindings_[fetch_constant_index];
+    const HostFormatPair* host_format = binding ? &GetHostFormatPair(binding->key) : nullptr;
+    REXGPU_INFO(
+        "TF_DESCRIPTOR deduplicated budget=32 fetch={} signed={} dimension={} binding={} key_base=0x{:X} format={} "
+        "size={}x{} mips={} mip_page=0x{:X} tiled={} packed_mips={} scaled_resolve={} "
+        "host_format_unsigned={} host_format_signed={} "
+        "texture_unsigned={} image_unsigned={} view_unsigned={} "
+        "texture_signed={} image_signed={} view_signed={} selected_view={}",
+        fetch_constant_index, is_signed, binding ? uint32_t(binding->key.dimension) : 0,
+        static_cast<const void*>(binding), binding ? binding->key.base_page : 0,
+        binding ? uint32_t(binding->key.format) : 0,
+        binding ? binding->key.GetWidth() : 0, binding ? binding->key.GetHeight() : 0,
+        binding ? uint32_t(binding->key.mip_max_level) + 1 : 0,
+        binding ? binding->key.mip_page : 0,
+        binding ? uint32_t(binding->key.tiled) : 0,
+        binding ? uint32_t(binding->key.packed_mips) : 0,
+        binding ? uint32_t(binding->key.scaled_resolve) : 0,
+        host_format ? uint32_t(host_format->format_unsigned.format) : 0,
+        host_format ? uint32_t(host_format->format_signed.format) : 0,
+        static_cast<const void*>(texture_unsigned),
+        reinterpret_cast<const void*>(texture_unsigned ? texture_unsigned->image() : VK_NULL_HANDLE),
+        reinterpret_cast<const void*>(views.image_view_unsigned),
+        static_cast<const void*>(texture_signed),
+        reinterpret_cast<const void*>(texture_signed ? texture_signed->image() : VK_NULL_HANDLE),
+        reinterpret_cast<const void*>(views.image_view_signed),
+        reinterpret_cast<const void*>(image_view));
+  }
   if (image_view != VK_NULL_HANDLE) {
     return image_view;
   }
@@ -672,7 +711,7 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_c
 }
 
 VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
-    const VulkanShader::SamplerBinding& binding) const {
+    const VulkanShader::SamplerBinding& binding, bool force_min_mag_linear) const {
   const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
 
@@ -702,11 +741,17 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
   xenos::TextureFilter mip_filter = binding.mip_filter == xenos::TextureFilter::kUseFetchConst
                                         ? fetch.mip_filter
                                         : binding.mip_filter;
-  parameters.mip_linear = mip_filter == xenos::TextureFilter::kLinear;
+  parameters.mip_linear = mip_filter == xenos::TextureFilter::kLinear ||
+                          ((draw_resolution_scale_x() > 1 || draw_resolution_scale_y() > 1) &&
+                           mip_filter == xenos::TextureFilter::kPoint);
   xenos::AnisoFilter aniso_filter = binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst
                                         ? fetch.aniso_filter
                                         : binding.aniso_filter;
   aniso_filter = std::min(aniso_filter, max_anisotropy_);
+  if (force_min_mag_linear) {
+    parameters.mag_linear = 1;
+    parameters.min_linear = 1;
+  }
   if (parameters.mag_linear || parameters.min_linear || parameters.mip_linear ||
       aniso_filter != xenos::AnisoFilter::kDisabled) {
     // Check if the texture is actually filterable on the host.
@@ -742,7 +787,7 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
   parameters.mip_min_level = mip_min_level;
   bool has_mips = mip_max_level > mip_min_level;
   int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
-  if (anisotropic_override > -1 && anisotropic_override < 6 && has_mips &&
+  if (!force_min_mag_linear && anisotropic_override > -1 && anisotropic_override < 6 && has_mips &&
       !parameters.mip_base_map && min_mag_linear && mip_filter_bilinear_or_trilinear) {
     aniso_filter = xenos::AnisoFilter(anisotropic_override);
   }
@@ -1830,6 +1875,14 @@ void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask)
         }
         if (uses_signed && host_format_pair.format_signed.format != VK_FORMAT_UNDEFINED) {
           vulkan_binding.image_view_signed = texture->GetView(true, binding->host_swizzle);
+        }
+        // Formats such as BC1 have no signed host representation, so the signed
+        // view above is never created. Binding that slot would leave the shader
+        // sampling the null image (all zeros), which reads as an unlit black
+        // surface, so fall back to the unsigned view of the same resource.
+        if (uses_signed && vulkan_binding.image_view_signed == VK_NULL_HANDLE &&
+            vulkan_binding.image_view_unsigned != VK_NULL_HANDLE) {
+          vulkan_binding.image_view_signed = vulkan_binding.image_view_unsigned;
         }
       }
     }

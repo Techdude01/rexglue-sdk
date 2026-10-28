@@ -126,7 +126,9 @@ void VulkanPrimitiveProcessor::BeginSubmission() {
 
     command_processor_.PushBufferMemoryBarrier(
         builtin_index_buffer_, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_INDEX_READ_BIT);
+        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_INDEX_READ_BIT,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, true,
+        VulkanCommandProcessor::BarrierRequester::kPrimitiveProcessor);
 
     builtin_index_buffer_upload_submission_ = command_processor_.GetCurrentSubmission();
   }

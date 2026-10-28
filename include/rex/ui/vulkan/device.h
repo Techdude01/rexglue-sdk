@@ -270,6 +270,8 @@ class VulkanDevice {
 
   const std::vector<QueueFamily>& queue_families() const { return queue_families_; }
   uint32_t queue_family_graphics_compute() const { return queue_family_graphics_compute_; }
+  // 0 unless vulkan_presenter_dedicated_queue created a second graphics queue.
+  uint32_t presenter_queue_index() const { return presenter_queue_index_; }
   // UINT32_MAX if not supported or not enabled.
   // May be the same as queue_family_graphics_compute().
   uint32_t queue_family_sparse_binding() const { return queue_family_sparse_binding_; }
@@ -304,6 +306,7 @@ class VulkanDevice {
   std::vector<QueueFamily> queue_families_;
   uint32_t queue_family_graphics_compute_ = UINT32_MAX;
   uint32_t queue_family_sparse_binding_ = UINT32_MAX;
+  uint32_t presenter_queue_index_ = 0;
 
   MemoryTypes memory_types_;
 };

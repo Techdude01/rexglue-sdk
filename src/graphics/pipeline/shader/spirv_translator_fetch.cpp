@@ -20,6 +20,10 @@
 
 #include <rex/assert.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/graphics/vulkan/diagnostic_storage_buffer.h>
+#include <rex/graphics/vulkan/fragment_diagnostic.h>
+#include <rex/graphics/vulkan/quad_partner_marker.h>
+#include <rex/graphics/vulkan/vertex_input_diagnostic.h>
 #include <rex/math.h>
 
 namespace rex::graphics {
@@ -466,6 +470,40 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     }
   }
   StoreResult(instr.result, result);
+
+  if (var_main_diagnostic_vertex_fetch_inputs_[0] != spv::NoResult &&
+      current_shader().ucode_data_hash() ==
+          vulkan::diagnostics::kGBufferVertexDiagnosticVertexHash &&
+      instr.result.storage_target == InstructionStorageTarget::kRegister) {
+    // Capture values after Xenos format and endian conversion, at the point
+    // where the guest vfetch writes its destination register.
+    static constexpr uint32_t kDiagnosticFetchRegisters[] = {
+        7, 6, 3, 2, 8, 5, 12, 15, 14, 16, 20, 18, 19, 17, 0, 4, 10, 9, 13, 1, 11, 5};
+    for (uint32_t input = 0; input < rex::countof(kDiagnosticFetchRegisters); ++input) {
+      if (instr.result.storage_index != kDiagnosticFetchRegisters[input]) {
+        continue;
+      }
+      // r5 receives the original packed indices via vfetch_mini, then later
+      // receives the fourth bone matrix vector via vfetch_full.
+      if (input == 5 && !instr.is_mini_fetch) {
+        continue;
+      }
+      if (input == 21 && instr.is_mini_fetch) {
+        continue;
+      }
+      spv::Id reg_value = builder_->createLoad(
+          builder_->createAccessChain(
+              spv::StorageClassFunction, var_main_registers_,
+              std::vector<spv::Id>{builder_->makeIntConstant(int(instr.result.storage_index))}),
+          spv::NoPrecision);
+      builder_->createStore(
+          reg_value, builder_->createAccessChain(
+                         spv::StorageClassFunction,
+                         var_main_diagnostic_vertex_fetch_inputs_[0],
+                         std::vector<spv::Id>{builder_->makeIntConstant(int(input))}));
+      break;
+    }
+  }
 }
 
 void SpirvShaderTranslator::ProcessTextureFetchInstruction(
@@ -542,6 +580,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
   }
 
   spv::Id result[] = {const_float_0_, const_float_0_, const_float_0_, const_float_0_};
+  spv::Id diagnostic_uv[2] = {spv::NoResult, spv::NoResult};
 
   if (instr.opcode == ucode::FetchOpcode::kGetTextureGradients) {
     // Doesn't need the texture, handle separately.
@@ -973,6 +1012,9 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       rex::bit_scan_forward(coordinates_needed_components, &coordinate_component_index);
       coordinates[coordinate_component_index] = coordinates_operand;
     }
+    // Guest operands before this translator's uniform texel-center offset.
+    // d(uv + c) / d(pixel) == d(uv) / d(pixel) when c is uniform across the quad.
+    const spv::Id unoffset_coordinates[3] = {coordinates[0], coordinates[1], coordinates[2]};
     spv::Id texture_resolution_scaled = spv::NoResult;
     uint32_t revert_resolution_scale_axes =
         uint32_t(draw_resolution_scale_x_ > 1) | (uint32_t(draw_resolution_scale_y_ > 1) << 1);
@@ -1383,7 +1425,14 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         spv::Id const_uint_2 = builder_->makeUintConstant(2);
         spv::Id const_uint_sign_signed =
             builder_->makeUintConstant(uint32_t(xenos::TextureSign::kSigned));
-        {
+        if (GetSpirvShaderModification().pixel.texture_signs_all_unsigned) {
+          is_all_signed = builder_->makeBoolConstant(false);
+          is_any_signed = builder_->makeBoolConstant(false);
+          for (uint32_t i = 0; i < 4; ++i) {
+            swizzled_signs[i] = const_uint_0_;
+            result_is_signed[i] = builder_->makeBoolConstant(false);
+          }
+        } else {
           uint32_t result_remaining_components = used_result_nonzero_components;
           uint32_t result_component_index;
           while (rex::bit_scan_forward(result_remaining_components, &result_component_index)) {
@@ -1411,7 +1460,9 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           }
         }
         spv::Id is_any_unsigned =
-            builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, is_all_signed);
+            GetSpirvShaderModification().pixel.texture_signs_all_unsigned
+                ? builder_->makeBoolConstant(true)
+                : builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, is_all_signed);
 
         // Load the fetch constant word 4, needed unconditionally for LOD
         // biasing, for result exponent biasing, and conditionally for stacked
@@ -1459,6 +1510,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         // k2D.
         // 3D vectors for k3DOrStacked, kCube.
         spv::Id gradients_h = spv::NoResult, gradients_v = spv::NoResult;
+        spv::Id diagnostic_fine_gradients = spv::NoResult;
         if (use_computed_lod) {
           // TODO(Triang3l): Gradient exponent adjustment is currently not done
           // in getCompTexLOD, so not doing it here too for now. Apply the
@@ -1535,9 +1587,17 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                       builder_->createCompositeConstruct(type_float2_, id_vector_temp_);
                 }
               } else {
+                // The texel-center offset added above is constant / texture size,
+                // both uniform, so d(uv + offset) == d(uv). On this host, differentiating
+                // the sum at 2 samples treats a helper lane's interpolant as zero and
+                // yields a gradient of ±uv. Normalized fetches differentiate the guest
+                // coordinate and still sample the offset coordinate. Unnormalized fetches
+                // divide by size after the add, so that scale stays inside the derivative.
                 id_vector_temp_.clear();
                 for (uint32_t i = 0; i < 2; ++i) {
-                  id_vector_temp_.push_back(coordinates[i]);
+                  id_vector_temp_.push_back(instr.attributes.unnormalized_coordinates
+                                                ? coordinates[i]
+                                                : unoffset_coordinates[i]);
                 }
                 spv::Id gradient_coordinate_vector =
                     builder_->createCompositeConstruct(type_float2_, id_vector_temp_);
@@ -1546,11 +1606,47 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                                                       gradient_coordinate_vector);
                 gradients_v = builder_->createUnaryOp(spv::OpDPdyCoarse, type_float2_,
                                                       gradient_coordinate_vector);
+                if (GetSpirvShaderModification().pixel.diagnostic_storage_version == 10 &&
+                    current_shader().ucode_data_hash() == UINT64_C(0x79A3448304FA0D22) &&
+                    fetch_constant_index == 0) {
+                  spv::Id gradients_fine_h = builder_->createUnaryOp(
+                      spv::OpDPdxFine, type_float2_, gradient_coordinate_vector);
+                  spv::Id gradients_fine_v = builder_->createUnaryOp(
+                      spv::OpDPdyFine, type_float2_, gradient_coordinate_vector);
+                  gradients_fine_h = builder_->createNoContractionBinOp(
+                      spv::OpVectorTimesScalar, type_float2_, gradients_fine_h,
+                      lod_gradient_scale);
+                  gradients_fine_v = builder_->createNoContractionBinOp(
+                      spv::OpVectorTimesScalar, type_float2_, gradients_fine_v,
+                      lod_gradient_scale);
+                  std::vector<spv::Id> fine_components;
+                  for (spv::Id gradient : {gradients_fine_h, gradients_fine_v}) {
+                    for (uint32_t component = 0; component < 2; ++component) {
+                      fine_components.push_back(
+                          builder_->createCompositeExtract(gradient, type_float_, component));
+                    }
+                  }
+                  diagnostic_fine_gradients =
+                      builder_->createCompositeConstruct(type_float4_, fine_components);
+                }
               }
               gradients_h = builder_->createNoContractionBinOp(
                   spv::OpVectorTimesScalar, type_float2_, gradients_h, lod_gradient_scale);
               gradients_v = builder_->createNoContractionBinOp(
                   spv::OpVectorTimesScalar, type_float2_, gradients_v, lod_gradient_scale);
+              if (quad_partner_valid_ != spv::NoResult && fetch_constant_index == 0 &&
+                  !instr.attributes.use_register_gradients) {
+                const spv::Id uv = builder_->createCompositeConstruct(type_float2_,
+                    std::vector<spv::Id>{coordinates[0], coordinates[1]});
+                // Compare in the same units as the actual Grad operands,
+                // including the fetch's LOD-bias scale. No derivative added.
+                builder_->createStore(builder_->createNoContractionBinOp(
+                    spv::OpVectorTimesScalar, type_float2_, uv, lod_gradient_scale),
+                    quad_partner_values_[0]);
+                builder_->createStore(gradients_h, quad_partner_values_[1]);
+                builder_->createStore(gradients_v, quad_partner_values_[2]);
+                builder_->createStore(builder_->makeBoolConstant(true), quad_partner_valid_);
+              }
             } break;
             case xenos::FetchOpDimension::k3DOrStacked: {
               if (instr.attributes.use_register_gradients) {
@@ -1616,6 +1712,99 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                   spv::OpVectorTimesScalar, type_float3_, gradients_v, lod_gradient_scale);
             } break;
           }
+        }
+
+        // Retain the gradients actually passed to sampling, before any
+        // diagnostic ROI branch. Reusing these IDs avoids issuing derivative
+        // operations in divergent diagnostic control flow or estimating them
+        // from adjacent (potentially different-primitive) logged fragments.
+        if (GetSpirvShaderModification().pixel.diagnostic_storage_version >= 10 &&
+            vulkan::diagnostics::IsQuadPartnerMarkerShader(current_shader().ucode_data_hash()) &&
+            instr.dimension == xenos::FetchOpDimension::k2D && use_computed_lod &&
+            (fetch_constant_index == 0 || fetch_constant_index == 14)) {
+          std::vector<spv::Id> gradient_components;
+          for (spv::Id gradient : {gradients_h, gradients_v}) {
+            for (uint32_t component = 0; component < 2; ++component) {
+              gradient_components.push_back(
+                  builder_->createCompositeExtract(gradient, type_float_, component));
+            }
+          }
+          builder_->createStore(
+              builder_->createCompositeConstruct(type_float4_, gradient_components),
+              face_stage_samples_[fetch_constant_index == 0 ? 20 : 21]);
+          if (fetch_constant_index == 0 && diagnostic_fine_gradients != spv::NoResult) {
+            builder_->createStore(diagnostic_fine_gradients, face_stage_samples_[36]);
+          }
+          if (fetch_constant_index == 0 &&
+              GetSpirvShaderModification().pixel.diagnostic_storage_version == 10 &&
+              input_output_interpolators_[1] != spv::NoResult) {
+            // Evaluate the same smooth guest UV varying at adjacent pixel
+            // offsets on this invocation's primitive. These are an independent
+            // interpolation reference for checking the host derivative ops.
+            const spv::Id half_pixel = builder_->makeFloatConstant(0.5f);
+            const spv::Id offset_x_positive = builder_->createCompositeConstruct(
+                type_float2_,
+                std::vector<spv::Id>{half_pixel, const_float_0_});
+            const spv::Id offset_x_negative = builder_->createCompositeConstruct(
+                type_float2_,
+                std::vector<spv::Id>{builder_->createUnaryOp(spv::OpFNegate, type_float_, half_pixel),
+                                     const_float_0_});
+            const spv::Id offset_y_positive = builder_->createCompositeConstruct(
+                type_float2_,
+                std::vector<spv::Id>{const_float_0_, half_pixel});
+            const spv::Id offset_y_negative = builder_->createCompositeConstruct(
+                type_float2_, std::vector<spv::Id>{
+                                  const_float_0_, builder_->createUnaryOp(
+                                                      spv::OpFNegate, type_float_, half_pixel)});
+            const auto interpolate_at = [this](spv::Id offset) {
+              return builder_->createBinBuiltinCall(
+                  type_float4_, ext_inst_glsl_std_450_, GLSLstd450InterpolateAtOffset,
+                  input_output_interpolators_[1], offset);
+            };
+            const spv::Id uv_at_x_positive = interpolate_at(offset_x_positive);
+            const spv::Id uv_at_x_negative = interpolate_at(offset_x_negative);
+            const spv::Id uv_at_y_positive = interpolate_at(offset_y_positive);
+            const spv::Id uv_at_y_negative = interpolate_at(offset_y_negative);
+            std::vector<spv::Id> interpolation_reference;
+            for (const auto& [positive, negative] :
+                 std::array<std::pair<spv::Id, spv::Id>, 2>{{{uv_at_x_positive, uv_at_x_negative},
+                                                              {uv_at_y_positive, uv_at_y_negative}}}) {
+              for (uint32_t component = 0; component < 2; ++component) {
+                const spv::Id positive_value =
+                    builder_->createCompositeExtract(positive, type_float_, component);
+                const spv::Id negative_value =
+                    builder_->createCompositeExtract(negative, type_float_, component);
+                interpolation_reference.push_back(builder_->createBinOp(
+                    spv::OpFSub, type_float_, positive_value, negative_value));
+              }
+            }
+            builder_->createStore(
+                builder_->createCompositeConstruct(type_float4_, interpolation_reference),
+                face_stage_samples_[37]);
+          }
+        }
+        if (diagnostic_storage_buffer_ != spv::NoResult &&
+            current_shader().ucode_data_hash() == UINT64_C(0xED58716070696DA4) &&
+            fetch_constant_index == 4 && instr.dimension == xenos::FetchOpDimension::k2D &&
+            use_computed_lod) {
+          std::vector<spv::Id> gradient_components;
+          for (spv::Id gradient : {gradients_h, gradients_v}) {
+            for (uint32_t component = 0; component < 2; ++component) {
+              gradient_components.push_back(
+                  builder_->createCompositeExtract(gradient, type_float_, component));
+            }
+          }
+          builder_->createStore(
+              builder_->createCompositeConstruct(type_float4_, gradient_components),
+              face_stage_samples_[34]);
+          builder_->createStore(
+              builder_->createCompositeConstruct(
+                  type_float4_,
+                  std::vector<spv::Id>{lod, const_float_1_,
+                                       builder_->makeFloatConstant(
+                                           instr.attributes.use_register_gradients ? 1.0f : 0.0f),
+                                       builder_->makeFloatConstant(instr.attributes.lod_bias)}),
+              face_stage_samples_[35]);
         }
 
         // Sample the texture.
@@ -1852,9 +2041,125 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           }
           texture_parameters.coords =
               builder_->createCompositeConstruct(type_float3_, id_vector_temp_);
+          const uint64_t current_hash = current_shader().ucode_data_hash();
+          const bool is_diagnostic_candidate =
+              vulkan::diagnostics::IsFragmentDiagnosticInstrumentedShader(current_hash);
+          const int diagnostic_sample_index =
+              vulkan::diagnostics::GetFragmentDiagnosticFetchSampleIndex(
+                  current_hash, instr.operands[1].storage_index);
+          if (diagnostic_storage_buffer_ != spv::NoResult &&
+              is_diagnostic_candidate &&
+              instr.opcode == ucode::FetchOpcode::kTextureFetch &&
+              instr.dimension == xenos::FetchOpDimension::k2D &&
+              diagnostic_sample_index >= 0) {
+            diagnostic_uv[0] = coordinates[0];
+            diagnostic_uv[1] = coordinates[1];
+          }
+          // [DEBUG-face-stage] Capture the actual normalized tf0 fetch coordinates
+          // at the same point they are passed to SampleTexture.
+          if (is_pixel_shader() &&
+              current_shader().ucode_data_hash() == UINT64_C(0x79A3448304FA0D22) &&
+              instr.operands[1].storage_index == 0 &&
+              instr.dimension == xenos::FetchOpDimension::k2D) {
+            std::vector<spv::Id> uv_components{
+                builder_->createCompositeExtract(texture_parameters.coords, type_float_, 0),
+                builder_->createCompositeExtract(texture_parameters.coords, type_float_, 1),
+                const_float_0_, const_float_1_};
+            builder_->createStore(builder_->createCompositeConstruct(type_float4_, uv_components),
+                                  face_stage_samples_[3]);
+          }
           SampleTexture(texture_parameters, image_operands_mask, image_2d_array_or_cube_unsigned,
                         image_2d_array_or_cube_signed, sampler, is_any_unsigned, is_any_signed,
                         sample_result_unsigned, sample_result_signed);
+          // [DEBUG-face-stage] Paired probe: coordinates and the sample taken
+          // from the same fetch instruction, so no other tf0 fetch in the
+          // shader can desynchronise them. Kept for the last 2D tf0 fetch, and
+          // also for the first four 2D tf0 fetches separately, since a shader
+          // may fetch tf0 more than once with different coordinates.
+          if (is_pixel_shader() &&
+              current_shader().ucode_data_hash() == UINT64_C(0x79A3448304FA0D22) &&
+              instr.operands[1].storage_index == 0 &&
+              instr.dimension == xenos::FetchOpDimension::k2D) {
+            uint32_t fetch_index = face_stage_slot0_fetch_index_++;
+            REXGPU_INFO(
+                "[DEBUG-face-stage] tf0 2D fetch #{} translated: used_result_components={:X} "
+                "use_computed_lod={} shader_instructions={}",
+                fetch_index, used_result_components, uint32_t(use_computed_lod),
+                current_shader().total_instruction_count());
+            spv::Id paired_sample = builder_->createTriOp(
+                spv::OpSelect, type_float4_, builder_->smearScalar(spv::NoPrecision, is_any_signed,
+                                                                 type_bool4_),
+                sample_result_signed, sample_result_unsigned);
+            std::vector<spv::Id> paired_components{
+                builder_->createCompositeExtract(texture_parameters.coords, type_float_, 0),
+                builder_->createCompositeExtract(texture_parameters.coords, type_float_, 1),
+                builder_->createCompositeExtract(paired_sample, type_float_, 1), const_float_1_};
+            spv::Id paired =
+                builder_->createCompositeConstruct(type_float4_, paired_components);
+            builder_->createStore(paired, face_stage_samples_[4]);
+            if (fetch_index < 4) {
+              builder_->createStore(paired, face_stage_samples_[5 + fetch_index]);
+            }
+            // Full-precision coordinates: the 8-bit frame capture only resolves
+            // about two texels of a 512x512 texture, so carry the fractional
+            // part of the 8-bit fixed-point value in the other two components.
+            spv::Id u_255 = builder_->createBinOp(
+                spv::OpFMul, type_float_,
+                builder_->createCompositeExtract(texture_parameters.coords, type_float_, 0),
+                builder_->makeFloatConstant(255.0f));
+            spv::Id v_255 = builder_->createBinOp(
+                spv::OpFMul, type_float_,
+                builder_->createCompositeExtract(texture_parameters.coords, type_float_, 1),
+                builder_->makeFloatConstant(255.0f));
+            std::vector<spv::Id> precise_components{
+                builder_->createCompositeExtract(texture_parameters.coords, type_float_, 0),
+                builder_->createCompositeExtract(texture_parameters.coords, type_float_, 1),
+                builder_->createBinOp(
+                    spv::OpFSub, type_float_, u_255,
+                    builder_->createUnaryOp(spv::OpConvertSToF, type_float_,
+                                            builder_->createUnaryOp(spv::OpConvertFToS, type_int_,
+                                                                    u_255))),
+                builder_->createBinOp(
+                    spv::OpFSub, type_float_, v_255,
+                    builder_->createUnaryOp(spv::OpConvertSToF, type_float_,
+                                            builder_->createUnaryOp(spv::OpConvertFToS, type_int_,
+                                                                    v_255)))};
+            builder_->createStore(
+                builder_->createCompositeConstruct(type_float4_, precise_components),
+                face_stage_samples_[9]);
+            // The raw sampled RGBA, so the texel the sampler returned can be
+            // located in the decoded image.
+            builder_->createStore(paired_sample, face_stage_samples_[10]);
+          }
+          // [DEBUG-face-stage] Explicit-LOD-0 re-sample of the head's tf0 fetch,
+          // selected at runtime so no additional pipeline is needed. Used to
+          // separate an over-blurred mip footprint from texture content.
+          if (is_pixel_shader() &&
+              current_shader().ucode_data_hash() == UINT64_C(0x79A3448304FA0D22) &&
+              instr.operands[1].storage_index == 0) {
+            spv::Id lod0_unsigned = spv::NoResult;
+            spv::Id lod0_signed = spv::NoResult;
+            spv::Builder::TextureParameters lod0_parameters = texture_parameters;
+            lod0_parameters.lod = const_float_0_;
+            SampleTexture(lod0_parameters, spv::ImageOperandsLodMask,
+                          image_2d_array_or_cube_unsigned, image_2d_array_or_cube_signed, sampler,
+                          is_any_unsigned, is_any_signed, lod0_unsigned, lod0_signed);
+            std::vector<spv::Id> lod0_indices{
+                builder_->makeIntConstant(kSystemConstantFaceStageLod0)};
+            spv::Id lod0_modes =
+                builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+                                                                 uniform_system_constants_,
+                                                                 lod0_indices),
+                                     spv::NoPrecision);
+            spv::Id use_lod0 = builder_->createBinOp(spv::OpINotEqual, type_bool_, lod0_modes,
+                                                     const_uint_0_);
+            sample_result_unsigned =
+                builder_->createTriOp(spv::OpSelect, type_float4_, use_lod0, lod0_unsigned,
+                                      sample_result_unsigned);
+            sample_result_signed =
+                builder_->createTriOp(spv::OpSelect, type_float4_, use_lod0, lod0_signed,
+                                      sample_result_signed);
+          }
         }
 
         // Swizzle the result components manually if needed, to `result`.
@@ -1954,6 +2259,10 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                     ? builder_->createCompositeExtract(sample_result_unsigned, type_float_,
                                                        result_component_index)
                     : result[result_component_index];
+            if (GetSpirvShaderModification().pixel.texture_signs_all_unsigned) {
+              result[result_component_index] = sample_result_component_unsigned;
+              continue;
+            }
             spv::Block& block_sign_head = *builder_->getBuildPoint();
             spv::Block* block_sign_signed =
                 features_.image_view_format_swizzle ? &builder_->makeNewBlock() : nullptr;
@@ -2069,6 +2378,47 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     uint32_t result_component_index;
     rex::bit_scan_forward(used_result_components, &result_component_index);
     result_vector = result[result_component_index];
+  }
+  // The per-invocation diagnostic record is emitted in CompleteFragmentShaderInMain().
+  // [DEBUG-face-stage] Preserve the actual post-swizzle, post-sign sample,
+  // not a CPU approximation or a different compute shader's texelFetch.
+  const uint64_t current_hash = current_shader().ucode_data_hash();
+  const bool is_diagnostic_candidate =
+      vulkan::diagnostics::IsFragmentDiagnosticInstrumentedShader(current_hash);
+  if (is_pixel_shader() && is_diagnostic_candidate) {
+    const int sample_index = vulkan::diagnostics::GetFragmentDiagnosticFetchSampleIndex(
+        current_hash, instr.operands[1].storage_index);
+    if (sample_index >= 0) {
+      std::vector<spv::Id> components;
+      for (uint32_t c = 0; c < 4; ++c) {
+        components.push_back((used_result_components & (1u << c)) ? result[c] : const_float_0_);
+      }
+      builder_->createStore(builder_->createCompositeConstruct(type_float4_, components),
+                            face_stage_samples_[sample_index]);
+      if (diagnostic_storage_buffer_ != spv::NoResult &&
+          instr.opcode == ucode::FetchOpcode::kTextureFetch &&
+          instr.dimension == xenos::FetchOpDimension::k2D &&
+          face_stage_samples_[11 + sample_index] != spv::NoResult &&
+          face_stage_samples_[17 + sample_index] != spv::NoResult &&
+          diagnostic_uv[0] != spv::NoResult && diagnostic_uv[1] != spv::NoResult) {
+        std::vector<spv::Id> probe_components;
+        for (uint32_t c = 0; c < 4; ++c) {
+          probe_components.push_back((used_result_components & (1u << c)) ? result[c]
+                                                                           : const_float_0_);
+        }
+        builder_->createStore(builder_->createCompositeConstruct(type_float4_, probe_components),
+                              face_stage_samples_[17 + sample_index]);
+        std::vector<spv::Id> uv_components{diagnostic_uv[0], diagnostic_uv[1], const_float_0_,
+                                          const_float_1_};
+        builder_->createStore(builder_->createCompositeConstruct(type_float4_, uv_components),
+                              face_stage_samples_[11 + sample_index]);
+        builder_->createStore(
+            builder_->createCompositeConstruct(
+                type_float4_, std::vector<spv::Id>{const_float_1_, const_float_0_, const_float_0_,
+                                                   const_float_0_}),
+            face_stage_samples_[14 + sample_index]);
+      }
+    }
   }
   StoreResult(instr.result, result_vector);
 }
@@ -2189,6 +2539,26 @@ void SpirvShaderTranslator::SampleTexture(spv::Builder::TextureParameters& textu
                                           spv::Id is_any_signed, spv::Id& result_unsigned_out,
                                           spv::Id& result_signed_out, spv::Id lerp_factor,
                                           spv::Id lerp_first_unsigned, spv::Id lerp_first_signed) {
+  if (GetSpirvShaderModification().pixel.texture_signs_all_unsigned) {
+    texture_parameters.sampler = builder_->createBinOp(
+        spv::OpSampledImage, builder_->makeSampledImageType(builder_->getTypeId(image_unsigned)),
+        image_unsigned, sampler);
+    result_unsigned_out =
+        builder_->createTextureCall(spv::NoPrecision, type_float4_, false, false, false, false,
+                                    false, texture_parameters, image_operands_mask);
+    if (lerp_factor != spv::NoResult && lerp_first_unsigned != spv::NoResult) {
+      spv::Id lerp_difference = builder_->createNoContractionBinOp(
+          spv::OpVectorTimesScalar, type_float4_,
+          builder_->createNoContractionBinOp(spv::OpFSub, type_float4_, result_unsigned_out,
+                                             lerp_first_unsigned),
+          lerp_factor);
+      result_unsigned_out = builder_->createNoContractionBinOp(spv::OpFAdd, type_float4_,
+                                                               result_unsigned_out,
+                                                               lerp_difference);
+    }
+    result_signed_out = result_unsigned_out;
+    return;
+  }
   for (uint32_t i = 0; i < 2; ++i) {
     SpirvBuilder::IfBuilder sign_if(i ? is_any_signed : is_any_unsigned,
                                     spv::SelectionControlDontFlattenMask, *builder_);
@@ -2226,6 +2596,14 @@ void SpirvShaderTranslator::SampleTexture(spv::Builder::TextureParameters& textu
 spv::Id SpirvShaderTranslator::QueryTextureLod(spv::Builder::TextureParameters& texture_parameters,
                                                spv::Id image_unsigned, spv::Id image_signed,
                                                spv::Id sampler, spv::Id is_all_signed) {
+  if (GetSpirvShaderModification().pixel.texture_signs_all_unsigned) {
+    texture_parameters.sampler = builder_->createBinOp(
+        spv::OpSampledImage, builder_->makeSampledImageType(builder_->getTypeId(image_unsigned)),
+        image_unsigned, sampler);
+    return builder_->createCompositeExtract(
+        builder_->createTextureQueryCall(spv::OpImageQueryLod, texture_parameters, false),
+        type_float_, 1);
+  }
   // OpSampledImage must be in the same block as where its result is used.
   SpirvBuilder::IfBuilder if_signed(is_all_signed, spv::SelectionControlDontFlattenMask, *builder_);
   spv::Id lod_signed;

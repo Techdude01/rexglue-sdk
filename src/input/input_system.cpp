@@ -35,6 +35,11 @@ REXCVAR_DEFINE_STRING(startup_input_sequence, "a@180:2", "Input/Test",
                       "Synthetic button or stick pulses as input@poll:duration, comma-separated");
 REXCVAR_DEFINE_UINT32(startup_input_cutoff_poll, 240, "Input/Test",
                       "Stop synthetic startup input after this guest XInput poll count");
+REXCVAR_DEFINE_STRING(input_record_path, "", "Input/Test",
+                      "Record user-0 controller state transitions; finish via PATH.stop after releasing controls");
+REXCVAR_DEFINE_STRING(input_replay_path, "", "Input/Test", "Replay a completed controller input trace");
+REXCVAR_DEFINE_STRING(input_replay_clock, "time", "Input/Test", "Input trace pacing: time or poll")
+    .allowed({"time", "poll"});
 namespace rex::input {
 
 namespace {
@@ -51,7 +56,53 @@ InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
 InputSystem::~InputSystem() = default;
 
 X_STATUS InputSystem::Setup() {
+  const auto& record = REXCVAR_GET(input_record_path);
+  const auto& replay = REXCVAR_GET(input_replay_path);
+  if ((!record.empty() && !replay.empty()) ||
+      ((!record.empty() || !replay.empty()) && REXCVAR_GET(test_startup_input))) {
+    REXLOG_ERROR("Input trace: record/replay and synthetic startup input are mutually exclusive");
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  if (!record.empty() || !replay.empty()) {
+    trace_ = std::make_unique<InputTrace>();
+    const bool opened = !record.empty()
+                            ? trace_->OpenRecord(record)
+                            : trace_->OpenReplay(replay, REXCVAR_GET(input_replay_clock) == "poll");
+    if (!opened) {
+      REXLOG_ERROR("Input trace: {}", trace_->error());
+      return X_STATUS_UNSUCCESSFUL;
+    }
+    trace_stop_path_ = record + ".stop";
+    REXLOG_INFO("Input trace: mode={} path='{}' clock={} user=0",
+                record.empty() ? "replay" : "record", record.empty() ? replay : record,
+                REXCVAR_GET(input_replay_clock));
+  }
   return X_STATUS_SUCCESS;
+}
+
+uint64_t InputSystem::TraceMicros() {
+  const auto now = std::chrono::steady_clock::now();
+  if (trace_start_ == std::chrono::steady_clock::time_point{}) trace_start_ = now;
+  return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(now - trace_start_).count());
+}
+
+void InputSystem::RecordInputState(uint32_t user_index, X_RESULT result, const X_INPUT_STATE& state) {
+  if (!trace_ || user_index != 0 || trace_->replaying()) return;
+  std::lock_guard lock(trace_mutex_);
+  if (!trace_->recording()) return;
+  if ((trace_polls_++ % 64) == 0 && !trace_finish_requested_) {
+    std::error_code ec;
+    trace_finish_requested_ = std::filesystem::exists(trace_stop_path_, ec) && !ec;
+  }
+  const auto& pad = state.gamepad;
+  const InputTraceState value{uint32_t(result), uint32_t(state.packet_number), uint16_t(pad.buttons),
+                              pad.left_trigger, pad.right_trigger, int16_t(pad.thumb_lx),
+                              int16_t(pad.thumb_ly), int16_t(pad.thumb_rx), int16_t(pad.thumb_ry)};
+  if (!trace_->Record(TraceMicros(), value, trace_finish_requested_)) {
+    REXLOG_ERROR("Input trace recording failed: {}", trace_->error());
+  } else if (trace_->complete()) {
+    REXLOG_INFO("Input trace recording complete: controls released, end marker persisted");
+  }
 }
 
 void InputSystem::Shutdown() {
@@ -198,6 +249,17 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
+  if (trace_ && trace_->replaying() && !trace_->complete() && user_index == 0) {
+    *out_caps = {};
+    out_caps->type = 1;
+    out_caps->sub_type = 1;
+    out_caps->gamepad.buttons = 0xFFFF;
+    out_caps->gamepad.left_trigger = out_caps->gamepad.right_trigger = 255;
+    out_caps->gamepad.thumb_lx = out_caps->gamepad.thumb_ly = 32767;
+    out_caps->gamepad.thumb_rx = out_caps->gamepad.thumb_ry = 32767;
+    return X_ERROR_SUCCESS;
+  }
+
   RefreshDevices();
   std::vector<DeviceId> ids;
   assignment_->DevicesForUser(user_index, ids);
@@ -221,7 +283,29 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
 
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
+  if (trace_ && trace_->replaying() && !trace_->complete() && user_index == 0) {
+    std::lock_guard lock(trace_mutex_);
+    const auto value = trace_->Replay(TraceMicros());
+    if (out_state) {
+      *out_state = {};
+      out_state->packet_number = value.packet;
+      auto& pad = out_state->gamepad;
+      pad.buttons = value.buttons;
+      pad.left_trigger = value.lt;
+      pad.right_trigger = value.rt;
+      pad.thumb_lx = value.lx;
+      pad.thumb_ly = value.ly;
+      pad.thumb_rx = value.rx;
+      pad.thumb_ry = value.ry;
+    }
+    if (trace_->complete() && !trace_reported_) {
+      trace_reported_ = true;
+      REXLOG_INFO("Input trace replay complete: route ended with controls released");
+    }
+    return X_RESULT(value.result);
+  }
   if (!assignment_) {
+    RecordInputState(user_index, X_ERROR_DEVICE_NOT_CONNECTED, {});
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
@@ -253,8 +337,10 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   }
 
   if (!any) {
+    RecordInputState(user_index, X_ERROR_DEVICE_NOT_CONNECTED, {});
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
+  RecordInputState(user_index, X_ERROR_SUCCESS, merged);
   if (out_state) {
     *out_state = merged;
     if (test_controller_connected) {
@@ -313,6 +399,7 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
 X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                                    X_INPUT_KEYSTROKE* out_keystroke) {
   SCOPE_profile_cpu_f("hid");
+  if (trace_ && trace_->replaying() && !trace_->complete() && user_index == 0) return X_ERROR_EMPTY;
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -329,6 +416,13 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
     }
     X_RESULT result = driver->GetDeviceKeystroke(id, flags, out_keystroke);
     if (result == X_ERROR_SUCCESS) {
+      if (trace_ && user_index == 0 && !trace_->replaying()) {
+        std::lock_guard lock(trace_mutex_);
+        if (trace_->recording()) {
+          trace_->RejectKeystroke();
+          REXLOG_ERROR("Input trace recording failed: {}", trace_->error());
+        }
+      }
       out_keystroke->user_index = static_cast<uint8_t>(user_index);
       return result;
     }

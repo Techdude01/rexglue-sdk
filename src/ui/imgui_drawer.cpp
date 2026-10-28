@@ -94,10 +94,13 @@ ImGuiDrawer::ImGuiDrawer(rex::ui::Window* window, size_t z_order, FontSetupCallb
       z_order_(z_order),
       font_setup_(std::move(font_setup)),
       style_setup_(std::move(style_setup)) {
+  paint_request_ = std::make_shared<PaintRequest>(PaintRequest{window, &window->app_context()});
   Initialize();
 }
 
 ImGuiDrawer::~ImGuiDrawer() {
+  // Both destruction and the deferred paint callback run on the UI thread.
+  paint_request_->window = nullptr;
   SetPresenter(nullptr);
   SetWindowTextInputActive(false);
   if (!dialogs_.empty()) {
@@ -132,6 +135,9 @@ void ImGuiDrawer::AddDialog(ImGuiDialog* dialog) {
     }
   }
   dialogs_.push_back(dialog);
+  if (presenter_) {
+    presenter_->RequestUIPaintFromUIThread();
+  }
 }
 
 void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
@@ -149,6 +155,9 @@ void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
   }
   dialogs_.erase(it);
   DetachIfLastDialogRemoved();
+  if (presenter_) {
+    presenter_->RequestUIPaintFromUIThread();
+  }
 }
 
 void ImGuiDrawer::Initialize() {
@@ -374,6 +383,20 @@ void ImGuiDrawer::SetImmediateDrawer(ImmediateDrawer* new_immediate_drawer) {
   if (immediate_drawer_ && presenter_) {
     SetupFontTexture();
   }
+}
+
+bool ImGuiDrawer::NeedsPaint() const {
+  return std::any_of(dialogs_.begin(), dialogs_.end(),
+                     [](const ImGuiDialog* dialog) { return dialog->NeedsPaint(); });
+}
+
+void ImGuiDrawer::RequestPaint() {
+  auto request = paint_request_;
+  request->context->CallInUIThread([request] {
+    if (request->window) {
+      request->window->RequestPaint();
+    }
+  });
 }
 
 void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {

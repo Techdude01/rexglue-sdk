@@ -201,7 +201,7 @@ class VulkanPipelineCache {
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
 
     // Including all the padding, for a stable hash.
-    static constexpr uint32_t kVersion = 0x20261017;
+    static constexpr uint32_t kVersion = 0x20261027;
     PipelineDescription() {
       Reset();
     }

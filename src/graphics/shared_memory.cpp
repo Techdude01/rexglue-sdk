@@ -437,7 +437,13 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
         append_upload_range(range_start, page_last + 1 - range_start);
       }
     }
-    return UploadRanges(upload_ranges_);
+    if (!upload_ranges_.empty()) {
+      if (!UploadRanges(upload_ranges_)) {
+        return false;
+      }
+    }
+    OnRangeRequested(start, length);
+    return true;
   }
 
   // Some texture or buffer is empty, for example - safe to draw in this case.
@@ -559,11 +565,19 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count",
                     uint32_t(upload_ranges_.size()));
 
-  if (upload_ranges_.empty()) {
-    return true;
+  if (!upload_ranges_.empty()) {
+    if (!UploadRanges(upload_ranges_)) {
+      return false;
+    }
   }
 
-  return UploadRanges(upload_ranges_);
+  for (size_t i = 0; i < count; ++i) {
+    if (ranges[i].second) {
+      OnRangeRequested(ranges[i].first, ranges[i].second);
+    }
+  }
+
+  return true;
 }
 
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {

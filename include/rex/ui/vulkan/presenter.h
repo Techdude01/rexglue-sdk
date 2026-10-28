@@ -199,6 +199,9 @@ class VulkanPresenter final : public Presenter {
     std::shared_ptr<GuestOutputImage> image;
     uint64_t version = UINT64_MAX;
     uint64_t last_refresher_submission = 0;
+    // Timeline value signaled on the producing queue after the copy that wrote
+    // this image. 0 means no cross-queue signal covers it.
+    uint64_t cross_queue_timeline_value = 0;
     // For choosing the barrier stage and access mask and layout depending on
     // whether the image has previously been written. If an image is active
     // after a refresh, it can be assumed that this is true.
@@ -208,6 +211,7 @@ class VulkanPresenter final : public Presenter {
       image = new_image;
       version = new_version;
       last_refresher_submission = 0;
+      cross_queue_timeline_value = 0;
       ever_successfully_refreshed = false;
     }
   };
@@ -444,6 +448,12 @@ class VulkanPresenter final : public Presenter {
   }
 
   bool InitializeSurfaceIndependent();
+  uint32_t PresenterQueueIndex() const {
+    return guest_output_cross_queue_semaphore_ != VK_NULL_HANDLE
+               ? vulkan_device_->presenter_queue_index()
+               : 0;
+  }
+  void CreateGuestOutputCrossQueueSemaphore();
 
   [[nodiscard]] VkPipeline CreateGuestOutputPaintPipeline(GuestOutputPaintEffect effect,
                                                           VkRenderPass render_pass);
@@ -460,6 +470,10 @@ class VulkanPresenter final : public Presenter {
 
   const VulkanDevice* vulkan_device_;
   const UISamplers* ui_samplers_;
+  // Signaled by the command-processor queue after each guest-output refresh
+  // when the presenter submits on a different queue of the same family.
+  VkSemaphore guest_output_cross_queue_semaphore_ = VK_NULL_HANDLE;
+  uint64_t guest_output_cross_queue_timeline_next_ = 0;
 
   // Static objects for guest output presentation, used only when painting the
   // main target (can be destroyed only after awaiting main target usage

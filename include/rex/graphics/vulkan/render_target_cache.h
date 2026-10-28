@@ -21,6 +21,7 @@
 #include <rex/graphics/pipeline/render_target/cache.h>
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/graphics/vulkan/texture_cache.h>
+#include <rex/graphics/vulkan/render_target_snapshot_diagnostic.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
 #include <rex/ui/vulkan/single_layout_descriptor_set_pool.h>
@@ -115,10 +116,17 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   RenderPassKey last_update_render_pass_key() const { return last_update_render_pass_key_; }
   VkRenderPass last_update_render_pass() const { return last_update_render_pass_; }
   const Framebuffer* last_update_framebuffer() const { return last_update_framebuffer_; }
+  VkImageView GetLastUpdateDrawAttachmentView(uint32_t index) const;
+  void LogLastUpdateDepthAttachmentState(uint64_t frame, uint32_t draw) const;
   void GetLastUpdateRenderingAttachments(VkRenderingAttachmentInfo* color_attachments,
                                          uint32_t* color_attachment_count_out,
                                          VkRenderingAttachmentInfo* depth_attachment,
                                          VkRenderingAttachmentInfo* stencil_attachment) const;
+  bool HasAnyPendingClear() const;
+  bool CaptureDiagnosticSnapshot(const diagnostics::RenderTargetSnapshotRequest& request,
+                                 diagnostics::RenderTargetSnapshotBoundary boundary,
+                                 diagnostics::BenOcclusionSnapshotBoundaryMetadata metadata = {});
+  void FinishDiagnosticSnapshotCapture(uint64_t completed_frame);
 
   // Using R16G16[B16A16]_SNORM, which are -1...1, not the needed -32...32.
   // Persistent data doesn't depend on this, so can be overriden by per-game
@@ -167,6 +175,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                                  bool is_transfer_format = false) const;
 
  protected:
+  bool CanRetainColorAttachmentsForDepthOnlyDraw() const override;
   uint32_t GetMaxRenderTargetWidth() const override;
   uint32_t GetMaxRenderTargetHeight() const override;
 
@@ -256,6 +265,38 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   std::unique_ptr<ui::vulkan::SingleLayoutDescriptorSetPool> descriptor_set_pool_sampled_image_;
   std::unique_ptr<ui::vulkan::SingleLayoutDescriptorSetPool> descriptor_set_pool_sampled_image_x2_;
+
+  VkPipelineLayout diagnostic_snapshot_color_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout diagnostic_snapshot_depth_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline diagnostic_snapshot_color_pipeline_ = VK_NULL_HANDLE;
+  VkPipeline diagnostic_snapshot_color_float_pipeline_ = VK_NULL_HANDLE;
+  VkPipeline diagnostic_snapshot_depth_pipeline_ = VK_NULL_HANDLE;
+  VkPipeline diagnostic_snapshot_color_single_sample_pipeline_ = VK_NULL_HANDLE;
+  VkPipeline diagnostic_snapshot_color_float_single_sample_pipeline_ = VK_NULL_HANDLE;
+  VkPipeline diagnostic_snapshot_depth_single_sample_pipeline_ = VK_NULL_HANDLE;
+  VkPipeline diagnostic_snapshot_color_packed_pipeline_ = VK_NULL_HANDLE;
+  VkPipeline diagnostic_snapshot_color_packed_single_sample_pipeline_ = VK_NULL_HANDLE;
+  VkPipeline diagnostic_snapshot_depth_packed_pipeline_ = VK_NULL_HANDLE;
+  VkBuffer diagnostic_snapshot_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory diagnostic_snapshot_memory_ = VK_NULL_HANDLE;
+  void* diagnostic_snapshot_mapping_ = nullptr;
+  VkBuffer diagnostic_snapshot_constants_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory diagnostic_snapshot_constants_memory_ = VK_NULL_HANDLE;
+  void* diagnostic_snapshot_constants_mapping_ = nullptr;
+  VkDeviceSize diagnostic_snapshot_constants_stride_ = 0;
+  VkDeviceSize diagnostic_snapshot_constants_memory_size_ = 0;
+  uint32_t diagnostic_snapshot_constants_memory_type_ = 0;
+  uint32_t diagnostic_snapshot_memory_type_ = 0;
+  VkDeviceSize diagnostic_snapshot_memory_size_ = 0;
+  VkDeviceSize diagnostic_snapshot_capacity_bytes_ = 0;
+  uint32_t diagnostic_snapshot_max_boundaries_ = 0;
+  uint32_t diagnostic_snapshot_boundary_count_ = 0;
+  uint64_t diagnostic_snapshot_frame_ = 0;
+  diagnostics::RenderTargetSnapshotRequest diagnostic_snapshot_request_{};
+  std::vector<diagnostics::RenderTargetSnapshotBoundary> diagnostic_snapshot_boundaries_;
+  std::vector<diagnostics::BenOcclusionSnapshotBoundaryMetadata>
+      diagnostic_snapshot_ben_metadata_;
+  bool diagnostic_snapshot_overflow_logged_ = false;
 
   VkDeviceMemory edram_buffer_memory_ = VK_NULL_HANDLE;
   VkBuffer edram_buffer_ = VK_NULL_HANDLE;

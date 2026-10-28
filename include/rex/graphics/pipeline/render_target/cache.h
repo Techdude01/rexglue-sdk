@@ -301,6 +301,39 @@ class RenderTargetCache {
     RenderTargetKey key_;
   };
 
+  // Compatibility policy for already-bound attachments. The caller also
+  // enforces backend scope and ownership-transfer constraints.
+  static bool CanKeepAccumulatedRenderTargets(
+      RenderTarget* const* current, RenderTarget* const* accumulated,
+      uint32_t pitch_tiles_at_32bpp, xenos::MsaaSamples msaa_samples,
+      bool retain_color_on_depth_only) {
+    bool has_color = false;
+    for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      has_color |= current[i] != nullptr;
+    }
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (!accumulated[i]) {
+        if (current[i]) return false;
+        continue;
+      }
+      if (current[i]) {
+        if (current[i] != accumulated[i]) return false;
+      } else {
+        if (i >= 1 && !has_color && !retain_color_on_depth_only) return false;
+        const auto key = accumulated[i]->key();
+        if (key.pitch_tiles_at_32bpp != pitch_tiles_at_32bpp ||
+            key.msaa_samples != msaa_samples) return false;
+      }
+    }
+    for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (!accumulated[i]) continue;
+      for (uint32_t j = 0; j < i; ++j) {
+        if (accumulated[j] == accumulated[i]) return false;
+      }
+    }
+    return true;
+  }
+
   struct Transfer {
     uint32_t start_tiles;
     uint32_t end_tiles;
@@ -461,6 +494,9 @@ class RenderTargetCache {
   };
 
   virtual uint32_t GetMaxRenderTargetWidth() const = 0;
+  // Backends opt in only while retaining attachments can preserve an active
+  // rendering scope. Cold passes should keep the depth-only pruning policy.
+  virtual bool CanRetainColorAttachmentsForDepthOnlyDraw() const { return false; }
   virtual uint32_t GetMaxRenderTargetHeight() const = 0;
 
   // Returns the height of a render target that's needed and can be created,

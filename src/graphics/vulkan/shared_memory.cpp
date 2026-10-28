@@ -222,7 +222,8 @@ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_
     }
     command_processor_.PushBufferMemoryBarrier(
         buffer_, offset, size, src_stage_mask, dst_stage_mask, src_access_mask, dst_access_mask,
-        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false,
+        VulkanCommandProcessor::BarrierRequester::kSharedMemory);
   }
   last_written_range_ = written_range;
 }
@@ -273,15 +274,38 @@ bool VulkanSharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
-  // upload_page_ranges are sorted, use them to determine the range for the
-  // ordering barrier.
-  Use(Usage::kTransferDestination,
-      std::make_pair(upload_page_ranges.front().first << page_size_log2(),
-                     (upload_page_ranges.back().first + upload_page_ranges.back().second -
-                      upload_page_ranges.front().first)
-                         << page_size_log2()));
-  command_processor_.SubmitBarriers(true);
-  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+
+  bool can_hoist = REXCVAR_GET(vulkan_hoist_shared_memory_uploads);
+  if (can_hoist) {
+    for (const auto& r : upload_page_ranges) {
+      uint32_t start_bytes = r.first << page_size_log2();
+      uint32_t length_bytes = r.second << page_size_log2();
+      if (command_processor_.HasSubmissionReadRange(start_bytes, length_bytes)) {
+        can_hoist = false;
+        break;
+      }
+    }
+  }
+
+  if (can_hoist) {
+    command_processor_.OnSharedMemoryUploadHoisted();
+  } else {
+    if (REXCVAR_GET(vulkan_hoist_shared_memory_uploads)) {
+      command_processor_.IncrementHoistFallbackCount();
+    }
+    // upload_page_ranges are sorted, use them to determine the range for the
+    // ordering barrier.
+    Use(Usage::kTransferDestination,
+        std::make_pair(upload_page_ranges.front().first << page_size_log2(),
+                       (upload_page_ranges.back().first + upload_page_ranges.back().second -
+                        upload_page_ranges.front().first)
+                           << page_size_log2()));
+    command_processor_.SubmitBarriers(true);
+  }
+
+  DeferredCommandBuffer& command_buffer =
+      can_hoist ? command_processor_.prologue_deferred_command_buffer()
+                : command_processor_.deferred_command_buffer();
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
   bool successful = true;
   upload_regions_.clear();
@@ -359,6 +383,10 @@ void VulkanSharedMemory::GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_
     default:
       assert_unhandled_case(usage);
   }
+}
+
+void VulkanSharedMemory::OnRangeRequested(uint32_t start, uint32_t length) {
+  command_processor_.AddSubmissionReadRange(start, length);
 }
 
 }  // namespace rex::graphics::vulkan

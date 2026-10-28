@@ -148,6 +148,8 @@ class SharedMemory {
   virtual bool UploadRanges(
       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
 
+  virtual void OnRangeRequested(uint32_t start, uint32_t length) {}
+
  private:
   memory::Memory& memory_;
 

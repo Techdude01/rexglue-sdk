@@ -19,6 +19,10 @@ class UIDrawContext;
 
 class UIDrawer {
  public:
+  // Queried on the UI thread before suppressing an unchanged guest paint.
+  // Conservative by default: unknown drawers may animate or handle input.
+  virtual bool NeedsPaint() const { return true; }
+
   // No preparation or finishing callbacks because drawers may register or
   // unregister each other, so between the loops the list may be different.
 

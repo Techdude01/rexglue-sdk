@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <utility>
@@ -23,6 +24,10 @@
 #include <rex/assert.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/graphics/vulkan/diagnostic_storage_buffer.h>
+#include <rex/graphics/vulkan/fragment_diagnostic.h>
+#include <rex/graphics/vulkan/quad_partner_marker.h>
+#include <rex/graphics/vulkan/vertex_input_diagnostic.h>
 #include <rex/math.h>
 #include <rex/string/buffer.h>
 
@@ -137,6 +142,8 @@ void SpirvShaderTranslator::Reset() {
 
   main_interface_.clear();
   var_main_registers_ = spv::NoResult;
+  std::fill(var_main_diagnostic_vertex_fetch_inputs_.begin(),
+            var_main_diagnostic_vertex_fetch_inputs_.end(), spv::NoResult);
   var_main_memexport_address_ = spv::NoResult;
   for (size_t memexport_eM_index = 0; memexport_eM_index < rex::countof(var_main_memexport_data_);
        ++memexport_eM_index) {
@@ -156,6 +163,11 @@ void SpirvShaderTranslator::Reset() {
   var_main_kill_pixel_ = spv::NoResult;
   var_main_fragment_depth_ = spv::NoResult;
   var_main_fsi_color_written_ = spv::NoResult;
+  face_stage_samples_.fill(spv::NoResult);
+  quad_partner_values_.fill(spv::NoResult);
+  quad_partner_valid_ = spv::NoResult;
+  face_stage_slot0_fetch_index_ = 0;
+  diagnostic_storage_buffer_ = spv::NoResult;
 
   main_switch_op_.reset();
   main_switch_next_pc_phi_operands_.clear();
@@ -310,6 +322,8 @@ void SpirvShaderTranslator::StartTranslation() {
       {"edram_rt_keep_mask", offsetof(SystemConstants, edram_rt_keep_mask), type_uint4_array_2},
       {"edram_rt_clamp", offsetof(SystemConstants, edram_rt_clamp), type_float4_array_4},
       {"edram_blend_constant", offsetof(SystemConstants, edram_blend_constant), type_float4_},
+      {"face_stage_mode", offsetof(SystemConstants, face_stage_mode), type_uint_},
+      {"face_stage_lod0", offsetof(SystemConstants, face_stage_lod0), type_uint_},
   };
   id_vector_temp_.clear();
   id_vector_temp_.reserve(rex::countof(system_constants));
@@ -452,6 +466,91 @@ void SpirvShaderTranslator::StartTranslation() {
     builder_->addDecoration(buffers_shared_memory_, spv::DecorationDescriptorSet,
                             int(kDescriptorSetSharedMemoryAndEdram));
     builder_->addDecoration(buffers_shared_memory_, spv::DecorationBinding, 0);
+
+    const Modification modification = GetSpirvShaderModification();
+    const uint64_t shader_hash = current_shader().ucode_data_hash();
+    const bool is_diagnostic_candidate =
+        shader_hash == UINT64_C(0x79A3448304FA0D22) ||
+        shader_hash == UINT64_C(0x2D4C010D3D75DEA5) ||
+        shader_hash == UINT64_C(0x3EB44C3A6D2D267B);
+    const bool pixel_diagnostic_storage =
+        is_pixel_shader() && modification.pixel.diagnostic_storage_version &&
+        (is_diagnostic_candidate ||
+         modification.pixel.diagnostic_storage_version >= 9);
+    const bool vertex_diagnostic_storage =
+        is_vertex_shader() && modification.vertex.diagnostic_storage_version &&
+        (shader_hash == vulkan::diagnostics::kVertexInputDiagnosticVertexHash ||
+         shader_hash == vulkan::diagnostics::kGBufferVertexDiagnosticVertexHash ||
+         shader_hash == vulkan::diagnostics::kBenCuffVertexDiagnosticVertexHash ||
+         shader_hash == vulkan::diagnostics::kBenDialVertexDiagnosticVertexHash ||
+         shader_hash == vulkan::diagnostics::kBenGlowVertexDiagnosticVertexHash);
+    if (pixel_diagnostic_storage || vertex_diagnostic_storage) {
+      using DiagnosticBuffer = vulkan::VulkanDiagnosticStorageBuffer;
+      id_vector_temp_.clear();
+      std::vector<spv::Id> record_members = {
+          type_uint_, type_uint_, type_uint_, type_uint_, type_uint_, type_uint_, type_uint_,
+          type_uint_, builder_->makeArrayType(type_uint_, builder_->makeUintConstant(2), 0),
+          builder_->makeArrayType(type_uint_, builder_->makeUintConstant(4), 0), type_uint_,
+          builder_->makeArrayType(type_uint_, builder_->makeUintConstant(4), 0),
+          type_uint_,
+          builder_->makeArrayType(type_uint_, builder_->makeUintConstant(4), 0),
+          builder_->makeArrayType(type_uint_, builder_->makeUintConstant(4), 0),
+          builder_->makeArrayType(type_uint_, builder_->makeUintConstant(4), 0),
+          builder_->makeArrayType(type_uint_, builder_->makeUintConstant(4), 0)};
+      for (uint32_t input = 0; input < var_main_diagnostic_vertex_fetch_inputs_.size(); ++input) {
+        record_members.push_back(
+            builder_->makeArrayType(type_uint_, builder_->makeUintConstant(4), 0));
+      }
+      const spv::Id type_record = builder_->makeStructType(record_members, "XeDiagnosticRecord");
+      const uint32_t offsets[] = {
+            DiagnosticBuffer::kShaderHashLoOffset, DiagnosticBuffer::kShaderHashHiOffset,
+            DiagnosticBuffer::kFetchSlotOffset,    DiagnosticBuffer::kStageMarkerOffset,
+            DiagnosticBuffer::kFragmentXOffset,    DiagnosticBuffer::kFragmentYOffset,
+            DiagnosticBuffer::kFrameIdOffset,      DiagnosticBuffer::kDrawIdOffset,
+            DiagnosticBuffer::kUvOffset,           DiagnosticBuffer::kRgbaOffset,
+            DiagnosticBuffer::kValidityOffset,     DiagnosticBuffer::kOutputRgbaOffset,
+            DiagnosticBuffer::kSampleMaskOffset,
+            DiagnosticBuffer::kVertexInterpolator0Offset,
+            DiagnosticBuffer::kVertexInterpolator1Offset,
+            DiagnosticBuffer::kVertexInterpolator2Offset,
+            DiagnosticBuffer::kVertexInterpolator3Offset};
+      for (uint32_t member = 0; member < 17; ++member) {
+        builder_->addMemberDecoration(type_record, member, spv::DecorationOffset, offsets[member]);
+      }
+      for (uint32_t input = 0; input < var_main_diagnostic_vertex_fetch_inputs_.size(); ++input) {
+        builder_->addMemberDecoration(type_record, 17 + input, spv::DecorationOffset,
+                                      DiagnosticBuffer::kVertexFetchInputOffset +
+                                          input * sizeof(uint32_t) * 4);
+      }
+      builder_->addDecoration(record_members[8], spv::DecorationArrayStride, sizeof(uint32_t));
+      builder_->addDecoration(record_members[9], spv::DecorationArrayStride, sizeof(uint32_t));
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeRuntimeArray(type_record));
+      builder_->addDecoration(id_vector_temp_.back(), spv::DecorationArrayStride,
+                              DiagnosticBuffer::kRecordSize);
+      const spv::Id type_record_array = id_vector_temp_.back();
+      id_vector_temp_.clear();
+      for (uint32_t member = 0; member < DiagnosticBuffer::kRecordsMember; ++member) {
+        id_vector_temp_.push_back(type_uint_);
+      }
+      id_vector_temp_.push_back(type_record_array);
+      const spv::Id type_diagnostic = builder_->makeStructType(id_vector_temp_, "XeDiagnostics");
+      for (uint32_t member = 0; member <= DiagnosticBuffer::kRecordsMember; ++member) {
+        builder_->addMemberDecoration(type_diagnostic, member, spv::DecorationOffset,
+                                      member == DiagnosticBuffer::kRecordsMember
+                                          ? sizeof(DiagnosticBuffer::Header)
+                                          : member * sizeof(uint32_t));
+      }
+      builder_->addDecoration(type_diagnostic, spv::DecorationBlock);
+      diagnostic_storage_buffer_ =
+          builder_->createVariable(spv::NoPrecision, spv::StorageClassStorageBuffer,
+                                   type_diagnostic, "xe_diagnostic_storage");
+      builder_->addDecoration(diagnostic_storage_buffer_, spv::DecorationDescriptorSet,
+                              int(kDescriptorSetSharedMemoryAndEdram));
+      builder_->addDecoration(diagnostic_storage_buffer_, spv::DecorationBinding, 2);
+      if (features_.spirv_version >= spv::Spv_1_4)
+        main_interface_.push_back(diagnostic_storage_buffer_);
+    }
     if (features_.spirv_version >= spv::Spv_1_4) {
       main_interface_.push_back(buffers_shared_memory_);
     }
@@ -514,6 +613,24 @@ void SpirvShaderTranslator::StartTranslation() {
           builder_->makeArrayType(type_float4_, builder_->makeUintConstant(register_count()), 1);
       var_main_registers_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
                                                      type_register_array, "xe_var_registers");
+    }
+    if (GetSpirvShaderModification().vertex.diagnostic_storage_version &&
+        current_shader().ucode_data_hash() ==
+            vulkan::diagnostics::kGBufferVertexDiagnosticVertexHash) {
+      spv::Id type_diagnostic_vertex_fetch_inputs = builder_->makeArrayType(
+          type_float4_,
+          builder_->makeUintConstant(uint32_t(var_main_diagnostic_vertex_fetch_inputs_.size())),
+          sizeof(float) * 4);
+      var_main_diagnostic_vertex_fetch_inputs_[0] = builder_->createVariable(
+          spv::NoPrecision, spv::StorageClassFunction, type_diagnostic_vertex_fetch_inputs,
+          "xe_var_diagnostic_vertex_fetch_inputs");
+      for (uint32_t input = 0; input < var_main_diagnostic_vertex_fetch_inputs_.size(); ++input) {
+        builder_->createStore(
+            const_float4_0_,
+            builder_->createAccessChain(
+                spv::StorageClassFunction, var_main_diagnostic_vertex_fetch_inputs_[0],
+                std::vector<spv::Id>{builder_->makeIntConstant(int(input))}));
+      }
     }
     if (IsSpirvRectangleListVertexLoopEnabled()) {
       Modification shader_modification = GetSpirvShaderModification();
@@ -1144,6 +1261,142 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
 
   if (is_vertex_shader() && !IsSpirvComputeShader() && !rectangle_vertex_loop) {
     CompleteVertexOrTessEvalShaderInMain();
+    const Modification shader_modification = GetSpirvShaderModification();
+    if (diagnostic_storage_buffer_ != spv::NoResult && input_vertex_index_ != spv::NoResult &&
+        shader_modification.vertex.diagnostic_storage_version &&
+        (current_shader().ucode_data_hash() ==
+             vulkan::diagnostics::kVertexInputDiagnosticVertexHash ||
+         current_shader().ucode_data_hash() ==
+             vulkan::diagnostics::kGBufferVertexDiagnosticVertexHash ||
+         current_shader().ucode_data_hash() ==
+             vulkan::diagnostics::kBenCuffVertexDiagnosticVertexHash ||
+         current_shader().ucode_data_hash() ==
+             vulkan::diagnostics::kBenDialVertexDiagnosticVertexHash ||
+         current_shader().ucode_data_hash() ==
+             vulkan::diagnostics::kBenGlowVertexDiagnosticVertexHash)) {
+      using DiagnosticBuffer = vulkan::VulkanDiagnosticStorageBuffer;
+      auto header_pointer = [&](uint32_t member) {
+        return builder_->createAccessChain(
+            spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+            std::vector<spv::Id>{builder_->makeIntConstant(int(member))});
+      };
+      auto atomic_header = [&](uint32_t member, spv::Op opcode, spv::Id value) {
+        std::unique_ptr<spv::Instruction> atomic = std::make_unique<spv::Instruction>(
+            builder_->getUniqueId(), type_uint_, opcode);
+        atomic->addIdOperand(header_pointer(member));
+        atomic->addIdOperand(builder_->makeUintConstant(1));  // Device scope.
+        atomic->addIdOperand(builder_->makeUintConstant(0));  // Relaxed semantics.
+        atomic->addIdOperand(value);
+        const spv::Id result = atomic->getResultId();
+        builder_->getBuildPoint()->addInstruction(std::move(atomic));
+        return result;
+      };
+      const spv::Id recording_load = builder_->getUniqueId();
+      std::unique_ptr<spv::Instruction> recording_atomic = std::make_unique<spv::Instruction>(
+          recording_load, type_uint_, spv::OpAtomicLoad);
+      recording_atomic->addIdOperand(header_pointer(DiagnosticBuffer::kRecordingEnabledMember));
+      recording_atomic->addIdOperand(builder_->makeUintConstant(1));  // Device scope.
+      recording_atomic->addIdOperand(builder_->makeUintConstant(0));  // Relaxed semantics.
+      builder_->getBuildPoint()->addInstruction(std::move(recording_atomic));
+      const spv::Id armed = builder_->createBinOp(
+          spv::OpINotEqual, type_bool_,
+          builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, recording_load,
+                                builder_->makeUintConstant(1)),
+          const_uint_0_);
+      SpirvBuilder::IfBuilder capture_if(armed, spv::SelectionControlMaskNone, *builder_);
+      const spv::Id record_index = atomic_header(DiagnosticBuffer::kCountMember,
+                                                 spv::OpAtomicIAdd,
+                                                 builder_->makeUintConstant(1));
+      const spv::Id in_capacity = builder_->createBinOp(
+          spv::OpULessThan, type_bool_, record_index,
+          builder_->makeUintConstant(DiagnosticBuffer::kMaxRecords));
+      SpirvBuilder::IfBuilder capacity_if(in_capacity, spv::SelectionControlMaskNone, *builder_);
+
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeIntConstant(DiagnosticBuffer::kRecordsMember));
+      id_vector_temp_.push_back(record_index);
+      const spv::Id record_pointer = builder_->createAccessChain(
+          spv::StorageClassStorageBuffer, diagnostic_storage_buffer_, id_vector_temp_);
+      auto store_record_word = [&](uint32_t member, spv::Id value) {
+        builder_->createStore(
+            value, builder_->createAccessChain(
+                       spv::StorageClassStorageBuffer, record_pointer,
+                       std::vector<spv::Id>{builder_->makeIntConstant(int(member))}));
+      };
+      const uint64_t shader_hash = current_shader().ucode_data_hash();
+      store_record_word(0, builder_->makeUintConstant(uint32_t(shader_hash)));
+      store_record_word(1, builder_->makeUintConstant(uint32_t(shader_hash >> 32)));
+      store_record_word(2, builder_->makeUintConstant(UINT32_C(0xFFFFFFFE)));
+      store_record_word(3, builder_->makeUintConstant(
+                              vulkan::diagnostics::kVertexOutputDiagnosticStageMarker));
+      store_record_word(4, builder_->createUnaryOp(
+                               spv::OpBitcast, type_uint_,
+                               builder_->createLoad(input_vertex_index_, spv::NoPrecision)));
+      store_record_word(5, const_uint_0_);
+      store_record_word(6, const_uint_0_);
+      store_record_word(7, const_uint_0_);
+      store_record_word(10, builder_->makeUintConstant(1));
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(
+          builder_->makeIntConstant(kOutputPerVertexMemberPosition));
+      const spv::Id position = builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_, id_vector_temp_),
+          spv::NoPrecision);
+      for (uint32_t component = 0; component < 4; ++component) {
+        const spv::Id float_component =
+            builder_->createCompositeExtract(position, type_float_, component);
+        const spv::Id bits = builder_->createUnaryOp(spv::OpBitcast, type_uint_, float_component);
+        builder_->createStore(
+            bits, builder_->createAccessChain(
+                      spv::StorageClassStorageBuffer, record_pointer,
+                      std::vector<spv::Id>{
+                          builder_->makeIntConstant(11), builder_->makeIntConstant(int(component))}));
+      }
+      for (uint32_t varying = 0; varying < 4; ++varying) {
+        const spv::Id interpolator = input_output_interpolators_[varying];
+        const spv::Id value = interpolator == spv::NoResult
+                                  ? const_float4_0_
+                                  : builder_->createLoad(interpolator, spv::NoPrecision);
+        for (uint32_t component = 0; component < 4; ++component) {
+          const spv::Id float_component =
+              builder_->createCompositeExtract(value, type_float_, component);
+          const spv::Id bits =
+              builder_->createUnaryOp(spv::OpBitcast, type_uint_, float_component);
+          builder_->createStore(
+              bits, builder_->createAccessChain(
+                        spv::StorageClassStorageBuffer, record_pointer,
+                        std::vector<spv::Id>{builder_->makeIntConstant(int(13 + varying)),
+                                             builder_->makeIntConstant(int(component))}));
+        }
+      }
+      if (var_main_diagnostic_vertex_fetch_inputs_[0] != spv::NoResult) {
+        for (uint32_t input = 0; input < var_main_diagnostic_vertex_fetch_inputs_.size(); ++input) {
+          const spv::Id value = builder_->createLoad(
+              builder_->createAccessChain(
+                  spv::StorageClassFunction, var_main_diagnostic_vertex_fetch_inputs_[0],
+                  std::vector<spv::Id>{builder_->makeIntConstant(int(input))}),
+              spv::NoPrecision);
+          for (uint32_t component = 0; component < 4; ++component) {
+            const spv::Id float_component =
+                builder_->createCompositeExtract(value, type_float_, component);
+            const spv::Id bits =
+                builder_->createUnaryOp(spv::OpBitcast, type_uint_, float_component);
+            builder_->createStore(
+                bits, builder_->createAccessChain(
+                          spv::StorageClassStorageBuffer, record_pointer,
+                          std::vector<spv::Id>{builder_->makeIntConstant(int(17 + input)),
+                                               builder_->makeIntConstant(int(component))}));
+          }
+        }
+      }
+      atomic_header(DiagnosticBuffer::kValidMember, spv::OpAtomicOr,
+                    builder_->makeUintConstant(1));
+      capacity_if.makeBeginElse();
+      atomic_header(DiagnosticBuffer::kOverflowMember, spv::OpAtomicOr,
+                    builder_->makeUintConstant(1));
+      capacity_if.makeEndIf();
+      capture_if.makeEndIf();
+    }
   } else if (is_pixel_shader()) {
     CompleteFragmentShaderInMain();
   }
@@ -1256,6 +1509,30 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
   module_bytes.insert(module_bytes.cend(), reinterpret_cast<const uint8_t*>(module_uints.data()),
                       reinterpret_cast<const uint8_t*>(module_uints.data()) +
                           sizeof(unsigned int) * module_uints.size());
+  const Modification modification = GetSpirvShaderModification();
+  if (is_pixel_shader() && vulkan::diagnostics::QuadPartnerMarkerEnabled() &&
+      vulkan::diagnostics::IsQuadPartnerMarkerShader(current_shader().ucode_data_hash())) {
+    const std::string path = fmt::format(
+        "/Users/Kushal/Projects/cosmicR/out/quad-partner-experiment-20261026/runtime/"
+        "shader_{:016X}_mod_{:016X}.spv", current_shader().ucode_data_hash(), modification.value);
+    FILE* marker_spirv = fopen(path.c_str(), "wb");
+    if (marker_spirv) {
+      fwrite(module_bytes.data(), sizeof(uint8_t), module_bytes.size(), marker_spirv);
+      fclose(marker_spirv);
+    }
+  }
+  if (is_pixel_shader() && modification.pixel.diagnostic_storage_version == 10 &&
+      current_shader().ucode_data_hash() == UINT64_C(0x79A3448304FA0D22)) {
+    // Keep the exact diagnostic variant used by the runtime capture so the
+    // derivative operand ordering and interpolation probes can be disassembled.
+    FILE* diagnostic_spirv = fopen(
+        "/Users/Kushal/Projects/cosmicR/out/face-shoulder-eye-audit-20261023/head-gradient-diagnostic.spv",
+        "wb");
+    if (diagnostic_spirv) {
+      fwrite(module_bytes.data(), sizeof(uint8_t), module_bytes.size(), diagnostic_spirv);
+      fclose(diagnostic_spirv);
+    }
+  }
   return module_bytes;
 }
 
@@ -1653,6 +1930,7 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
     input_primitive_id_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
                                                    type_int_, "gl_PrimitiveID");
     builder_->addDecoration(input_primitive_id_, spv::DecorationBuiltIn, spv::BuiltInPrimitiveId);
+    builder_->addDecoration(input_primitive_id_, spv::DecorationFlat);
     main_interface_.push_back(input_primitive_id_);
     input_tess_coord_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
                                                  type_float3_, "gl_TessCoord");
@@ -2875,6 +3153,21 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
       }
     }
 
+  // Keep the actual primitive identity for the bounded head-gradient audit.
+  // This lets the capture join fragment records to the indexed triangle,
+  // instead of assigning ownership from UV proximity.
+  if (diagnostic_storage_buffer_ != spv::NoResult &&
+      shader_modification.pixel.diagnostic_storage_version == 10 &&
+      current_shader().ucode_data_hash() == UINT64_C(0x79A3448304FA0D22)) {
+    builder_->addCapability(spv::CapabilityGeometry);
+    builder_->addCapability(spv::CapabilityInterpolationFunction);
+    input_primitive_id_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
+                                                   type_int_, "gl_PrimitiveID");
+    builder_->addDecoration(input_primitive_id_, spv::DecorationBuiltIn, spv::BuiltInPrimitiveId);
+    builder_->addDecoration(input_primitive_id_, spv::DecorationFlat);
+    main_interface_.push_back(input_primitive_id_);
+  }
+
     // Point coordinate input.
     if (shader_modification.pixel.param_gen_point) {
       if (param_gen_needed) {
@@ -2904,7 +3197,12 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   bool memexport_resolution_scaled = current_shader().memexport_eM_written() &&
                                      (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1);
   if (edram_fragment_shader_interlock_ || param_gen_needed || memexport_resolution_scaled ||
-      float24_depth_from_fragment_coordinates || alpha_to_coverage_possible) {
+      float24_depth_from_fragment_coordinates || alpha_to_coverage_possible ||
+      (diagnostic_storage_buffer_ != spv::NoResult && is_pixel_shader() &&
+       (current_shader().ucode_data_hash() == UINT64_C(0x79A3448304FA0D22) ||
+        current_shader().ucode_data_hash() == UINT64_C(0x2D4C010D3D75DEA5) ||
+        current_shader().ucode_data_hash() == UINT64_C(0x3EB44C3A6D2D267B) ||
+        GetSpirvShaderModification().pixel.diagnostic_storage_version >= 9))) {
     input_fragment_coordinates_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
                                                            type_float4_, "gl_FragCoord");
     builder_->addDecoration(input_fragment_coordinates_, spv::DecorationBuiltIn,
@@ -2922,8 +3220,15 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   }
 
   // Sample mask input.
+  const bool diagnostic_sample_mask_input =
+      diagnostic_storage_buffer_ != spv::NoResult &&
+      GetSpirvShaderModification().pixel.diagnostic_storage_version >= 10 &&
+      GetSpirvShaderModification().pixel.diagnostic_storage_version != 14 &&
+      current_shader().ucode_data_hash() == vulkan::diagnostics::kFragmentDiagnosticPixelHash &&
+      features_.sample_rate_shading;
   if (edram_fragment_shader_interlock_ || IsSampleRate() ||
-      (alpha_to_coverage_possible && features_.sample_rate_shading)) {
+      (alpha_to_coverage_possible && features_.sample_rate_shading) ||
+      diagnostic_sample_mask_input) {
     // SampleMask depends on SampleRateShading in some SPIR-V revisions.
     builder_->addCapability(spv::CapabilitySampleRateShading);
   }
@@ -2934,7 +3239,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
     builder_->addDecoration(input_sample_id_, spv::DecorationBuiltIn, spv::BuiltInSampleId);
     main_interface_.push_back(input_sample_id_);
   }
-  if (edram_fragment_shader_interlock_) {
+  if (edram_fragment_shader_interlock_ || diagnostic_sample_mask_input) {
     input_sample_mask_ = builder_->createVariable(
         spv::NoPrecision, spv::StorageClassInput,
         builder_->makeArrayType(type_int_, builder_->makeUintConstant(1), 0), "gl_SampleMaskIn");
@@ -2991,6 +3296,131 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
 }
 
 void SpirvShaderTranslator::StartFragmentShaderInMain() {
+  const uint32_t diagnostic_storage_version =
+      GetSpirvShaderModification().pixel.diagnostic_storage_version;
+  const uint64_t shader_hash = current_shader().ucode_data_hash();
+  const bool is_diagnostic_candidate =
+      vulkan::diagnostics::IsFragmentDiagnosticInstrumentedShader(shader_hash);
+  if (diagnostic_storage_buffer_ != spv::NoResult && is_pixel_shader() &&
+      diagnostic_storage_version != 12 && diagnostic_storage_version != 14 &&
+      (is_diagnostic_candidate ||
+       diagnostic_storage_version >= 9)) {
+    // Diagnostic flags: bit 0 arms, bit 1 witnesses, bit 2 enables triples,
+    // bit 3 filters to candidate ROI, and bit 4 records final RT0 output.
+    const std::vector<spv::Id> enabled_indices{builder_->makeIntConstant(4)};
+    const spv::Id enabled_ptr = builder_->createAccessChain(
+        spv::StorageClassStorageBuffer, diagnostic_storage_buffer_, enabled_indices);
+    const spv::Id enabled_id = builder_->getUniqueId();
+    std::unique_ptr<spv::Instruction> enabled_load = std::make_unique<spv::Instruction>(
+        enabled_id, type_uint_, spv::OpAtomicLoad);
+    enabled_load->addIdOperand(enabled_ptr);
+    enabled_load->addIdOperand(builder_->makeUintConstant(1));  // Device scope.
+    enabled_load->addIdOperand(builder_->makeUintConstant(0));  // Relaxed semantics.
+    builder_->getBuildPoint()->addInstruction(std::move(enabled_load));
+    const spv::Id enabled = enabled_id;
+    const spv::Id enabled_bool =
+        builder_->createBinOp(spv::OpINotEqual, type_bool_, enabled, const_uint_0_);
+    SpirvBuilder::IfBuilder invocation_if(enabled_bool, spv::SelectionControlMaskNone, *builder_);
+    auto atomic_header = [&](uint32_t member, spv::Op opcode, spv::Id value) {
+      // Revision 13 retains the load, calculations and branches while omitting
+      // the entry updates. Revision 12 omits the entire entry block above.
+      if (diagnostic_storage_version == 13) return;
+      const std::vector<spv::Id> indices{builder_->makeIntConstant(int(member))};
+      const spv::Id pointer = builder_->createAccessChain(spv::StorageClassStorageBuffer,
+                                                          diagnostic_storage_buffer_, indices);
+      std::unique_ptr<spv::Instruction> atomic =
+          std::make_unique<spv::Instruction>(builder_->getUniqueId(), type_uint_, opcode);
+      atomic->addIdOperand(pointer);
+      atomic->addIdOperand(builder_->makeUintConstant(1));  // Device scope.
+      atomic->addIdOperand(builder_->makeUintConstant(0));  // Relaxed semantics.
+      atomic->addIdOperand(value);
+      builder_->getBuildPoint()->addInstruction(std::move(atomic));
+    };
+    atomic_header(vulkan::VulkanDiagnosticStorageBuffer::kRecordingEnabledMember, spv::OpAtomicOr,
+                  builder_->makeUintConstant(2));  // Invocation witness.
+    if (diagnostic_storage_version >= 6) {
+      assert_true(input_fragment_coordinates_ != spv::NoResult);
+      spv::Id fragment_xy[2];
+      for (uint32_t component = 0; component < 2; ++component) {
+        const spv::Id position = builder_->createLoad(
+            builder_->createAccessChain(
+                spv::StorageClassInput, input_fragment_coordinates_,
+                std::vector<spv::Id>{builder_->makeIntConstant(int(component))}),
+            spv::NoPrecision);
+        fragment_xy[component] = builder_->createUnaryOp(spv::OpConvertFToU, type_uint_, position);
+      }
+      using DiagnosticBuffer = vulkan::VulkanDiagnosticStorageBuffer;
+      atomic_header(DiagnosticBuffer::kEntryInvocationCountMember, spv::OpAtomicIAdd,
+                    builder_->makeUintConstant(1));
+      atomic_header(DiagnosticBuffer::kEntryMinXMember, spv::OpAtomicUMin, fragment_xy[0]);
+      atomic_header(DiagnosticBuffer::kEntryMinYMember, spv::OpAtomicUMin, fragment_xy[1]);
+      atomic_header(DiagnosticBuffer::kEntryMaxXMember, spv::OpAtomicUMax, fragment_xy[0]);
+      atomic_header(DiagnosticBuffer::kEntryMaxYMember, spv::OpAtomicUMax, fragment_xy[1]);
+      atomic_header(DiagnosticBuffer::kValidMember, spv::OpAtomicExchange,
+                    builder_->makeUintConstant(1));
+      const uint32_t roi_min_x_base =
+          diagnostic_storage_version >= 9 ? vulkan::diagnostics::kFragmentDiagnosticLocalCandidateMinX
+                                          : vulkan::diagnostics::kFragmentDiagnosticNoseMinX;
+      const uint32_t roi_max_x_base =
+          diagnostic_storage_version >= 9 ? vulkan::diagnostics::kFragmentDiagnosticLocalCandidateMaxX
+                                          : vulkan::diagnostics::kFragmentDiagnosticNoseMaxX;
+      const uint32_t roi_max_y_base = diagnostic_storage_version >= 9
+                                         ? vulkan::diagnostics::GetFragmentDiagnosticCandidateMaxY(shader_hash)
+                                         : vulkan::diagnostics::kFragmentDiagnosticNoseMaxY;
+      const uint32_t roi_min_y_base = diagnostic_storage_version >= 9
+                                     ? vulkan::diagnostics::GetFragmentDiagnosticCandidateMinY(shader_hash)
+                                     : vulkan::diagnostics::kFragmentDiagnosticNoseMinY;
+      const uint32_t roi_min_x = roi_min_x_base * draw_resolution_scale_x_;
+      const uint32_t roi_max_x = roi_max_x_base * draw_resolution_scale_x_;
+      const uint32_t roi_min_y = roi_min_y_base * draw_resolution_scale_y_;
+      const uint32_t roi_max_y = roi_max_y_base * draw_resolution_scale_y_;
+      const spv::Id in_roi_x = builder_->createBinOp(
+          spv::OpLogicalAnd, type_bool_,
+          builder_->createBinOp(spv::OpUGreaterThanEqual, type_bool_, fragment_xy[0],
+                                builder_->makeUintConstant(roi_min_x)),
+          builder_->createBinOp(spv::OpULessThanEqual, type_bool_, fragment_xy[0],
+                                builder_->makeUintConstant(roi_max_x)));
+      const spv::Id in_roi_y = builder_->createBinOp(
+          spv::OpLogicalAnd, type_bool_,
+          builder_->createBinOp(spv::OpUGreaterThanEqual, type_bool_, fragment_xy[1],
+                                builder_->makeUintConstant(roi_min_y)),
+          builder_->createBinOp(spv::OpULessThanEqual, type_bool_, fragment_xy[1],
+                                builder_->makeUintConstant(roi_max_y)));
+      const spv::Id in_diagnostic_roi =
+          builder_->createBinOp(spv::OpLogicalAnd, type_bool_, in_roi_x, in_roi_y);
+      SpirvBuilder::IfBuilder diagnostic_roi_if(in_diagnostic_roi,
+                                                spv::SelectionControlMaskNone, *builder_);
+      atomic_header(DiagnosticBuffer::kEntryNoseRoiCountMember, spv::OpAtomicIAdd,
+                    builder_->makeUintConstant(1));
+      diagnostic_roi_if.makeEndIf();
+    }
+    invocation_if.makeEndIf();
+  }
+
+  // [DEBUG-face-stage] Keep the guest PS execution intact; retain its actual
+  // texture results for a diagnostic-only output override in the epilogue.
+  face_stage_samples_.fill(spv::NoResult);
+  face_stage_slot0_fetch_index_ = 0;
+  const uint64_t debug_pixel_hash = current_shader().ucode_data_hash();
+  if (vulkan::diagnostics::IsFragmentDiagnosticInstrumentedShader(debug_pixel_hash)) {
+    for (size_t i = 0; i < face_stage_samples_.size(); ++i) {
+      if (i >= 11 && diagnostic_storage_buffer_ == spv::NoResult)
+        continue;
+      face_stage_samples_[i] =
+          builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float4_,
+                                   "debug_face_sample", const_float4_0_);
+    }
+  }
+  if (vulkan::diagnostics::IsQuadPartnerMarkerShader(debug_pixel_hash)) {
+    for (spv::Id& value : quad_partner_values_) {
+      value = builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
+          type_float2_, "quad_partner_value",
+          const_float2_0_);
+    }
+    quad_partner_valid_ = builder_->createVariable(spv::NoPrecision,
+        spv::StorageClassFunction, type_bool_, "quad_partner_valid",
+        builder_->makeBoolConstant(false));
+  }
   // Set up pixel killing from within the translated shader without affecting
   // the control flow (unlike with OpKill), similarly to how pixel killing works
   // on the Xenos, and also keeping a single critical section exit and return
@@ -3184,6 +3614,14 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
                                     id_vector_temp_));
   }
 
+  if (diagnostic_storage_buffer_ != spv::NoResult &&
+      GetSpirvShaderModification().pixel.diagnostic_storage_version == 10 &&
+      current_shader().ucode_data_hash() == UINT64_C(0x79A3448304FA0D22) &&
+      input_output_interpolators_[1] != spv::NoResult) {
+    builder_->createStore(builder_->createLoad(input_output_interpolators_[1], spv::NoPrecision),
+                          face_stage_samples_[38]);
+  }
+
   // Pixel parameters.
   if (param_gen_interpolator != UINT32_MAX) {
     Modification modification = GetSpirvShaderModification();
@@ -3301,6 +3739,38 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
     builder_->createStore(
         param_gen, builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_,
                                                id_vector_temp_));
+  }
+
+  // Capture the exact deferred-lighting guest r0 input and its raw interpolator
+  // source. r0 is normally copied from interpolator 0 above, but pixel parameter
+  // generation may replace it. Keep these diagnostic-only values paired with
+  // the deferred shader's existing per-invocation fetch records.
+  if (diagnostic_storage_buffer_ != spv::NoResult &&
+      current_shader().ucode_data_hash() == UINT64_C(0x3CC2A52F0A5CB063)) {
+    const std::vector<spv::Id> r0_indices{builder_->makeIntConstant(0)};
+    builder_->createStore(
+        builder_->createLoad(builder_->createAccessChain(spv::StorageClassFunction,
+                                                         var_main_registers_, r0_indices),
+                             spv::NoPrecision),
+        face_stage_samples_[22]);
+    if (input_output_interpolators_[0] != spv::NoResult) {
+      builder_->createStore(builder_->createLoad(input_output_interpolators_[0], spv::NoPrecision),
+                            face_stage_samples_[23]);
+    }
+  }
+
+  // Retain the G-buffer guest PS input registers after interpolator/parameter
+  // setup. The corresponding bounded record also stores selected instruction
+  // results, allowing an independent tf4 normal reconstruction check.
+  if (diagnostic_storage_buffer_ != spv::NoResult &&
+      current_shader().ucode_data_hash() == UINT64_C(0xED58716070696DA4)) {
+    for (uint32_t reg = 0; reg < 4; ++reg) {
+      const std::vector<spv::Id> indices{builder_->makeIntConstant(int(reg))};
+      const spv::Id value = builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_, indices),
+          spv::NoPrecision);
+      builder_->createStore(value, face_stage_samples_[30 + reg]);
+    }
   }
 
   if (!edram_fragment_shader_interlock_) {

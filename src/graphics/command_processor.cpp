@@ -37,6 +37,9 @@
 
 REXCVAR_DEFINE_BOOL(vsync, false, "GPU", "Enable vertical sync");
 
+REXCVAR_DEFINE_BOOL(gpu_wait_correlation, false, "GPU",
+                    "Log diagnostic WAIT_REG_MEM, vblank and candidate writes");
+
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
@@ -81,6 +84,12 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics {
+
+FrameCpuTimeline& GetFrameCpuTimeline() {
+  thread_local FrameCpuTimeline timeline;
+  return timeline;
+}
+
 
 using namespace rex::graphics::xenos;
 
@@ -205,6 +214,7 @@ void CommandProcessor::WorkerThreadMain() {
 
   while (worker_running_) {
     while (!pending_fns_.empty()) {
+      FrameCpuTimeline::Scope audit_pending(GetFrameCpuTimeline(), FrameCpuTimeline::Bucket::kPendingFns);
       auto fn = std::move(pending_fns_.front());
       pending_fns_.pop();
       fn();
@@ -213,6 +223,7 @@ void CommandProcessor::WorkerThreadMain() {
     uint32_t write_ptr_index = write_ptr_index_.load();
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
+      FrameCpuTimeline::Scope audit_idle(GetFrameCpuTimeline(), FrameCpuTimeline::Bucket::kRingIdle);
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
@@ -663,6 +674,7 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
 }
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+  FrameCpuTimeline::Scope audit_packet(GetFrameCpuTimeline(), FrameCpuTimeline::Bucket::kPm4);
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
   if (packet == 0) {
@@ -912,10 +924,15 @@ bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32
 
 bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, uint32_t packet,
                                                     uint32_t count) {
+  FrameCpuTimeline::Scope audit_interrupt(GetFrameCpuTimeline(), FrameCpuTimeline::Bucket::kInterrupt);
   SCOPE_profile_cpu_f("gpu");
 
   // generate interrupt from the command stream
   uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
+  if (REXCVAR_GET(gpu_wait_correlation)) {
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    REXGPU_INFO("[WAIT_CORRELATION] event=pm4_interrupt ts_ns={} mask={} counter={}", ns, cpu_mask, counter_);
+  }
   for (int n = 0; n < 6; n++) {
     if (cpu_mask & (1 << n)) {
       if (graphics_system_) {
@@ -928,6 +945,7 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
 
 bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
+  FrameCpuTimeline::Scope audit_swap_packet(GetFrameCpuTimeline(), FrameCpuTimeline::Bucket::kSwapPacket);
   SCOPE_profile_cpu_f("gpu");
 
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
@@ -958,6 +976,10 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
+  if (REXCVAR_GET(gpu_wait_correlation)) {
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    REXGPU_INFO("[WAIT_CORRELATION] event=swap ts_ns={} counter={}", ns, counter_);
+  }
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   ++counter_;
@@ -988,9 +1010,24 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   uint32_t wait = reader->ReadAndSwap<uint32_t>();
 
   bool is_memory = (wait_info & 0x10) != 0;
+  FrameCpuTimeline::Scope audit_wait(GetFrameCpuTimeline(), is_memory
+      ? FrameCpuTimeline::Bucket::kWaitMem : FrameCpuTimeline::Bucket::kWaitReg);
 
+  const bool trace_wait = REXCVAR_GET(gpu_wait_correlation) && is_memory &&
+                          (poll_reg_addr & ~uint32_t(3)) == 0x1fca3004;
+  auto trace_entry = trace_wait ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  uint32_t trace_initial = 0, trace_matched = 0;
+  uint64_t audit_poll_count = 0;
+  struct WaitAudit {
+    FrameCpuTimeline& timeline;
+    bool memory;
+    uint32_t address;
+    uint64_t& polls;
+    ~WaitAudit() { timeline.ObserveWait(memory, address, polls); }
+  } audit_wait_count{GetFrameCpuTimeline(), is_memory, poll_reg_addr, audit_poll_count};
   bool matched = false;
   do {
+    ++audit_poll_count;
     uint32_t value = 0;
     if (is_memory) {
       value =
@@ -999,10 +1036,14 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     } else {
       value = ReadRegisterValue(poll_reg_addr);
       if (poll_reg_addr == XE_GPU_REG_COHER_STATUS_HOST) {
-        MakeCoherent();
+        {
+          FrameCpuTimeline::Scope audit_coherent(GetFrameCpuTimeline(), FrameCpuTimeline::Bucket::kCoherent);
+          MakeCoherent();
+        }
         value = ReadRegisterValue(poll_reg_addr);
       }
     }
+    if (trace_wait && audit_poll_count == 1) trace_initial = value;
     switch (wait_info & 0x7) {
       case 0x0:  // Never.
         matched = false;
@@ -1029,6 +1070,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         matched = true;
         break;
     }
+    if (trace_wait && matched) trace_matched = value;
     if (!matched) {
       // Wait.
       if (wait >= 0x100) {
@@ -1051,6 +1093,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+  if (trace_wait) {
+    auto end = std::chrono::steady_clock::now();
+    auto entry_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(trace_entry.time_since_epoch()).count();
+    auto end_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count();
+    REXGPU_INFO("[WAIT_CORRELATION] event=wait entry_ns={} ts_ns={} counter={} ref={} mask={} cmp={} initial={} final={} polls={}",
+                entry_ns, end_ns, counter_, ref, mask, wait_info & 7, trace_initial, trace_matched, audit_poll_count);
+  }
 
   return true;
 }
@@ -1108,6 +1157,10 @@ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, 
     auto endianness = static_cast<xenos::Endian>(write_addr & 0x3);
     auto addr = write_addr & ~0x3;
     write_data = GpuSwap(write_data, endianness);
+    if (REXCVAR_GET(gpu_wait_correlation) && addr == 0x1fca3004) {
+      auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+      REXGPU_INFO("[WAIT_CORRELATION] event=mem_write ts_ns={} counter={} address={} value={}", ns, counter_, addr, write_data);
+    }
     memory::store(memory_->TranslatePhysical(addr), write_data);
     write_addr += 4;
   }
@@ -1169,6 +1222,10 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       auto endianness = static_cast<xenos::Endian>(write_reg_addr & 0x3);
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
+      if (REXCVAR_GET(gpu_wait_correlation) && write_reg_addr == 0x1fca3004) {
+        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        REXGPU_INFO("[WAIT_CORRELATION] event=cond_write ts_ns={} counter={} address={} value={}", ns, counter_, write_reg_addr, write_data);
+      }
       memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
     } else {
       // Register.
@@ -1214,6 +1271,10 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
+  if (REXCVAR_GET(gpu_wait_correlation) && address == 0x1fca3004) {
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    REXGPU_INFO("[WAIT_CORRELATION] event=event_write_shd ts_ns={} counter={} address={} value={}", ns, counter_, address, data_value);
+  }
   memory::store(memory_->TranslatePhysical(address), data_value);
   return true;
 }
@@ -1241,6 +1302,10 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
       1,                                         // max z
   };
   assert_true(endianness == xenos::Endian::k8in16);
+  if (REXCVAR_GET(gpu_wait_correlation) && uint64_t(address) <= 0x1fca3004 && uint64_t(address) + sizeof(extents) > 0x1fca3004) {
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    REXGPU_INFO("[WAIT_CORRELATION] event=event_write_ext ts_ns={} counter={} address={}", ns, counter_, address);
+  }
   memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
                                      rex::countof(extents));
   return true;

@@ -13,6 +13,7 @@
 
 #include <algorithm>
 
+#include <rex/ui/flags.h>
 #include <rex/ui/immediate_drawer.h>
 
 namespace rex::ui {
@@ -25,8 +26,20 @@ AchievementToastDialog::AchievementToastDialog(ImGuiDrawer* drawer,
 AchievementToastDialog::~AchievementToastDialog() {}
 
 void AchievementToastDialog::Push(const rex::system::AchievementEvent& event) {
+  bool was_empty;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    was_empty = queue_.empty();
+    queue_.push_back({event, std::chrono::steady_clock::now()});
+  }
+  if (was_empty && REXCVAR_GET(present_skip_unchanged_guest_output)) {
+    imgui_drawer()->RequestPaint();
+  }
+}
+
+bool AchievementToastDialog::NeedsPaint() const {
   std::lock_guard<std::mutex> lock(mutex_);
-  queue_.push_back({event, std::chrono::steady_clock::now()});
+  return !queue_.empty();
 }
 
 void AchievementToastDialog::OnDraw(ImGuiIO& io) {

@@ -23,6 +23,16 @@
 #include <system_error>
 
 #include <rex/filesystem.h>
+#include <rex/cvar.h>
+#include <rex/logging.h>
+
+REXCVAR_DEFINE_BOOL(
+    vulkan_moltenvk_async_queue_submits, true, "UI/Vulkan",
+    "Configure MoltenVK for asynchronous queue submits (MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=0)");
+
+REXCVAR_DEFINE_STRING(
+    vulkan_driver, "moltenvk", "UI/Vulkan",
+    "Select active Vulkan driver on macOS ('moltenvk' [default] or 'kosmickrisp')");
 
 namespace rex::ui::vulkan {
 namespace {
@@ -187,6 +197,20 @@ MacOSVulkanRuntimePaths DetectMacOSVulkanRuntimePaths() {
 }
 
 void ConfigureMacOSVulkanEnvironment(const MacOSVulkanRuntimePaths& paths) {
+  const std::string driver_choice = REXCVAR_GET(vulkan_driver);
+  if (driver_choice == "kosmickrisp") {
+    constexpr const char* kKosmicKrispManifest =
+        "/Users/Kushal/Projects/cosmicR/out/kosmickrisp-trial-20261028/trial-icd.json";
+    if (fs::exists(kKosmicKrispManifest)) {
+      setenv("VK_DRIVER_FILES", kKosmicKrispManifest, 1);
+      setenv("VK_ICD_FILENAMES", kKosmicKrispManifest, 1);
+      REXLOG_INFO("Configured Vulkan environment for KosmicKrisp via cvar: {}", kKosmicKrispManifest);
+      return;
+    } else {
+      REXLOG_WARN("KosmicKrisp manifest not found at {}; falling back to MoltenVK", kKosmicKrispManifest);
+    }
+  }
+
   if (!paths.sdk_root.empty()) {
     const char* vulkan_sdk = std::getenv("VULKAN_SDK");
     if (!vulkan_sdk || !vulkan_sdk[0]) {
@@ -207,6 +231,16 @@ void ConfigureMacOSVulkanEnvironment(const MacOSVulkanRuntimePaths& paths) {
       setenv("VK_ICD_FILENAMES", moltenvk_icd.c_str(), 1);
     }
   }
+
+  const char* sync_queue_submits = std::getenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS");
+  if (!sync_queue_submits || !sync_queue_submits[0]) {
+    if (REXCVAR_GET(vulkan_moltenvk_async_queue_submits)) {
+      setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "0", 0);
+    }
+    sync_queue_submits = std::getenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS");
+  }
+  REXLOG_INFO("MoltenVK synchronous queue submits: {}",
+              sync_queue_submits ? sync_queue_submits : "1 (default)");
 }
 
 }  // namespace rex::ui::vulkan

@@ -28,6 +28,13 @@ class DeferredCommandBuffer {
   DeferredCommandBuffer(const VulkanCommandProcessor& command_processor,
                         size_t initial_size_bytes = 1024 * 1024);
 
+  void CmdProfileTimestamp(VkQueryPool pool, uint32_t query) {
+    auto& args = *reinterpret_cast<ArgsProfileTimestamp*>(
+        WriteCommand(Command::kProfileTimestamp, sizeof(ArgsProfileTimestamp)));
+    args.pool = pool;
+    args.query = query;
+  }
+
   void Reset();
   void Execute(VkCommandBuffer command_buffer);
 
@@ -353,6 +360,7 @@ class DeferredCommandBuffer {
 
  private:
   enum class Command {
+    kProfileTimestamp,
     kVkBeginRenderPass,
     kVkBeginQuery,
     kVkBindDescriptorSets,
@@ -499,6 +507,8 @@ class DeferredCommandBuffer {
     uint32_t group_count_y;
     uint32_t group_count_z;
   };
+
+  struct ArgsProfileTimestamp { VkQueryPool pool; uint32_t query; };
 
   struct ArgsVkDraw {
     uint32_t vertex_count;

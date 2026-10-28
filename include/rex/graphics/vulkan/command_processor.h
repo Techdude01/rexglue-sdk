@@ -13,12 +13,15 @@
 #include <array>
 #include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -29,6 +32,9 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
+#include <rex/graphics/vulkan/diagnostic_storage_buffer.h>
+#include <rex/graphics/vulkan/render_target_snapshot_diagnostic.h>
+#include <rex/graphics/vulkan/fragment_diagnostic.h>
 #include <rex/graphics/vulkan/graphics_system.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/primitive_processor.h>
@@ -141,6 +147,27 @@ class VulkanCommandProcessor : public CommandProcessor {
         ->vulkan_device();
   }
 
+  bool diagnostic_storage_enabled() const { return diagnostic_storage_enabled_; }
+  bool diagnostic_storage_vertex_input_dump_mode() const {
+    return diagnostic_storage_vertex_input_dump_mode_;
+  }
+  bool diagnostic_storage_combined_vertex_output_mode() const {
+    return diagnostic_storage_combined_vertex_output_mode_;
+  }
+  bool diagnostic_storage_census_mode() const { return diagnostic_storage_census_mode_; }
+  bool diagnostic_storage_local_overwrite_census_mode() const {
+    return diagnostic_storage_local_overwrite_census_mode_;
+  }
+  bool diagnostic_storage_local_candidate_output_mode() const {
+    return diagnostic_storage_local_candidate_output_mode_;
+  }
+  diagnostics::FragmentDiagnosticShaderTarget diagnostic_storage_shader_target() const {
+    return diagnostic_storage_shader_target_;
+  }
+  uint32_t diagnostic_storage_shader_draw_ordinal() const {
+    return diagnostic_storage_shader_draw_ordinal_;
+  }
+
   bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
                           std::vector<uint32_t>& spirv_out, std::string& error_out) const;
 
@@ -151,7 +178,51 @@ class VulkanCommandProcessor : public CommandProcessor {
     return deferred_command_buffer_;
   }
 
+  DeferredCommandBuffer& prologue_deferred_command_buffer() {
+    assert_true(submission_open_);
+    return prologue_deferred_command_buffer_;
+  }
+
+  void OnSharedMemoryUploadHoisted() {
+    hoisted_uploads_pending_ = true;
+    ++current_frame_shmem_hoist_successes_;
+  }
+
+  void IncrementHoistFallbackCount() {
+    ++current_frame_shmem_hoist_fallbacks_;
+  }
+
+  void IncrementHoistSuccessCount() {
+    ++current_frame_shmem_hoist_successes_;
+  }
+
+  void AddSubmissionReadRange(uint32_t start, uint32_t length) {
+    if (!length) return;
+    submission_read_ranges_.push_back({start, length});
+  }
+
+  bool HasSubmissionReadRange(uint32_t start, uint32_t length) const {
+    if (!length) return false;
+    uint32_t end = start + length;
+    for (const auto& r : submission_read_ranges_) {
+      if (start < r.first + r.second && r.first < end) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   bool submission_open() const { return submission_open_; }
+  bool CanRetainActiveRenderTargetAttachments() const {
+    return in_render_pass_ && !current_dynamic_rendering_is_transfer_ &&
+           current_render_pass_ == VK_NULL_HANDLE &&
+           pending_barriers_.empty() && pending_barriers_buffer_memory_barriers_.empty() &&
+           pending_barriers_image_memory_barriers_.empty() &&
+           !current_pending_barrier_.src_stage_mask && !current_pending_barrier_.dst_stage_mask;
+  }
+  uint32_t BeginTransferProfile();
+  void EndTransferProfile(uint32_t query);
+
   uint64_t GetCurrentSubmission() const {
     return submission_completed_ + uint64_t(submissions_in_flight_fences_.size()) + 1;
   }
@@ -168,6 +239,26 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   uint64_t GetCurrentFrame() const { return frame_current_; }
   uint64_t GetCompletedFrame() const { return frame_completed_; }
+  bool IsFragmentDiagnosticEnabledForFrame(uint64_t frame) const {
+    return diagnostic_storage_enabled_ && frame == diagnostic_storage_frame_ &&
+           diagnostic_storage_resolve_log_count_ < diagnostics::kFragmentDiagnosticMaxCensusDraws;
+  }
+  void NoteFragmentDiagnosticResolveLogged() { ++diagnostic_storage_resolve_log_count_; }
+  uint64_t GetFragmentDiagnosticLastVertexHash() const {
+    return diagnostic_storage_last_vertex_hash_;
+  }
+  uint64_t GetFragmentDiagnosticLastPixelHash() const { return diagnostic_storage_last_pixel_hash_; }
+  uint32_t GetFragmentDiagnosticLastDrawOrdinal() const {
+    return diagnostic_storage_last_draw_ordinal_;
+  }
+
+  enum class BarrierRequester : uint8_t {
+    kSharedMemory,
+    kTextureCache,
+    kRenderTargetCache,
+    kPrimitiveProcessor,
+    kOther,
+  };
 
   // Submission must be open to insert barriers. If no pipeline stages access
   // the resource in a synchronization scope, the stage masks should be 0 (top /
@@ -179,7 +270,8 @@ class VulkanCommandProcessor : public CommandProcessor {
                                VkAccessFlags dst_access_mask,
                                uint32_t src_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
                                uint32_t dst_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
-                               bool skip_if_equal = true);
+                               bool skip_if_equal = true,
+                               BarrierRequester requester = BarrierRequester::kOther);
   bool PushImageMemoryBarrier(VkImage image, const VkImageSubresourceRange& subresource_range,
                               VkPipelineStageFlags src_stage_mask,
                               VkPipelineStageFlags dst_stage_mask, VkAccessFlags src_access_mask,
@@ -187,7 +279,8 @@ class VulkanCommandProcessor : public CommandProcessor {
                               VkImageLayout new_layout,
                               uint32_t src_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
                               uint32_t dst_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
-                              bool skip_if_equal = true);
+                              bool skip_if_equal = true,
+                              BarrierRequester requester = BarrierRequester::kOther);
   // Returns whether any barriers have been submitted - if true is returned, the
   // render pass will also be closed.
   bool SubmitBarriers(bool force_end_render_pass);
@@ -513,6 +606,52 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   bool device_lost_ = false;
 
+  void LogFragmentDiagnostic(std::string_view message);
+  void LogFragmentDiagnosticOutcome(uint64_t frame, uint64_t vertex_hash, uint64_t pixel_hash,
+                                    uint32_t draw, std::string_view status, uint32_t count,
+                                    bool overflow, std::string_view error);
+
+  // Startup-gated host ownership and per-draw diagnostic capture evidence.
+  bool diagnostic_storage_gate_latched_ = false;
+  bool diagnostic_storage_enabled_ = false;
+  bool diagnostic_storage_census_mode_ = false;
+  bool diagnostic_storage_overwrite_census_mode_ = false;
+  bool diagnostic_storage_local_overwrite_census_mode_ = false;
+  bool diagnostic_storage_local_overwrite_tracking_started_ = false;
+  bool diagnostic_storage_local_candidate_triples_mode_ = false;
+  bool diagnostic_storage_local_candidate_output_mode_ = false;
+  bool diagnostic_storage_vertex_input_dump_mode_ = false;
+  bool diagnostic_storage_ben_occlusion_mode_ = false;
+  bool diagnostic_storage_combined_vertex_output_mode_ = false;
+  diagnostics::FragmentDiagnosticShaderTarget diagnostic_storage_shader_target_ =
+      diagnostics::FragmentDiagnosticShaderTarget::kHead;
+  uint32_t diagnostic_storage_shader_draw_ordinal_ = 0;
+  bool diagnostic_snapshot_gate_latched_ = false;
+  bool diagnostic_snapshot_enabled_ = false;
+  bool diagnostic_snapshot_head_draw_seen_ = false;
+  uint64_t diagnostic_snapshot_ordinal_frame_ = 0;
+  uint32_t diagnostic_snapshot_draw_ordinal_ = 0;
+  diagnostics::RenderTargetSnapshotRequest diagnostic_snapshot_request_{};
+  bool diagnostic_vertex_output_frame_captured_[3] = {false, false, false};
+  uint32_t diagnostic_vertex_input_dump_serial_ = 0;
+  diagnostics::FragmentDiagnosticTf14FilterMode diagnostic_storage_tf14_filter_mode_ =
+      diagnostics::FragmentDiagnosticTf14FilterMode::kDefault;
+  diagnostics::FragmentDiagnosticTf0MipFilterMode diagnostic_storage_tf0_mip_filter_mode_ =
+      diagnostics::FragmentDiagnosticTf0MipFilterMode::kDefault;
+  bool diagnostic_storage_attempt_consumed_ = false;
+  bool diagnostic_storage_census_limit_logged_ = false;
+  bool diagnostic_storage_first_pixel_hash_logged_ = false;
+  uint32_t diagnostic_storage_census_draw_count_ = 0;
+  uint32_t diagnostic_storage_resolve_log_count_ = 0;
+  uint64_t diagnostic_storage_session_ = 0;
+  uint64_t diagnostic_storage_frame_ = diagnostics::kDefaultFragmentDiagnosticFrame;
+  uint64_t diagnostic_storage_last_vertex_hash_ = 0;
+  uint64_t diagnostic_storage_last_pixel_hash_ = 0;
+  uint32_t diagnostic_storage_last_draw_ordinal_ = 0;
+  diagnostics::FragmentDiagnosticDrawLog diagnostic_storage_draw_log_;
+  std::vector<VulkanDiagnosticStorageBuffer::Record> diagnostic_storage_records_;
+  std::unique_ptr<VulkanDiagnosticStorageBuffer> diagnostic_storage_buffer_;
+
   bool cache_clear_requested_ = false;
 
   // Host shader types that guest shaders can be translated into - they can
@@ -556,6 +695,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<CommandBuffer> command_buffers_writable_;
   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
   DeferredCommandBuffer deferred_command_buffer_;
+  DeferredCommandBuffer prologue_deferred_command_buffer_;
+  bool hoisted_uploads_pending_ = false;
+  std::vector<std::pair<uint32_t, uint32_t>> submission_read_ranges_;
+  uint64_t current_frame_shmem_hoist_fallbacks_ = 0;
+  uint64_t current_frame_shmem_hoist_successes_ = 0;
 
   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
   std::vector<SparseBufferBind> sparse_buffer_binds_;
@@ -798,8 +942,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkRenderPass current_render_pass_;
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
   bool in_render_pass_ = false;
+  bool current_dynamic_rendering_is_transfer_ = false;
+  bool current_dynamic_rendering_has_depth_ = false;
   bool current_dynamic_rendering_has_stencil_ = false;
   uint32_t current_dynamic_rendering_color_count_ = 0;
+  VkImageView current_dynamic_rendering_transfer_dest_view_ = VK_NULL_HANDLE;
+  VulkanRenderTargetCache::RenderPassKey current_dynamic_rendering_render_pass_key_ = {};
+  VkRect2D current_dynamic_rendering_area_ = {};
 
   // Currently bound graphics pipeline, either from the pipeline cache (with
   // potentially deferred creation - current_external_graphics_pipeline_ is
@@ -812,10 +961,8 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   // Pipeline layout of the current guest graphics pipeline.
   const PipelineLayout* current_guest_graphics_pipeline_layout_;
-  VkDescriptorBufferInfo
-      current_constant_buffer_infos_[SpirvShaderTranslator::kConstantBufferCount];
-  // Whether up-to-date data has been written to constant (uniform) buffers, and
-  // the buffer infos in current_constant_buffer_infos_ point to them.
+  // Whether up-to-date data has been written to the constant (uniform) buffers
+  // in the Set 1 constant ring buffer for the current draw.
   uint32_t current_constant_buffers_up_to_date_;
   VkDescriptorSet current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetCount];
   // Whether descriptor sets in current_graphics_descriptor_sets_ point to
@@ -864,21 +1011,32 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkDeviceSize bound_index_buffer_offset_ = 0;
   VkIndexType bound_index_type_ = VK_INDEX_TYPE_MAX_ENUM;
 
-  // Dynamic uniform buffer descriptor set and offsets for Set 1 (constants - Pillar 7).
-  VkDescriptorPool dynamic_constants_descriptor_pool_ = VK_NULL_HANDLE;
-  struct DynamicConstantsDescriptorSet {
-    VkBuffer buffer = VK_NULL_HANDLE;
-    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
-  };
-  std::vector<DynamicConstantsDescriptorSet> dynamic_constants_descriptor_sets_;
+  // Persistent ring buffer for Set 1 constants (Pillar 7).
+  // Every constant range shares one VkBuffer handle, so a dynamic offset can
+  // never be applied to a different buffer than the one it was written into.
+  // Transient upload pool slabs could roll over mid-frame and desynchronize
+  // the ranges, which made textured UI content drop out for a single frame.
+  static constexpr size_t kConstantRingFramePartitionSize = 16 * 1024 * 1024;
+  static constexpr size_t kConstantRingBufferSize =
+      kConstantRingFramePartitionSize * kMaxFramesInFlight;
+  VkBuffer constant_ring_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory constant_ring_buffer_memory_ = VK_NULL_HANDLE;
+  uint8_t* constant_ring_mapping_ = nullptr;
+  uint32_t constant_ring_upload_memory_type_ = 0;
+  VkDeviceSize constant_ring_upload_memory_size_ = 0;
+  size_t constant_ring_offset_ = 0;
+  uint32_t constant_ring_frame_index_ = 0;
+  size_t constant_ring_frame_base_ = 0;
+
+  VkDescriptorPool constant_descriptor_pool_ = VK_NULL_HANDLE;
+  // One pre-written descriptor set per frame in flight, allocated in
+  // SetupContext and never updated again.
+  std::array<VkDescriptorSet, kMaxFramesInFlight> constant_descriptor_sets_{};
   std::array<uint32_t, SpirvShaderTranslator::kConstantBufferCount>
       current_constant_buffer_dynamic_offsets_{};
   std::array<uint32_t, SpirvShaderTranslator::kConstantBufferCount>
       last_bound_constant_buffer_dynamic_offsets_{};
-  VkBuffer current_constant_buffer_handle_ = VK_NULL_HANDLE;
-  VkBuffer last_bound_constant_buffer_handle_ = VK_NULL_HANDLE;
 
-  VkDescriptorSet GetOrCreateDynamicConstantsDescriptorSet(VkBuffer buffer);
 
   // Lock-free cache of verified resident shared memory ranges (Pillar 8).
   std::array<std::pair<uint32_t, uint32_t>, 16> validated_shared_memory_ranges_{};
@@ -900,6 +1058,21 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint64_t fence_wait_count = 0;
     std::chrono::nanoseconds time_fence_waits{0};
     std::chrono::nanoseconds time_draw_total{0};
+    std::chrono::nanoseconds time_exec_submit{0};
+    std::chrono::nanoseconds time_copy{0};
+    std::chrono::nanoseconds time_swap_pre{0};
+    std::chrono::nanoseconds time_occlusion_wait{0}, time_memexport_wait{0};
+    uint64_t occlusion_wait_count = 0, memexport_wait_count = 0;
+    std::chrono::nanoseconds time_pre_wall_fence{0};
+    uint64_t submit_count = 0;
+    uint64_t copy_count = 0;
+    uint64_t pre_wall_fence_count = 0;
+    uint64_t break_transfer = 0, break_framebuffer = 0, break_depth = 0;
+    uint64_t break_stencil = 0, break_color = 0, break_clear = 0, break_area = 0;
+    uint64_t break_growth_only = 0, break_growth_framebuffer = 0, break_framebuffer_only = 0;
+    uint64_t retained_depth_only_draws = 0;
+    uint64_t transfer_guest_scope_reuses = 0;
+    uint64_t break_barrier = 0, break_force = 0, break_submission = 0;
 
     void Reset() {
       draw_count = 0;
@@ -913,8 +1086,193 @@ class VulkanCommandProcessor : public CommandProcessor {
       fence_wait_count = 0;
       time_fence_waits = std::chrono::nanoseconds{0};
       time_draw_total = std::chrono::nanoseconds{0};
+      time_exec_submit = time_copy = time_swap_pre = time_pre_wall_fence = std::chrono::nanoseconds{0};
+      time_occlusion_wait = time_memexport_wait = std::chrono::nanoseconds{0};
+      occlusion_wait_count = memexport_wait_count = 0;
+      submit_count = copy_count = pre_wall_fence_count = 0;
+      break_transfer = break_framebuffer = break_depth = break_stencil = 0;
+      break_color = break_clear = break_area = break_barrier = break_force = break_submission = 0;
+      break_growth_only = break_growth_framebuffer = break_framebuffer_only = 0;
+      retained_depth_only_draws = 0;
+      transfer_guest_scope_reuses = 0;
     }
   } frame_cpu_profiling_stats_;
+
+  // Frame-time and workload audit instrumentation (docs/fps-frame-time-audit-plan.md).
+  struct FrameWorkCounters {
+    uint32_t resolve_attempts = 0;
+    uint32_t resolve_successes = 0;
+    uint32_t resolve_empty_or_noop = 0;
+    uint64_t resolve_bytes = 0;
+    uint32_t color_clears = 0;
+    uint32_t depth_clears = 0;
+    uint32_t attachment_clear_promotions = 0;
+    uint32_t edram_dumps = 0;
+    uint64_t edram_dump_bytes = 0;
+
+    void Reset() {
+      *this = FrameWorkCounters{};
+    }
+  } frame_work_counters_;
+
+  struct FramePassStats {
+    uint32_t pass_count = 0;
+    uint32_t main_pass_count = 0;
+    uint32_t transfer_pass_count = 0;
+    uint64_t main_render_area_pixels = 0;
+    uint64_t main_full_area_pixels = 0;
+    uint32_t bounded_main_pass_count = 0;
+    uint32_t draws_with_depth = 0;
+    uint32_t draws_color_only = 0;
+    uint32_t draws_memexport = 0;
+
+    void Reset() {
+      *this = FramePassStats{};
+    }
+  } frame_pass_stats_;
+
+  std::chrono::steady_clock::time_point frame_start_time_{};
+  std::chrono::steady_clock::time_point audit_swap_start_{};
+  std::chrono::steady_clock::time_point previous_swap_time_{};
+  double frame_swap_interval_ms_ = 0.0;
+
+  // Interval accumulator for periodic P10 CPU profile logging.
+  struct IntervalCpuProfilingStats {
+    uint64_t frame_count = 0;
+    uint64_t total_draw_count = 0;
+    uint64_t total_fence_wait_count = 0;
+    std::chrono::nanoseconds time_fence_waits{0};
+
+    void Reset() {
+      *this = IntervalCpuProfilingStats{};
+    }
+  } interval_cpu_profiling_stats_;
+
+  bool ShouldProfileFrameDraws(uint64_t frame) const;
+  void RecordFrameAuditRow(uint64_t frame, double wall_ms);
+
+  // Step 1: GPU timing resources and helper thread
+  static constexpr uint32_t kMaxTimestampFramesInFlight = 16;
+  static constexpr uint32_t kMaxQueriesPerFrameSlot = 16;
+  static constexpr uint32_t kTotalTimestampQueries = kMaxTimestampFramesInFlight * kMaxQueriesPerFrameSlot;
+
+  static constexpr uint32_t kTransferQueriesPerFrame = 1024;
+  VkQueryPool transfer_profile_pool_ = VK_NULL_HANDLE;
+  uint32_t transfer_profile_counts_[kMaxTimestampFramesInFlight] = {};
+  uint32_t transfer_profile_reset_count_ = 0;
+  VkQueryPool timestamp_query_pool_ = VK_NULL_HANDLE;
+  float timestamp_period_ns_ = 1.0f;
+  uint32_t timestamp_valid_bits_ = 0;
+  uint32_t frame_submission_counts_[kMaxTimestampFramesInFlight] = {};
+
+  bool InitializeGpuTimingResources();
+  void ShutdownGpuTimingResources();
+
+  class GpuCompletionTracker {
+   public:
+    void Start(VkDevice device, const ui::vulkan::VulkanDevice::Functions* dfn);
+    void Stop();
+    void TrackFrameClosingFence(uint64_t frame, VkFence fence);
+    bool GetCompletionInterval(uint64_t frame, double* interval_ms);
+
+   private:
+    void Run();
+
+    struct PendingFrame {
+      uint64_t frame = 0;
+      VkFence fence = VK_NULL_HANDLE;
+    };
+
+    VkDevice device_ = VK_NULL_HANDLE;
+    const ui::vulkan::VulkanDevice::Functions* dfn_ = nullptr;
+    std::atomic<bool> running_{false};
+    std::thread thread_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<PendingFrame> pending_fences_;
+    std::unordered_map<uint64_t, double> completed_intervals_;
+    std::chrono::steady_clock::time_point prev_completion_{};
+    bool has_prev_ = false;
+  } gpu_completion_tracker_;
+
+  // Step 2: Barrier attribution tracking
+  std::vector<BarrierRequester> pending_buffer_barrier_requesters_;
+  std::vector<BarrierRequester> pending_image_barrier_requesters_;
+
+  struct BarrierTupleKey {
+    BarrierRequester requester = BarrierRequester::kOther;
+    bool is_image = false;
+    VkAccessFlags src_access = 0;
+    VkAccessFlags dst_access = 0;
+    VkPipelineStageFlags src_stage = 0;
+    VkPipelineStageFlags dst_stage = 0;
+    VkImageLayout old_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout new_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    bool operator==(const BarrierTupleKey& o) const {
+      return requester == o.requester && is_image == o.is_image &&
+             src_access == o.src_access && dst_access == o.dst_access &&
+             src_stage == o.src_stage && dst_stage == o.dst_stage &&
+             old_layout == o.old_layout && new_layout == o.new_layout;
+    }
+  };
+
+  struct BarrierTupleKeyHash {
+    size_t operator()(const BarrierTupleKey& k) const {
+      size_t h = static_cast<size_t>(k.requester);
+      h = (h * 31) ^ (k.is_image ? 1 : 0);
+      h = (h * 31) ^ static_cast<size_t>(k.src_access);
+      h = (h * 31) ^ static_cast<size_t>(k.dst_access);
+      h = (h * 31) ^ static_cast<size_t>(k.src_stage);
+      h = (h * 31) ^ static_cast<size_t>(k.dst_stage);
+      h = (h * 31) ^ static_cast<size_t>(k.old_layout);
+      h = (h * 31) ^ static_cast<size_t>(k.new_layout);
+      return h;
+    }
+  };
+
+  std::unordered_map<BarrierTupleKey, uint64_t, BarrierTupleKeyHash> barrier_tuple_frequency_map_;
+  uint32_t current_frame_barrier_breaks_shmem_ = 0;
+  uint32_t current_frame_barrier_breaks_texture_ = 0;
+  uint32_t current_frame_barrier_breaks_rt_ = 0;
+  uint32_t current_frame_barrier_breaks_prim_ = 0;
+  uint32_t current_frame_barrier_breaks_other_ = 0;
+
+  void RecordBarrierBreakAttribution();
+  void RecordBarrierTuple(BarrierRequester requester, bool is_image,
+                          VkAccessFlags src_access, VkAccessFlags dst_access,
+                          VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage,
+                          VkImageLayout old_layout, VkImageLayout new_layout);
+  void LogTopBarrierTuples();
+
+  // Pending CSV rows for lagged GPU metric reporting
+  struct PendingFrameAuditRow {
+    uint64_t frame = 0;
+    uint64_t closing_submission = 0;
+    uint32_t submission_count = 0;
+    uint32_t transfer_profile_count = 0;
+    double wall_ms = 0.0;
+    FrameCpuProfilingStats cpu_stats;
+    FrameWorkCounters work_counters;
+    FramePassStats pass_stats;
+    double swap_interval_ms = 0.0;
+    std::array<std::chrono::nanoseconds, 18> timeline_durations{};
+    uint64_t timeline_top_key = 0;
+    uint64_t timeline_top_polls = 0;
+    std::array<uint64_t, 2> timeline_wait_counts{};
+    uint64_t timeline_wait_overflow = 0;
+    uint64_t queue_acquire_count = 0;
+    uint32_t break_barrier_shmem = 0;
+    uint32_t break_barrier_texture = 0;
+    uint32_t break_barrier_rt = 0;
+    uint32_t break_barrier_prim = 0;
+    uint32_t break_barrier_other = 0;
+    uint32_t shmem_hoist_fallbacks = 0;
+    uint32_t shmem_hoist_successes = 0;
+  };
+
+  std::deque<PendingFrameAuditRow> pending_audit_rows_;
+  void FlushCompletedAuditRows(bool force);
 };
 
 }  // namespace rex::graphics::vulkan

@@ -21,6 +21,10 @@
 #include <rex/platform.h>
 #include <rex/string.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/flags.h>
+
+REXCVAR_DEFINE_BOOL(vulkan_presenter_dedicated_queue, false, "UI/Vulkan",
+                    "Present on a second graphics-family queue when the device exposes one");
 
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
@@ -480,6 +484,31 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   device->queue_families_[device->queue_family_graphics_compute_].queues.resize(std::max(
       size_t(1), device->queue_families_[device->queue_family_graphics_compute_].queues.size()));
+  device->presenter_queue_index_ = 0;
+  if (REXCVAR_GET(vulkan_presenter_dedicated_queue)) {
+    const uint32_t graphics_family = device->queue_family_graphics_compute_;
+    const uint32_t available_queues = queue_families[graphics_family].queueCount;
+    const bool timeline_semaphore =
+        properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0) &&
+        features_1_2.supported.timelineSemaphore == VK_TRUE;
+    // MoltenVK reports one queue per family (kMVKQueueCountPerQueueFamily = 1)
+    // because a Vulkan queue family maps to one Metal command queue. A second
+    // queue is requested only when this family actually exposes one.
+    if (available_queues >= 2 && timeline_semaphore) {
+      device->queue_families_[graphics_family].queues.resize(2);
+      device->presenter_queue_index_ = 1;
+      features_1_2.enabled.timelineSemaphore = VK_TRUE;
+      REXLOG_INFO(
+          "Vulkan presenter dedicated queue: graphics family {} queue 1 of {}",
+          graphics_family, available_queues);
+    } else {
+      REXLOG_WARN(
+          "Vulkan presenter dedicated queue requested but unavailable "
+          "(graphics family {} queueCount={}, timelineSemaphore={}); "
+          "falling back to queue 0",
+          graphics_family, available_queues, timeline_semaphore ? 1 : 0);
+    }
+  }
   if (device->queue_family_sparse_binding_ != UINT32_MAX) {
     device->queue_families_[device->queue_family_sparse_binding_].queues.resize(std::max(
         size_t(1), device->queue_families_[device->queue_family_sparse_binding_].queues.size()));

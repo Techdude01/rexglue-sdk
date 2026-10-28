@@ -11,12 +11,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <sstream>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -44,6 +48,7 @@
 #include <rex/ui/surface_win.h>
 #endif
 #if REX_PLATFORM_MAC
+#include <pthread.h>
 #include <rex/ui/surface_mac.h>
 #endif
 
@@ -122,6 +127,208 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/guest_output_triangle_strip_rect_vs.h"
 }  // namespace shaders
 
+namespace {
+
+const char* PresentModeName(VkPresentModeKHR mode) {
+  switch (mode) {
+    case VK_PRESENT_MODE_IMMEDIATE_KHR:
+      return "IMMEDIATE";
+    case VK_PRESENT_MODE_MAILBOX_KHR:
+      return "MAILBOX";
+    case VK_PRESENT_MODE_FIFO_KHR:
+      return "FIFO";
+    case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
+      return "FIFO_RELAXED";
+    default:
+      return "OTHER";
+  }
+}
+
+enum class QueueLockSite : size_t {
+  kGuestCapture = 0,
+  kGuestRefresh,
+  kPresenterSubmit,
+  kPresent,
+  kAcquireImage,
+  kCount
+};
+
+struct QueueLockSlot {
+  std::atomic<uint64_t> thread_id{0};
+  std::atomic<uint64_t> hold_ns{0};
+  std::atomic<uint64_t> max_ns{0};
+  std::atomic<uint64_t> count{0};
+  char thread_name[64]{};
+};
+
+struct QueueLockSiteStats {
+  QueueLockSlot slots[2];
+};
+
+QueueLockSiteStats g_queue_lock_sites[static_cast<size_t>(QueueLockSite::kCount)];
+std::atomic<uint64_t> g_queue_lock_present_frames{0};
+std::atomic<uint64_t> g_present_skips{0};
+
+const char* QueueLockSiteName(QueueLockSite site) {
+  switch (site) {
+    case QueueLockSite::kGuestCapture:
+      return "guest_capture";
+    case QueueLockSite::kGuestRefresh:
+      return "guest_refresh";
+    case QueueLockSite::kPresenterSubmit:
+      return "presenter_submit";
+    case QueueLockSite::kPresent:
+      return "present";
+    case QueueLockSite::kAcquireImage:
+      return "acquire_image";
+    default:
+      return "unknown";
+  }
+}
+
+uint64_t HostThreadId() {
+#if REX_PLATFORM_MAC
+  uint64_t tid = 0;
+  pthread_threadid_np(nullptr, &tid);
+  return tid;
+#else
+  return uint64_t(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+#endif
+}
+
+bool QueueLockDiagEnabled() {
+  // 0 = unread, 1 = off, 2 = on. After the first read this is an atomic load.
+  static std::atomic<int> state{0};
+  const int current = state.load(std::memory_order_acquire);
+  if (current != 0) {
+    return current == 2;
+  }
+  const bool enabled = REXCVAR_QUERY(bool, gpu_frame_audit_enable) ||
+                       REXCVAR_QUERY(bool, gpu_frame_timeline_enable);
+  int expected = 0;
+  if (state.compare_exchange_strong(expected, enabled ? 2 : 1, std::memory_order_release)) {
+    auto refresh = [](std::string_view, std::string_view) {
+      const bool now = REXCVAR_QUERY(bool, gpu_frame_audit_enable) ||
+                       REXCVAR_QUERY(bool, gpu_frame_timeline_enable);
+      state.store(now ? 2 : 1, std::memory_order_release);
+    };
+    rex::cvar::RegisterChangeCallback("gpu_frame_audit_enable", refresh);
+    rex::cvar::RegisterChangeCallback("gpu_frame_timeline_enable", refresh);
+  }
+  return state.load(std::memory_order_acquire) == 2;
+}
+
+void RememberQueueThreadName(QueueLockSlot& slot) {
+#if REX_PLATFORM_MAC
+  pthread_getname_np(pthread_self(), slot.thread_name, sizeof(slot.thread_name));
+#else
+  (void)slot;
+#endif
+}
+
+void AccumulateQueueLock(QueueLockSlot& slot, uint64_t hold_ns) {
+  slot.hold_ns.fetch_add(hold_ns, std::memory_order_relaxed);
+  uint64_t previous = slot.max_ns.load(std::memory_order_relaxed);
+  while (hold_ns > previous &&
+         !slot.max_ns.compare_exchange_weak(previous, hold_ns, std::memory_order_relaxed)) {
+  }
+  slot.count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordQueueLockHold(QueueLockSite site, std::chrono::steady_clock::time_point start) {
+  const auto elapsed =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start);
+  const uint64_t hold_ns = elapsed.count() > 0 ? uint64_t(elapsed.count()) : 0;
+  const uint64_t tid = HostThreadId();
+  auto& stats = g_queue_lock_sites[static_cast<size_t>(site)];
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    for (auto& slot : stats.slots) {
+      uint64_t current = slot.thread_id.load(std::memory_order_relaxed);
+      if (current == tid) {
+        AccumulateQueueLock(slot, hold_ns);
+        return;
+      }
+      if (current == 0 &&
+          slot.thread_id.compare_exchange_strong(current, tid, std::memory_order_relaxed)) {
+        RememberQueueThreadName(slot);
+        AccumulateQueueLock(slot, hold_ns);
+        return;
+      }
+    }
+  }
+  AccumulateQueueLock(stats.slots[0], hold_ns);
+}
+
+class QueueLockHold {
+ public:
+  QueueLockHold(QueueLockSite site, bool enabled)
+      : site_(site),
+        enabled_(enabled),
+        start_(enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+  ~QueueLockHold() {
+    if (enabled_) {
+      RecordQueueLockHold(site_, start_);
+    }
+  }
+  QueueLockHold(const QueueLockHold&) = delete;
+  QueueLockHold& operator=(const QueueLockHold&) = delete;
+
+ private:
+  QueueLockSite site_;
+  bool enabled_;
+  std::chrono::steady_clock::time_point start_;
+};
+
+void LogQueueLockSummary() {
+  char logger_name[64] = {};
+#if REX_PLATFORM_MAC
+  pthread_getname_np(pthread_self(), logger_name, sizeof(logger_name));
+#endif
+  std::ostringstream line;
+  line.setf(std::ios::fixed);
+  line.precision(3);
+  line << "[PRESENT_LOCK_AUDIT] presents=" << g_queue_lock_present_frames.load(std::memory_order_relaxed)
+       << " skipped_paints=" << g_present_skips.load(std::memory_order_relaxed)
+       << " logger_thread=" << HostThreadId() << " logger_name=\"" << logger_name << "\"";
+  for (size_t i = 0; i < static_cast<size_t>(QueueLockSite::kCount); ++i) {
+    const char* name = QueueLockSiteName(static_cast<QueueLockSite>(i));
+    const auto& slots = g_queue_lock_sites[i].slots;
+    for (size_t slot_index = 0; slot_index < 2; ++slot_index) {
+      const uint64_t count = slots[slot_index].count.load(std::memory_order_relaxed);
+      if (slot_index > 0 && count == 0) {
+        continue;
+      }
+      const double total_ms = double(slots[slot_index].hold_ns.load(std::memory_order_relaxed)) / 1e6;
+      const double mean_ms = count ? total_ms / double(count) : 0.0;
+      const double max_ms = double(slots[slot_index].max_ns.load(std::memory_order_relaxed)) / 1e6;
+      const char* suffix = slot_index ? "b" : "";
+      line << ' ' << name << suffix << "_mean_ms=" << mean_ms << ' ' << name << suffix
+           << "_max_ms=" << max_ms << ' ' << name << suffix << "_n=" << count << ' ' << name
+           << suffix << "_thread=" << slots[slot_index].thread_id.load(std::memory_order_relaxed)
+           << ' ' << name << suffix << "_thread_name=\"" << slots[slot_index].thread_name << '"';
+    }
+  }
+  REXLOG_INFO("{}", line.str());
+}
+
+void NotePresenterFrame() {
+  const uint64_t frame = g_queue_lock_present_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (frame % 120 == 0) {
+    LogQueueLockSummary();
+  }
+}
+
+struct PresentFrameNote {
+  bool enabled = false;
+  ~PresentFrameNote() {
+    if (enabled) {
+      NotePresenterFrame();
+    }
+  }
+};
+
+}  // namespace
+
 VulkanPresenter::PaintContext::Submission::~Submission() {
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
@@ -191,6 +398,9 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
 }
 
 VulkanPresenter::~VulkanPresenter() {
+  if (QueueLockDiagEnabled() || g_present_skips.load(std::memory_order_relaxed) != 0) {
+    LogQueueLockSummary();
+  }
   // Destroy the swapchain after its images are not used for drawing anymore.
   // This is a confusing part in Vulkan, as vkQueuePresentKHR doesn't signal a
   // fence clearly indicating when it's safe to destroy a swapchain, so we
@@ -214,6 +424,11 @@ VulkanPresenter::~VulkanPresenter() {
 
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
+
+  if (guest_output_cross_queue_semaphore_ != VK_NULL_HANDLE) {
+    dfn.vkDestroySemaphore(device, guest_output_cross_queue_semaphore_, nullptr);
+    guest_output_cross_queue_semaphore_ = VK_NULL_HANDLE;
+  }
 
   if (paint_context_.swapchain_render_pass != VK_NULL_HANDLE) {
     dfn.vkDestroyRenderPass(device, paint_context_.swapchain_render_pass, nullptr);
@@ -610,8 +825,10 @@ bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
       }
       VkResult submit_result;
       {
+        const bool queue_lock_diag = QueueLockDiagEnabled();
         const VulkanDevice::Queue::Acquisition queue_acquisition =
             vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
+        QueueLockHold queue_lock_hold(QueueLockSite::kGuestCapture, queue_lock_diag);
         submit_result =
             dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence_acqusition.fence());
       }
@@ -1052,6 +1269,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   }
 
   is_vsync_implicit_out = paint_context_.swapchain_is_fifo;
+  NoteSwapchainNeedsPresent();
   return SurfacePaintConnectResult::kSuccess;
 }
 
@@ -1120,11 +1338,45 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
   {
     VulkanSubmissionTracker::FenceAcquisition fence_acqusition(
         guest_output_image_refresher_submission_tracker_.AcquireFenceToAdvanceSubmission());
+    const bool queue_lock_diag = QueueLockDiagEnabled();
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
-    if (dfn.vkQueueSubmit(queue_acquisition.queue(), 0, nullptr, fence_acqusition.fence()) !=
-        VK_SUCCESS) {
+    QueueLockHold queue_lock_hold(QueueLockSite::kGuestRefresh, queue_lock_diag);
+    VkResult refresh_submit_result;
+    uint64_t signaled_timeline = 0;
+    if (guest_output_cross_queue_semaphore_ != VK_NULL_HANDLE) {
+      // Empty submit still covers earlier queue-0 submissions, including the
+      // guest-output copy, in the semaphore signal's first sync scope.
+      signaled_timeline = ++guest_output_cross_queue_timeline_next_;
+      VkTimelineSemaphoreSubmitInfo timeline_info = {};
+      timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+      timeline_info.pNext = nullptr;
+      timeline_info.waitSemaphoreValueCount = 0;
+      timeline_info.pWaitSemaphoreValues = nullptr;
+      timeline_info.signalSemaphoreValueCount = 1;
+      timeline_info.pSignalSemaphoreValues = &signaled_timeline;
+      VkSubmitInfo refresh_submit_info = {};
+      refresh_submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+      refresh_submit_info.pNext = &timeline_info;
+      refresh_submit_info.waitSemaphoreCount = 0;
+      refresh_submit_info.pWaitSemaphores = nullptr;
+      refresh_submit_info.pWaitDstStageMask = nullptr;
+      refresh_submit_info.commandBufferCount = 0;
+      refresh_submit_info.pCommandBuffers = nullptr;
+      refresh_submit_info.signalSemaphoreCount = 1;
+      refresh_submit_info.pSignalSemaphores = &guest_output_cross_queue_semaphore_;
+      refresh_submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &refresh_submit_info,
+                                                fence_acqusition.fence());
+    } else {
+      refresh_submit_result =
+          dfn.vkQueueSubmit(queue_acquisition.queue(), 0, nullptr, fence_acqusition.fence());
+    }
+    if (refresh_submit_result != VK_SUCCESS) {
       fence_acqusition.SubmissionSucceededSignalFailed();
+      signaled_timeline = 0;
+    }
+    if (signaled_timeline != 0) {
+      image_instance.cross_queue_timeline_value = signaled_timeline;
     }
   }
 
@@ -1437,10 +1689,16 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   }
   REXLOG_INFO(
       "VulkanPresenter: Created {}x{} swapchain with format {}, color space "
-      "{}, presentation mode {}",
+      "{}, presentation mode {} ({})",
       swapchain_create_info.imageExtent.width, swapchain_create_info.imageExtent.height,
       uint32_t(swapchain_create_info.imageFormat), uint32_t(swapchain_create_info.imageColorSpace),
-      uint32_t(swapchain_create_info.presentMode));
+      uint32_t(swapchain_create_info.presentMode),
+      PresentModeName(swapchain_create_info.presentMode));
+  if (QueueLockDiagEnabled()) {
+    REXLOG_INFO("[QUEUE_LOCK] present_mode={} present_queue_family={} graphics_queue_family={}",
+                PresentModeName(swapchain_create_info.presentMode), queue_family_index_present,
+                vulkan_device->queue_family_graphics_compute());
+  }
 
   present_queue_family_out = queue_family_index_present;
   image_format_out = swapchain_create_info.imageFormat;
@@ -1559,6 +1817,16 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
 }
 
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+  if (ShouldSkipUnchangedGuestOutputPaint(execute_ui_drawers)) {
+    g_present_skips.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<bool> logged_skip{false};
+    if (!logged_skip.exchange(true, std::memory_order_relaxed)) {
+      REXLOG_INFO("[PRESENT_LOCK_AUDIT] skipping unchanged guest output paints");
+    }
+    return PaintResult::kNotPresented;
+  }
+  const bool queue_lock_diag = QueueLockDiagEnabled();
+  PresentFrameNote present_frame_note{queue_lock_diag};
   static std::atomic<uint32_t> visible_present_debug_call{0};
   const char* visible_present_debug_env = std::getenv("COSMIC_PRESENT_DIAGNOSTICS");
   const bool visible_present_debug_enabled =
@@ -1610,9 +1878,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
   uint32_t swapchain_image_index;
-  VkResult acquire_result =
-      dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
-                                VK_NULL_HANDLE, &swapchain_image_index);
+  VkResult acquire_result;
+  {
+    QueueLockHold acquire_image_timer(QueueLockSite::kAcquireImage, queue_lock_diag);
+    acquire_result =
+        dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
+                                  VK_NULL_HANDLE, &swapchain_image_index);
+  }
   switch (acquire_result) {
     case VK_SUCCESS:
     case VK_SUBOPTIMAL_KHR:
@@ -1673,12 +1945,15 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   GuestOutputPaintConfig guest_output_paint_config;
   std::shared_ptr<GuestOutputImage> guest_output_image;
   uint32_t guest_output_mailbox_index = UINT32_MAX;
+  uint64_t guest_output_cross_queue_sync = 0;
   {
     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
         guest_output_mailbox_index, &guest_output_properties, &guest_output_paint_config));
     if (guest_output_mailbox_index != UINT32_MAX) {
       assert_true(guest_output_images_[guest_output_mailbox_index].ever_successfully_refreshed);
       guest_output_image = guest_output_images_[guest_output_mailbox_index].image;
+      guest_output_cross_queue_sync =
+          guest_output_images_[guest_output_mailbox_index].cross_queue_timeline_value;
     }
     // Incremented the reference count of the guest output image - safe to leave
     // the consumer critical section now as everything here either will be using
@@ -2227,6 +2502,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   dfn.vkEndCommandBuffer(draw_command_buffer);
 
   VkPipelineStageFlags acquire_semaphore_wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  const bool wait_for_guest_output =
+      PresenterQueueIndex() != 0 && guest_output_cross_queue_sync != 0;
   VkCommandBuffer command_buffers[2];
   uint32_t command_buffer_count = 0;
   // UI setup command buffers must be accessed only if execute_ui_drawers is not
@@ -2246,12 +2523,28 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   }
   command_buffers[command_buffer_count++] = draw_command_buffer;
   VkSemaphore present_semaphore = paint_submission.present_semaphore();
+  // Same queue family: no ownership transfer. The timeline wait's destination
+  // stage is the fragment shader that samples the guest image, which is the
+  // memory dependency the separate queue no longer gets from submission order.
+  VkSemaphore wait_semaphores[2] = {acquire_semaphore, guest_output_cross_queue_semaphore_};
+  VkPipelineStageFlags wait_stages[2] = {acquire_semaphore_wait_stage,
+                                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT};
+  uint64_t wait_values[2] = {0, guest_output_cross_queue_sync};
+  uint64_t signal_values[1] = {0};
+  const uint32_t wait_semaphore_count = wait_for_guest_output ? 2u : 1u;
+  VkTimelineSemaphoreSubmitInfo timeline_submit_info = {};
+  timeline_submit_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+  timeline_submit_info.pNext = nullptr;
+  timeline_submit_info.waitSemaphoreValueCount = wait_semaphore_count;
+  timeline_submit_info.pWaitSemaphoreValues = wait_values;
+  timeline_submit_info.signalSemaphoreValueCount = 1;
+  timeline_submit_info.pSignalSemaphoreValues = signal_values;
   VkSubmitInfo submit_info;
   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  submit_info.pNext = nullptr;
-  submit_info.waitSemaphoreCount = 1;
-  submit_info.pWaitSemaphores = &acquire_semaphore;
-  submit_info.pWaitDstStageMask = &acquire_semaphore_wait_stage;
+  submit_info.pNext = wait_for_guest_output ? &timeline_submit_info : nullptr;
+  submit_info.waitSemaphoreCount = wait_semaphore_count;
+  submit_info.pWaitSemaphores = wait_semaphores;
+  submit_info.pWaitDstStageMask = wait_stages;
   submit_info.commandBufferCount = command_buffer_count;
   submit_info.pCommandBuffers = command_buffers;
   submit_info.signalSemaphoreCount = 1;
@@ -2267,8 +2560,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     }
     VkResult submit_result;
     {
-      const VulkanDevice::Queue::Acquisition queue_acquisition =
-          vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
+      const VulkanDevice::Queue::Acquisition queue_acquisition = vulkan_device_->AcquireQueue(
+          vulkan_device_->queue_family_graphics_compute(), PresenterQueueIndex());
+      QueueLockHold queue_lock_hold(QueueLockSite::kPresenterSubmit, queue_lock_diag);
       submit_result =
           dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence_acqusition.fence());
       if (ui_fence_acquisition.fence() != VK_NULL_HANDLE && submit_result == VK_SUCCESS) {
@@ -2309,8 +2603,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   present_info.pResults = nullptr;
   VkResult present_result;
   {
+    const uint32_t present_queue_index =
+        paint_context_.present_queue_family == vulkan_device_->queue_family_graphics_compute()
+            ? PresenterQueueIndex()
+            : 0;
     const VulkanDevice::Queue::Acquisition queue_acquisition =
-        vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
+        vulkan_device_->AcquireQueue(paint_context_.present_queue_family, present_queue_index);
+    QueueLockHold queue_lock_hold(QueueLockSite::kPresent, queue_lock_diag);
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
   }
   if (log_visible_present) {
@@ -2327,6 +2626,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       if (pending_destroy != VK_NULL_HANDLE) {
         dfn.vkDestroySwapchainKHR(device, pending_destroy, nullptr);
       }
+      NoteGuestOutputPresented(guest_output_properties.publish_serial);
       return PaintResult::kPresented;
     }
     case VK_SUBOPTIMAL_KHR: {
@@ -2360,6 +2660,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         // cadence above.
         return PaintResult::kNotPresentedConnectionOutdated;
       }
+      NoteGuestOutputPresented(guest_output_properties.publish_serial);
       return PaintResult::kPresentedSuboptimal;
     }
     case VK_ERROR_DEVICE_LOST:
@@ -2387,7 +2688,32 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   }
 }
 
+void VulkanPresenter::CreateGuestOutputCrossQueueSemaphore() {
+  if (vulkan_device_->presenter_queue_index() == 0) {
+    return;
+  }
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  VkSemaphoreTypeCreateInfo type_info = {};
+  type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+  type_info.pNext = nullptr;
+  type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+  type_info.initialValue = 0;
+  VkSemaphoreCreateInfo create_info = {};
+  create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+  create_info.pNext = &type_info;
+  create_info.flags = 0;
+  if (dfn.vkCreateSemaphore(device, &create_info, nullptr, &guest_output_cross_queue_semaphore_) !=
+      VK_SUCCESS) {
+    guest_output_cross_queue_semaphore_ = VK_NULL_HANDLE;
+    REXLOG_WARN(
+        "Vulkan presenter dedicated queue: timeline semaphore creation failed; "
+        "falling back to graphics queue 0");
+  }
+}
+
 bool VulkanPresenter::InitializeSurfaceIndependent() {
+  CreateGuestOutputCrossQueueSemaphore();
   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
   const VkDevice device = vulkan_device_->device();
 

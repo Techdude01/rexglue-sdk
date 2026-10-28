@@ -41,6 +41,9 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
                     "Resolve from host render targets directly to shared memory when possible")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(render_target_retain_color_on_depth_only, false, "GPU",
+                    "Keep compatible accumulated color attachments across depth-only draws");
+
 namespace rex::graphics {
 
 void RenderTargetCache::GetPSIColorFormatInfo(xenos::ColorRenderTargetFormat format,
@@ -701,62 +704,13 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
         (depth_and_color_rts_used_bits & (uint32_t(1) << i)) ? rts[i] : nullptr;
   }
   if (are_accumulated_render_targets_valid_) {
-    // Check if the only re-enabling a previously bound render target.
-    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
-      RenderTarget* current_rt =
-          (depth_and_color_rts_used_bits & (uint32_t(1) << i)) ? rts[i] : nullptr;
-      const RenderTarget* accumulated_rt = last_update_accumulated_render_targets_[i];
-      if (!accumulated_rt) {
-        if (current_rt) {
-          // Binding a totally new render target - won't keep the existing
-          // render pass anyway, no much need to try to re-enable previously
-          // disabled render targets in other slots as well, even though that
-          // would be valid.
-          are_accumulated_render_targets_valid_ = false;
-          break;
-        }
-        // Append the new render target.
-        last_update_accumulated_render_targets_[i] = current_rt;
-        continue;
-      }
-      if (current_rt) {
-        if (current_rt != accumulated_rt) {
-          // Changing a render target in a slot.
-          are_accumulated_render_targets_valid_ = false;
-          break;
-        }
-      } else {
-        // If the current draw has no color render targets bound at all (depth-only pass),
-        // do not keep dummy accumulated color attachments (Pillar 6 TBDR pruning).
-        if (i >= 1 && (depth_and_color_rts_used_bits & ~uint32_t(1)) == 0) {
-          are_accumulated_render_targets_valid_ = false;
-          break;
-        }
-        RenderTargetKey accumulated_rt_key = accumulated_rt->key();
-        if (accumulated_rt_key.pitch_tiles_at_32bpp != pitch_tiles_at_32bpp ||
-            accumulated_rt_key.msaa_samples != msaa_samples) {
-          // The previously bound render target is incompatible with the
-          // current surface info.
-          are_accumulated_render_targets_valid_ = false;
-          break;
-        }
-      }
-    }
-    // Make sure the same render target isn't bound into two different slots
-    // over time.
-    for (uint32_t i = 1;
-         are_accumulated_render_targets_valid_ && i < 1 + xenos::kMaxColorRenderTargets; ++i) {
-      const RenderTarget* render_target = last_update_accumulated_render_targets_[i];
-      if (!render_target) {
-        continue;
-      }
-      for (uint32_t j = 0; j < i; ++j) {
-        if (last_update_accumulated_render_targets_[j] == render_target) {
-          are_accumulated_render_targets_valid_ = false;
-          break;
-        }
-      }
-    }
+    are_accumulated_render_targets_valid_ = CanKeepAccumulatedRenderTargets(
+        last_update_used_render_targets_, last_update_accumulated_render_targets_,
+        pitch_tiles_at_32bpp, msaa_samples,
+        REXCVAR_GET(render_target_retain_color_on_depth_only) &&
+            CanRetainColorAttachmentsForDepthOnlyDraw() &&
+            std::all_of(std::begin(last_update_transfers_), std::end(last_update_transfers_),
+                        [](const auto& transfers) { return transfers.empty(); }));
   }
   if (!are_accumulated_render_targets_valid_) {
     std::memcpy(last_update_accumulated_render_targets_, last_update_used_render_targets_,

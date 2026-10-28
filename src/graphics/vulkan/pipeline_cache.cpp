@@ -41,6 +41,8 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/command_processor.h>
+#include <rex/graphics/vulkan/fragment_diagnostic.h>
+#include <rex/graphics/vulkan/quad_partner_marker.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/vulkan/texture_cache.h>
@@ -970,6 +972,21 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
   SpirvShaderTranslator::Modification modification(
       shader_translator_->GetDefaultPixelShaderModification(
           shader.GetDynamicAddressableRegisterCount(regs.Get<reg::SQ_PROGRAM_CNTL>().ps_num_reg)));
+  const bool local_overwrite_census =
+      command_processor_.diagnostic_storage_local_overwrite_census_mode();
+  const uint64_t shader_hash = shader.ucode_data_hash();
+  const bool is_candidate_shader = diagnostics::IsFragmentDiagnosticInstrumentedShader(shader_hash);
+  modification.pixel.diagnostic_storage_version = diagnostics::GetPixelDiagnosticStorageVersion(
+      command_processor_.diagnostic_storage_enabled(),
+      command_processor_.diagnostic_storage_vertex_input_dump_mode(),
+      command_processor_.diagnostic_storage_combined_vertex_output_mode(), local_overwrite_census,
+      is_candidate_shader, command_processor_.diagnostic_storage_local_candidate_output_mode());
+  if (modification.pixel.diagnostic_storage_version == 10 &&
+      diagnostics::QuadPartnerMarkerEnabled()) {
+    // Gradient-only control: retain the atomics/logging, without the legacy
+    // PrimitiveId, fine-derivative and pull-interpolation probes of revision 10.
+    modification.pixel.diagnostic_storage_version = diagnostics::QuadPartnerDiagnosticRevision();
+  }
 
   modification.pixel.interpolator_mask = interpolator_mask;
   modification.pixel.interpolators_centroid =
@@ -3305,6 +3322,11 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
 
   bool subpass_has_attachments =
       !edram_fragment_shader_interlock && description.render_pass_key.depth_and_color_used != 0;
+  const xenos::MsaaSamples host_msaa =
+      diagnostics::ForceHostSingleSample() &&
+              description.render_pass_key.msaa_samples == xenos::MsaaSamples::k2X
+          ? xenos::MsaaSamples::k1X
+          : description.render_pass_key.msaa_samples;
   VkSampleMask sample_mask = UINT32_MAX;
   VkPipelineMultisampleStateCreateInfo multisample_state = {};
   multisample_state.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
@@ -3316,7 +3338,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     // Keep parity with D3D12 host-render-target path, where draws without
     // color/depth attachments must run at 1x sample count.
     multisample_state.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-  } else if (description.render_pass_key.msaa_samples == xenos::MsaaSamples::k2X &&
+  } else if (host_msaa == xenos::MsaaSamples::k2X &&
              !render_target_cache_.IsMsaa2xSupported(subpass_has_attachments)) {
     // Using sample 0 as 0 and 3 as 1 for 2x instead (not exactly the same
     // sample locations, but still top-left and bottom-right - however, this can
@@ -3329,14 +3351,13 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     }
   } else {
     multisample_state.rasterizationSamples =
-        VkSampleCountFlagBits(uint32_t(1) << uint32_t(description.render_pass_key.msaa_samples));
+        VkSampleCountFlagBits(uint32_t(1) << uint32_t(host_msaa));
   }
   if (description.sample_rate_shading &&
       multisample_state.rasterizationSamples != VK_SAMPLE_COUNT_1_BIT) {
     multisample_state.sampleShadingEnable = VK_TRUE;
     multisample_state.minSampleShading = 1.0f;
   }
-
   VkPipelineDepthStencilStateCreateInfo depth_stencil_state = {};
   depth_stencil_state.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
   depth_stencil_state.pNext = nullptr;

@@ -20,6 +20,9 @@
 #include <rex/graphics/pipeline/render_target/cache.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/graphics/vulkan/diagnostic_storage_buffer.h>
+#include <rex/graphics/vulkan/fragment_diagnostic.h>
+#include <rex/graphics/vulkan/quad_partner_marker.h>
 #include <rex/math.h>
 
 namespace rex::graphics {
@@ -497,6 +500,76 @@ void SpirvShaderTranslator::PostProcessInstruction(uint32_t instr_offset) {
   if (!is_pixel_shader()) {
     return;
   }
+  // Narrow diagnostic trace of the deferred shader's reconstruction registers.
+  // These offsets are the guest instruction addresses in its decoded ucode.
+  // Capture after StoreResult has committed both vector and scalar results.
+  if (diagnostic_storage_buffer_ != spv::NoResult &&
+      current_shader().ucode_data_hash() == UINT64_C(0x3CC2A52F0A5CB063)) {
+    uint32_t stage = UINT32_MAX;
+    switch (instr_offset) {
+      case 11:  // tf13 normal decode
+        stage = 0;
+        break;
+      case 17:  // view vector construction
+        stage = 1;
+        break;
+      case 20:  // normalized view vector
+        stage = 2;
+        break;
+      case 24:  // normalized reconstruction basis
+        stage = 3;
+        break;
+    }
+    if (stage != UINT32_MAX) {
+      for (uint32_t reg = 0; reg < 5; ++reg) {
+        const std::vector<spv::Id> indices{builder_->makeIntConstant(int(reg))};
+        const spv::Id value = builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_, indices),
+            spv::NoPrecision);
+        builder_->createStore(value, face_stage_samples_[24 + stage * 5 + reg]);
+      }
+    }
+  }
+  // Bounded tf4 normal reconstruction audit for the authentic G-buffer PS.
+  // The stage slots are consumed only by its existing frame/ROI-gated record.
+  if (diagnostic_storage_buffer_ != spv::NoResult &&
+      current_shader().ucode_data_hash() == UINT64_C(0xED58716070696DA4)) {
+    uint32_t stage = UINT32_MAX;
+    uint32_t reg = UINT32_MAX;
+    switch (instr_offset) {
+      case 6:   // decoded tangent-space normal, r6
+        stage = 0;
+        reg = 6;
+        break;
+      case 17:  // normalized tf4 direction, r1
+        stage = 1;
+        reg = 1;
+        break;
+      case 20:  // tangent-frame dot products, r1 and r3
+        stage = 2;
+        reg = 1;
+        break;
+      case 19:
+        stage = 3;
+        reg = 3;
+        break;
+      case 23:  // transformed normal before final normalization, r1
+        stage = 4;
+        reg = 1;
+        break;
+      case 26:  // normalized / encoded normal before output scale, r1
+        stage = 5;
+        reg = 1;
+        break;
+    }
+    if (stage != UINT32_MAX) {
+      const std::vector<spv::Id> indices{builder_->makeIntConstant(int(reg))};
+      const spv::Id value = builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassFunction, var_main_registers_, indices),
+          spv::NoPrecision);
+      builder_->createStore(value, face_stage_samples_[24 + stage]);
+    }
+  }
   if (alpha_test_killed_emitted_) {
     return;
   }
@@ -542,6 +615,771 @@ void SpirvShaderTranslator::PostProcessInstruction(uint32_t instr_offset) {
 }
 
 void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
+  using DiagnosticBuffer = vulkan::VulkanDiagnosticStorageBuffer;
+  const uint32_t diagnostic_storage_version =
+      GetSpirvShaderModification().pixel.diagnostic_storage_version;
+  auto atomic_load_header = [&](uint32_t member) {
+    const spv::Id pointer = builder_->createAccessChain(
+        spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+        std::vector<spv::Id>{builder_->makeIntConstant(int(member))});
+    const spv::Id result = builder_->getUniqueId();
+    std::unique_ptr<spv::Instruction> load =
+        std::make_unique<spv::Instruction>(result, type_uint_, spv::OpAtomicLoad);
+    load->addIdOperand(pointer);
+    load->addIdOperand(builder_->makeUintConstant(1));  // Device scope.
+    load->addIdOperand(builder_->makeUintConstant(0));  // Relaxed semantics.
+    builder_->getBuildPoint()->addInstruction(std::move(load));
+    return result;
+  };
+  auto atomic_store_header = [&](uint32_t member, spv::Id value) {
+    const spv::Id pointer = builder_->createAccessChain(
+        spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+        std::vector<spv::Id>{builder_->makeIntConstant(int(member))});
+    std::unique_ptr<spv::Instruction> exchange = std::make_unique<spv::Instruction>(
+        builder_->getUniqueId(), type_uint_, spv::OpAtomicExchange);
+    exchange->addIdOperand(pointer);
+    exchange->addIdOperand(builder_->makeUintConstant(1));  // Device scope.
+    exchange->addIdOperand(builder_->makeUintConstant(0));  // Relaxed semantics.
+    exchange->addIdOperand(value);
+    builder_->getBuildPoint()->addInstruction(std::move(exchange));
+  };
+  const uint64_t current_hash = current_shader().ucode_data_hash();
+  const bool is_diagnostic_candidate =
+      vulkan::diagnostics::IsFragmentDiagnosticInstrumentedShader(current_hash);
+  if (diagnostic_storage_version >= 7 && diagnostic_storage_buffer_ != spv::NoResult &&
+      is_diagnostic_candidate) {
+    const auto fetch_slots = vulkan::diagnostics::GetFragmentDiagnosticRecordFetchSlots(current_hash);
+    for (uint32_t sample = 0; sample < 3; ++sample) {
+      if (fetch_slots[sample] == UINT32_MAX) {
+        builder_->createStore(
+            builder_->createCompositeConstruct(
+                type_float4_, std::vector<spv::Id>{const_float_1_, const_float_0_, const_float_0_,
+                                                  const_float_0_}),
+            face_stage_samples_[14 + sample]);
+      }
+    }
+  }
+  if (diagnostic_storage_version >= 6 && diagnostic_storage_buffer_ != spv::NoResult &&
+      is_diagnostic_candidate) {
+    spv::Id all_samples_valid = builder_->makeBoolConstant(true);
+    for (uint32_t sample = 0; sample < 3; ++sample) {
+      assert_true(face_stage_samples_[14 + sample] != spv::NoResult);
+      spv::Id valid = builder_->createLoad(face_stage_samples_[14 + sample], spv::NoPrecision);
+      valid = builder_->createCompositeExtract(valid, type_float_, 0);
+      valid = builder_->createBinOp(spv::OpFOrdGreaterThan, type_bool_, valid, const_float_0_);
+      all_samples_valid =
+          builder_->createBinOp(spv::OpLogicalAnd, type_bool_, all_samples_valid, valid);
+    }
+    const spv::Id enabled = atomic_load_header(DiagnosticBuffer::kRecordingEnabledMember);
+    const spv::Id armed =
+        builder_->createBinOp(spv::OpINotEqual, type_bool_,
+                              builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, enabled,
+                                                    builder_->makeUintConstant(1)),
+                              const_uint_0_);
+    const spv::Id eligible =
+        builder_->createBinOp(spv::OpLogicalAnd, type_bool_, armed, all_samples_valid);
+    SpirvBuilder::IfBuilder eligible_if(eligible, spv::SelectionControlMaskNone, *builder_);
+    auto atomic_header_add = [&](uint32_t member) {
+      const spv::Id pointer =
+          builder_->createAccessChain(spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+                                      std::vector<spv::Id>{builder_->makeIntConstant(int(member))});
+      std::unique_ptr<spv::Instruction> atomic = std::make_unique<spv::Instruction>(
+          builder_->getUniqueId(), type_uint_, spv::OpAtomicIAdd);
+      atomic->addIdOperand(pointer);
+      atomic->addIdOperand(builder_->makeUintConstant(1));
+      atomic->addIdOperand(builder_->makeUintConstant(0));
+      atomic->addIdOperand(builder_->makeUintConstant(1));
+      builder_->getBuildPoint()->addInstruction(std::move(atomic));
+    };
+    atomic_header_add(DiagnosticBuffer::kEligibleInvocationCountMember);
+    assert_true(input_fragment_coordinates_ != spv::NoResult);
+    spv::Id fragment_xy[2];
+    for (uint32_t component = 0; component < 2; ++component) {
+      const spv::Id position =
+          builder_->createLoad(builder_->createAccessChain(
+                                   spv::StorageClassInput, input_fragment_coordinates_,
+                                   std::vector<spv::Id>{builder_->makeIntConstant(int(component))}),
+                               spv::NoPrecision);
+      fragment_xy[component] = builder_->createUnaryOp(spv::OpConvertFToU, type_uint_, position);
+    }
+    const uint32_t roi_min_x_base =
+        diagnostic_storage_version >= 9 ? vulkan::diagnostics::kFragmentDiagnosticLocalCandidateMinX
+                                        : vulkan::diagnostics::kFragmentDiagnosticNoseMinX;
+    const uint32_t roi_max_x_base =
+        diagnostic_storage_version >= 9 ? vulkan::diagnostics::kFragmentDiagnosticLocalCandidateMaxX
+                                        : vulkan::diagnostics::kFragmentDiagnosticNoseMaxX;
+    const uint32_t roi_min_y_base = diagnostic_storage_version >= 9
+                                   ? vulkan::diagnostics::GetFragmentDiagnosticCandidateMinY(current_hash)
+                                   : vulkan::diagnostics::kFragmentDiagnosticNoseMinY;
+    const uint32_t roi_max_y_base = diagnostic_storage_version >= 9
+                                   ? vulkan::diagnostics::GetFragmentDiagnosticCandidateMaxY(current_hash)
+                                   : vulkan::diagnostics::kFragmentDiagnosticNoseMaxY;
+    const uint32_t roi_min_x = roi_min_x_base * draw_resolution_scale_x_;
+    const uint32_t roi_max_x = roi_max_x_base * draw_resolution_scale_x_;
+    const uint32_t roi_min_y = roi_min_y_base * draw_resolution_scale_y_;
+    const uint32_t roi_max_y = roi_max_y_base * draw_resolution_scale_y_;
+    const spv::Id in_roi_x = builder_->createBinOp(
+        spv::OpLogicalAnd, type_bool_,
+        builder_->createBinOp(spv::OpUGreaterThanEqual, type_bool_, fragment_xy[0],
+                              builder_->makeUintConstant(roi_min_x)),
+        builder_->createBinOp(spv::OpULessThanEqual, type_bool_, fragment_xy[0],
+                              builder_->makeUintConstant(roi_max_x)));
+    const spv::Id in_roi_y = builder_->createBinOp(
+        spv::OpLogicalAnd, type_bool_,
+        builder_->createBinOp(spv::OpUGreaterThanEqual, type_bool_, fragment_xy[1],
+                              builder_->makeUintConstant(roi_min_y)),
+        builder_->createBinOp(spv::OpULessThanEqual, type_bool_, fragment_xy[1],
+                              builder_->makeUintConstant(roi_max_y)));
+    const spv::Id in_diagnostic_roi =
+        builder_->createBinOp(spv::OpLogicalAnd, type_bool_, in_roi_x, in_roi_y);
+    SpirvBuilder::IfBuilder eligible_roi_if(in_diagnostic_roi, spv::SelectionControlMaskNone,
+                                            *builder_);
+    atomic_header_add(DiagnosticBuffer::kEligibleNoseRoiCountMember);
+    eligible_roi_if.makeEndIf();
+    eligible_if.makeEndIf();
+  }
+
+  // Record tf0/tf2/tf14 together at shader completion. Reserving a contiguous
+  // triple in one atomic operation preserves exact fragment-invocation pairing
+  // even when multiple invocations share integer fragment coordinates.
+  if (diagnostic_storage_version >= 7 && diagnostic_storage_buffer_ != spv::NoResult &&
+      is_diagnostic_candidate) {
+    spv::Id all_samples_valid = builder_->makeBoolConstant(true);
+    for (uint32_t sample = 0; sample < 3; ++sample) {
+      assert_true(face_stage_samples_[14 + sample] != spv::NoResult);
+      spv::Id valid = builder_->createLoad(face_stage_samples_[14 + sample], spv::NoPrecision);
+      valid = builder_->createCompositeExtract(valid, type_float_, 0);
+      valid = builder_->createBinOp(spv::OpFOrdGreaterThan, type_bool_, valid, const_float_0_);
+      all_samples_valid =
+          builder_->createBinOp(spv::OpLogicalAnd, type_bool_, all_samples_valid, valid);
+    }
+
+    const spv::Id enabled =
+        atomic_load_header(DiagnosticBuffer::kRecordingEnabledMember);
+    const spv::Id recording_enabled =
+        builder_->createBinOp(spv::OpIEqual, type_bool_,
+                              builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, enabled,
+                                                    builder_->makeUintConstant(5)),
+                              builder_->makeUintConstant(5));
+    assert_true(input_fragment_coordinates_ != spv::NoResult);
+    spv::Id fragment_xy[2];
+    for (uint32_t component = 0; component < 2; ++component) {
+      const spv::Id position =
+          builder_->createLoad(builder_->createAccessChain(
+                                   spv::StorageClassInput, input_fragment_coordinates_,
+                                   std::vector<spv::Id>{builder_->makeIntConstant(int(component))}),
+                               spv::NoPrecision);
+      fragment_xy[component] = builder_->createUnaryOp(spv::OpConvertFToU, type_uint_, position);
+    }
+    const spv::Id local_roi_filter_enabled = builder_->createBinOp(
+        spv::OpINotEqual, type_bool_,
+        builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, enabled,
+                              builder_->makeUintConstant(8)),
+        const_uint_0_);
+    const auto roi_axis = [&](uint32_t component, uint32_t minimum, uint32_t maximum) {
+      const spv::Id at_or_after_min = builder_->createBinOp(
+          spv::OpUGreaterThanEqual, type_bool_, fragment_xy[component],
+          builder_->makeUintConstant(minimum));
+      const spv::Id at_or_before_max = builder_->createBinOp(
+          spv::OpULessThanEqual, type_bool_, fragment_xy[component],
+          builder_->makeUintConstant(maximum));
+      return builder_->createBinOp(spv::OpLogicalAnd, type_bool_, at_or_after_min, at_or_before_max);
+    };
+    const spv::Id in_local_candidate_roi = builder_->createBinOp(
+        spv::OpLogicalAnd, type_bool_,
+        roi_axis(0, vulkan::diagnostics::kFragmentDiagnosticLocalCandidateMinX *
+                        draw_resolution_scale_x_,
+                 vulkan::diagnostics::kFragmentDiagnosticLocalCandidateMaxX *
+                        draw_resolution_scale_x_),
+        roi_axis(1, vulkan::diagnostics::GetFragmentDiagnosticCandidateMinY(current_hash) *
+                        draw_resolution_scale_y_,
+                 vulkan::diagnostics::GetFragmentDiagnosticCandidateMaxY(current_hash) *
+                        draw_resolution_scale_y_));
+    spv::Id in_diagnostic_region = in_local_candidate_roi;
+    if (current_hash == vulkan::diagnostics::kFragmentDiagnosticGBufferPixelHash) {
+      // Scale changes move this UV patch in output space. Select it by the
+      // actual tf4 coordinates so the 1x/2x replay compares the same material
+      // region instead of assuming its screen position doubles exactly.
+      const spv::Id tf4_coordinates =
+          builder_->createLoad(face_stage_samples_[11], spv::NoPrecision);
+      const spv::Id u = builder_->createCompositeExtract(tf4_coordinates, type_float_, 0);
+      const spv::Id v = builder_->createCompositeExtract(tf4_coordinates, type_float_, 1);
+      const spv::Id u_in_range = builder_->createBinOp(
+          spv::OpLogicalAnd, type_bool_,
+          builder_->createBinOp(spv::OpFOrdGreaterThanEqual, type_bool_, u,
+                                builder_->makeFloatConstant(0.46f)),
+          builder_->createBinOp(spv::OpFOrdLessThanEqual, type_bool_, u,
+                                builder_->makeFloatConstant(0.48f)));
+      const spv::Id v_in_range = builder_->createBinOp(
+          spv::OpLogicalAnd, type_bool_,
+          builder_->createBinOp(spv::OpFOrdGreaterThanEqual, type_bool_, v,
+                                builder_->makeFloatConstant(0.27f)),
+          builder_->createBinOp(spv::OpFOrdLessThanEqual, type_bool_, v,
+                                builder_->makeFloatConstant(0.295f)));
+      in_diagnostic_region =
+          builder_->createBinOp(spv::OpLogicalAnd, type_bool_, u_in_range, v_in_range);
+    }
+    const spv::Id roi_allowed = builder_->createBinOp(
+        spv::OpLogicalOr, type_bool_,
+        builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, local_roi_filter_enabled),
+        in_diagnostic_region);
+    const spv::Id should_record = builder_->createBinOp(
+        spv::OpLogicalAnd, type_bool_, recording_enabled,
+        builder_->createBinOp(spv::OpLogicalAnd, type_bool_, all_samples_valid, roi_allowed));
+    SpirvBuilder::IfBuilder recording_if(should_record, spv::SelectionControlMaskNone, *builder_);
+
+    const std::vector<spv::Id> count_indices{builder_->makeIntConstant(0)};
+    const spv::Id count_pointer = builder_->createAccessChain(
+        spv::StorageClassStorageBuffer, diagnostic_storage_buffer_, count_indices);
+    std::unique_ptr<spv::Instruction> atomic =
+        std::make_unique<spv::Instruction>(builder_->getUniqueId(), type_uint_, spv::OpAtomicIAdd);
+    atomic->addIdOperand(count_pointer);
+    atomic->addIdOperand(builder_->makeUintConstant(1));  // Device scope.
+    atomic->addIdOperand(builder_->makeUintConstant(0));  // Relaxed semantics.
+    atomic->addIdOperand(builder_->makeUintConstant(3));  // One tf0/tf2/tf14 invocation group.
+    const spv::Id first_record = atomic->getResultId();
+    builder_->getBuildPoint()->addInstruction(std::move(atomic));
+
+    const std::vector<spv::Id> capacity_indices{builder_->makeIntConstant(2)};
+    const spv::Id capacity = builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+                                    capacity_indices),
+        spv::NoPrecision);
+    const spv::Id last_record =
+        builder_->createBinOp(spv::OpIAdd, type_uint_, first_record, builder_->makeUintConstant(2));
+    const spv::Id in_bounds =
+        builder_->createBinOp(spv::OpULessThan, type_bool_, last_record, capacity);
+    SpirvBuilder::IfBuilder bounds_if(in_bounds, spv::SelectionControlMaskNone, *builder_);
+
+    const auto fetch_slots =
+        vulkan::diagnostics::GetFragmentDiagnosticRecordFetchSlots(current_hash);
+    std::array<uint32_t, 4> gbuffer_interpolators{UINT32_MAX, UINT32_MAX, UINT32_MAX,
+                                                  UINT32_MAX};
+    if (current_hash == vulkan::diagnostics::kFragmentDiagnosticGBufferPixelHash) {
+      uint32_t interpolators = GetModificationInterpolatorMask();
+      for (uint32_t i = 0; i < gbuffer_interpolators.size() && interpolators; ++i) {
+        uint32_t index;
+        rex::bit_scan_forward(interpolators, &index);
+        interpolators &= ~(UINT32_C(1) << index);
+        gbuffer_interpolators[i] = index;
+      }
+    }
+    for (uint32_t sample = 0; sample < 3; ++sample) {
+      const spv::Id record_index =
+          sample ? builder_->createBinOp(spv::OpIAdd, type_uint_, first_record,
+                                         builder_->makeUintConstant(sample))
+                 : first_record;
+      auto record_member_pointer = [&](uint32_t member) {
+        return builder_->createAccessChain(
+            spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+            std::vector<spv::Id>{builder_->makeIntConstant(DiagnosticBuffer::kRecordsMember),
+                                 record_index, builder_->makeIntConstant(int(member))});
+      };
+      auto store_member = [&](uint32_t member, spv::Id value) {
+        builder_->createStore(value, record_member_pointer(member));
+      };
+      store_member(0, builder_->makeUintConstant(uint32_t(current_shader().ucode_data_hash())));
+      store_member(1, builder_->makeUintConstant(uint32_t(current_shader().ucode_data_hash() >> 32)));
+      store_member(2, builder_->makeUintConstant(fetch_slots[sample]));
+      const bool is_gbuffer =
+          current_hash == vulkan::diagnostics::kFragmentDiagnosticGBufferPixelHash;
+      const uint32_t varying_index =
+          is_gbuffer ? gbuffer_interpolators[sample == 2 ? 3 : sample] : UINT32_MAX;
+      store_member(3, builder_->makeUintConstant(
+                         is_gbuffer && sample == 1 && gbuffer_interpolators[2] != UINT32_MAX
+                             ? (0x40000000 | gbuffer_interpolators[2])
+                             : varying_index == UINT32_MAX ? 2 : (0x200 | varying_index)));
+      if (is_gbuffer && sample == 1 && gbuffer_interpolators[1] != UINT32_MAX) {
+        store_member(2, builder_->makeUintConstant(0x80000000 | gbuffer_interpolators[1]));
+      }
+      store_member(4, fragment_xy[0]);
+      store_member(5, fragment_xy[1]);
+      store_member(6, builder_->makeUintConstant(UINT32_MAX));  // Frame unknown.
+      const spv::Id z_coord = builder_->createLoad(
+          builder_->createAccessChain(
+              spv::StorageClassInput, input_fragment_coordinates_,
+              std::vector<spv::Id>{builder_->makeIntConstant(2)}),
+          spv::NoPrecision);
+      const spv::Id z_bits = builder_->createUnaryOp(spv::OpBitcast, type_uint_, z_coord);
+      store_member(7, z_bits);  // Fragment Z depth
+      if (sample == 0 && input_sample_mask_ != spv::NoResult &&
+          current_shader().ucode_data_hash() ==
+              vulkan::diagnostics::kFragmentDiagnosticPixelHash) {
+        const spv::Id sample_mask = builder_->createUnaryOp(
+            spv::OpBitcast, type_uint_,
+            builder_->createLoad(
+                builder_->createAccessChain(
+                    spv::StorageClassInput, input_sample_mask_,
+                    std::vector<spv::Id>{builder_->makeIntConstant(0)}),
+                spv::NoPrecision));
+        store_member(12, sample_mask);
+      }
+      const spv::Id uv = builder_->createLoad(face_stage_samples_[11 + sample], spv::NoPrecision);
+      spv::Id rgba = builder_->createLoad(face_stage_samples_[17 + sample], spv::NoPrecision);
+      if (varying_index != UINT32_MAX && sample != 0 &&
+          input_output_interpolators_[varying_index] != spv::NoResult) {
+        rgba = builder_->createLoad(input_output_interpolators_[varying_index], spv::NoPrecision);
+      }
+      for (uint32_t component = 0; component < 2; ++component) {
+        const spv::Id uv_component =
+            builder_->createCompositeExtract(uv, type_float_, int(component));
+        const spv::Id uv_bits = builder_->createUnaryOp(spv::OpBitcast, type_uint_, uv_component);
+        builder_->createStore(
+            uv_bits,
+            builder_->createAccessChain(
+                spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+                std::vector<spv::Id>{builder_->makeIntConstant(DiagnosticBuffer::kRecordsMember),
+                                     record_index, builder_->makeIntConstant(8),
+                                     builder_->makeIntConstant(int(component))}));
+      }
+      for (uint32_t component = 0; component < 4; ++component) {
+        const spv::Id rgba_component =
+            builder_->createCompositeExtract(rgba, type_float_, int(component));
+        const spv::Id rgba_bits =
+            builder_->createUnaryOp(spv::OpBitcast, type_uint_, rgba_component);
+        builder_->createStore(
+            rgba_bits,
+            builder_->createAccessChain(
+                spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+                std::vector<spv::Id>{builder_->makeIntConstant(DiagnosticBuffer::kRecordsMember),
+                                     record_index, builder_->makeIntConstant(9),
+                                     builder_->makeIntConstant(int(component))}));
+      }
+      const uint32_t output_varying_index = is_gbuffer && sample == 1
+                                                ? gbuffer_interpolators[2]
+                                                : sample == 2 ? UINT32_MAX : varying_index;
+      if (output_varying_index != UINT32_MAX &&
+          input_output_interpolators_[output_varying_index] != spv::NoResult) {
+        const spv::Id varying =
+            builder_->createLoad(input_output_interpolators_[output_varying_index], spv::NoPrecision);
+        for (uint32_t component = 0; component < 4; ++component) {
+          const spv::Id bits = builder_->createUnaryOp(
+              spv::OpBitcast, type_uint_,
+              builder_->createCompositeExtract(varying, type_float_, int(component)));
+          builder_->createStore(
+              bits, builder_->createAccessChain(
+                        spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+                        std::vector<spv::Id>{builder_->makeIntConstant(DiagnosticBuffer::kRecordsMember),
+                                             record_index, builder_->makeIntConstant(11),
+                                             builder_->makeIntConstant(int(component))}));
+        }
+      }
+      if (current_hash == vulkan::diagnostics::kFragmentDiagnosticDeferredPixelHash &&
+          sample < 2) {
+        const spv::Id input = builder_->createLoad(face_stage_samples_[22 + sample],
+                                                   spv::NoPrecision);
+        for (uint32_t component = 0; component < 4; ++component) {
+          const spv::Id bits = builder_->createUnaryOp(
+              spv::OpBitcast, type_uint_,
+              builder_->createCompositeExtract(input, type_float_, int(component)));
+          builder_->createStore(
+              bits, builder_->createAccessChain(
+                        spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+                        std::vector<spv::Id>{builder_->makeIntConstant(DiagnosticBuffer::kRecordsMember),
+                                             record_index, builder_->makeIntConstant(11),
+                                             builder_->makeIntConstant(int(component))}));
+        }
+      }
+      if (sample == 2 && diagnostic_storage_version >= 8 &&
+          output_or_var_fragment_data_[0] != spv::NoResult) {
+        const spv::Id output_capture_enabled = builder_->createBinOp(
+            spv::OpINotEqual, type_bool_,
+            builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, enabled,
+                                  builder_->makeUintConstant(16)),
+            const_uint_0_);
+        SpirvBuilder::IfBuilder output_if(output_capture_enabled, spv::SelectionControlMaskNone,
+                                          *builder_);
+        const spv::Id output_color =
+            builder_->createLoad(output_or_var_fragment_data_[0], spv::NoPrecision);
+        for (uint32_t component = 0; component < 4; ++component) {
+          const spv::Id output_component =
+              builder_->createCompositeExtract(output_color, type_float_, int(component));
+          const spv::Id output_bits =
+              builder_->createUnaryOp(spv::OpBitcast, type_uint_, output_component);
+          builder_->createStore(
+              output_bits,
+              builder_->createAccessChain(
+                  spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+                  std::vector<spv::Id>{builder_->makeIntConstant(DiagnosticBuffer::kRecordsMember),
+                                       record_index, builder_->makeIntConstant(11),
+                                       builder_->makeIntConstant(int(component))}));
+        }
+        output_if.makeEndIf();
+      }
+      // For the G-buffer PS only, reuse the unused pixel-side vertex-fetch
+      // payload on the third record to store r0-r3 inputs and the six selected
+      // tf4 reconstruction intermediates. This remains within the existing
+      // frame/ROI-gated record and leaves guest output untouched.
+      if (sample == 2 &&
+          current_hash == vulkan::diagnostics::kFragmentDiagnosticGBufferPixelHash) {
+        for (uint32_t value_index = 0; value_index < 12; ++value_index) {
+          const uint32_t stage_index = value_index < 6 ? 24 + value_index
+                                      : value_index < 10 ? 30 + (value_index - 6)
+                                      : value_index == 10 ? 34
+                                                          : 35;
+          const spv::Id value = builder_->createLoad(face_stage_samples_[stage_index],
+                                                     spv::NoPrecision);
+          for (uint32_t component = 0; component < 4; ++component) {
+            const spv::Id bits = builder_->createUnaryOp(
+                spv::OpBitcast, type_uint_,
+                builder_->createCompositeExtract(value, type_float_, int(component)));
+            builder_->createStore(
+                bits, builder_->createAccessChain(
+                          spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+                          std::vector<spv::Id>{builder_->makeIntConstant(DiagnosticBuffer::kRecordsMember),
+                                               record_index,
+                                               builder_->makeIntConstant(int(17 + value_index)),
+                                               builder_->makeIntConstant(int(component))}));
+          }
+        }
+      }
+      // Revision 10 uses the otherwise unused output payload of the first
+      // two records for tf0/tf14 gradients (dUdx,dVdx,dUdy,dVdy). The third
+      // record continues to carry the guest shader's RT0 output.
+      if (diagnostic_storage_version >= 10 && sample < 2 &&
+          vulkan::diagnostics::IsQuadPartnerMarkerShader(current_shader().ucode_data_hash())) {
+        const spv::Id gradients =
+            builder_->createLoad(face_stage_samples_[20 + sample], spv::NoPrecision);
+        for (uint32_t component = 0; component < 4; ++component) {
+          const spv::Id bits = builder_->createUnaryOp(
+              spv::OpBitcast, type_uint_,
+              builder_->createCompositeExtract(gradients, type_float_, component));
+          builder_->createStore(
+              bits, builder_->createAccessChain(
+                        spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+                        std::vector<spv::Id>{
+                            builder_->makeIntConstant(DiagnosticBuffer::kRecordsMember),
+                            record_index, builder_->makeIntConstant(11),
+                            builder_->makeIntConstant(int(component))}));
+        }
+        if (sample == 0 && diagnostic_storage_version == 10) {
+          // ABI 9 leaves the interpolator payload unused for fragment records.
+          // Store fine tf0 derivatives beside the coarse Grad operands so the
+          // target invocation can be compared without another capture format.
+          const spv::Id fine_gradients =
+              builder_->createLoad(face_stage_samples_[36], spv::NoPrecision);
+          for (uint32_t component = 0; component < 4; ++component) {
+            const spv::Id bits = builder_->createUnaryOp(
+                spv::OpBitcast, type_uint_,
+                builder_->createCompositeExtract(fine_gradients, type_float_, int(component)));
+            builder_->createStore(
+                bits, builder_->createAccessChain(
+                          spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+                          std::vector<spv::Id>{builder_->makeIntConstant(DiagnosticBuffer::kRecordsMember),
+                                               record_index, builder_->makeIntConstant(13),
+                                               builder_->makeIntConstant(int(component))}));
+          }
+          if (GetSpirvShaderModification().pixel.diagnostic_storage_version == 10 &&
+              input_primitive_id_ != spv::NoResult) {
+            const spv::Id primitive_id = builder_->createUnaryOp(
+                spv::OpBitcast, type_uint_,
+                builder_->createLoad(input_primitive_id_, spv::NoPrecision));
+            const spv::Id centroid = builder_->makeUintConstant(
+                (GetSpirvShaderModification().pixel.interpolators_centroid & (1u << 1)) ? 1u : 0u);
+            for (const auto& [component, value] :
+                 std::array<std::pair<uint32_t, spv::Id>, 2>{{{0, primitive_id}, {1, centroid}}}) {
+              builder_->createStore(
+                  value, builder_->createAccessChain(
+                             spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+                             std::vector<spv::Id>{
+                                 builder_->makeIntConstant(DiagnosticBuffer::kRecordsMember),
+                                 record_index, builder_->makeIntConstant(14),
+                                 builder_->makeIntConstant(int(component))}));
+            }
+            const spv::Id interpolation_reference =
+                builder_->createLoad(face_stage_samples_[37], spv::NoPrecision);
+            for (uint32_t component = 0; component < 4; ++component) {
+              const spv::Id bits = builder_->createUnaryOp(
+                  spv::OpBitcast, type_uint_,
+                  builder_->createCompositeExtract(interpolation_reference, type_float_,
+                                                    int(component)));
+              builder_->createStore(
+                  bits, builder_->createAccessChain(
+                            spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+                            std::vector<spv::Id>{
+                                builder_->makeIntConstant(DiagnosticBuffer::kRecordsMember),
+                                record_index, builder_->makeIntConstant(15),
+                                builder_->makeIntConstant(int(component))}));
+            }
+            const spv::Id source_interpolator =
+                builder_->createLoad(face_stage_samples_[38], spv::NoPrecision);
+            for (uint32_t component = 0; component < 4; ++component) {
+              const spv::Id bits = builder_->createUnaryOp(
+                  spv::OpBitcast, type_uint_,
+                  builder_->createCompositeExtract(source_interpolator, type_float_,
+                                                    int(component)));
+              builder_->createStore(
+                  bits, builder_->createAccessChain(
+                            spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+                            std::vector<spv::Id>{
+                                builder_->makeIntConstant(DiagnosticBuffer::kRecordsMember),
+                                record_index, builder_->makeIntConstant(16),
+                                builder_->makeIntConstant(int(component))}));
+            }
+          }
+        }
+      }
+      store_member(10, builder_->makeUintConstant(1));  // Publish record validity last.
+    }
+    atomic_store_header(DiagnosticBuffer::kValidMember, builder_->makeUintConstant(1));
+    bounds_if.makeBeginElse();
+    std::unique_ptr<spv::Instruction> overflow_set = std::make_unique<spv::Instruction>(
+        builder_->getUniqueId(), type_uint_, spv::OpAtomicExchange);
+    overflow_set->addIdOperand(
+        builder_->createAccessChain(spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+                                    std::vector<spv::Id>{builder_->makeIntConstant(1)}));
+    overflow_set->addIdOperand(builder_->makeUintConstant(1));
+    overflow_set->addIdOperand(builder_->makeUintConstant(0));
+    overflow_set->addIdOperand(builder_->makeUintConstant(1));
+    builder_->getBuildPoint()->addInstruction(std::move(overflow_set));
+    bounds_if.makeEndIf();
+
+    // Reserve a separate, bounded block of 21 records (a multiple of the
+    // existing three-record stride) for r0-r4 at four deferred reconstruction
+    // instruction boundaries. One record is padding so subsequent sample
+    // groups retain their modulo-three indexing.
+    if (current_hash == vulkan::diagnostics::kFragmentDiagnosticDeferredPixelHash) {
+      constexpr uint32_t kTraceRecordCount = 21;
+      const spv::Id trace_count = builder_->getUniqueId();
+      std::unique_ptr<spv::Instruction> trace_atomic =
+          std::make_unique<spv::Instruction>(trace_count, type_uint_, spv::OpAtomicIAdd);
+      trace_atomic->addIdOperand(count_pointer);
+      trace_atomic->addIdOperand(builder_->makeUintConstant(1));
+      trace_atomic->addIdOperand(builder_->makeUintConstant(0));
+      trace_atomic->addIdOperand(builder_->makeUintConstant(kTraceRecordCount));
+      builder_->getBuildPoint()->addInstruction(std::move(trace_atomic));
+      const spv::Id trace_last = builder_->createBinOp(
+          spv::OpIAdd, type_uint_, trace_count, builder_->makeUintConstant(kTraceRecordCount - 1));
+      const spv::Id trace_in_bounds =
+          builder_->createBinOp(spv::OpULessThan, type_bool_, trace_last, capacity);
+      SpirvBuilder::IfBuilder trace_bounds_if(trace_in_bounds, spv::SelectionControlMaskNone,
+                                              *builder_);
+      assert_true(input_fragment_coordinates_ != spv::NoResult);
+      const spv::Id depth_z = builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
+                                      std::vector<spv::Id>{builder_->makeIntConstant(2)}),
+          spv::NoPrecision);
+      const spv::Id depth_bits = builder_->createUnaryOp(spv::OpBitcast, type_uint_, depth_z);
+      const spv::Id invocation_x = builder_->createUnaryOp(
+          spv::OpConvertFToU, type_uint_,
+          builder_->createLoad(builder_->createAccessChain(
+                                   spv::StorageClassInput, input_fragment_coordinates_,
+                                   std::vector<spv::Id>{builder_->makeIntConstant(0)}),
+                               spv::NoPrecision));
+      const spv::Id invocation_y = builder_->createUnaryOp(
+          spv::OpConvertFToU, type_uint_,
+          builder_->createLoad(builder_->createAccessChain(
+                                   spv::StorageClassInput, input_fragment_coordinates_,
+                                   std::vector<spv::Id>{builder_->makeIntConstant(1)}),
+                               spv::NoPrecision));
+      for (uint32_t stage = 0; stage < 4; ++stage) {
+        for (uint32_t reg = 0; reg < 5; ++reg) {
+          const uint32_t trace_index = stage * 5 + reg;
+          const spv::Id record_index = builder_->createBinOp(
+              spv::OpIAdd, type_uint_, trace_count, builder_->makeUintConstant(trace_index));
+          auto store_trace_member = [&](uint32_t member, spv::Id value) {
+            builder_->createStore(
+                value, builder_->createAccessChain(
+                           spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+                           std::vector<spv::Id>{
+                               builder_->makeIntConstant(DiagnosticBuffer::kRecordsMember),
+                               record_index, builder_->makeIntConstant(int(member))}));
+          };
+          store_trace_member(0, builder_->makeUintConstant(uint32_t(current_hash)));
+          store_trace_member(1, builder_->makeUintConstant(uint32_t(current_hash >> 32)));
+          store_trace_member(2, builder_->makeUintConstant(0xF0000000u | (stage << 8) | reg));
+          constexpr uint32_t kTraceInstructionOffsets[] = {11, 17, 20, 24};
+          store_trace_member(3, builder_->makeUintConstant(kTraceInstructionOffsets[stage]));
+          store_trace_member(4, invocation_x);
+          store_trace_member(5, invocation_y);
+          store_trace_member(6, first_record);
+          store_trace_member(7, depth_bits);
+          store_trace_member(10, builder_->makeUintConstant(1));
+          const spv::Id value = builder_->createLoad(face_stage_samples_[24 + trace_index],
+                                                     spv::NoPrecision);
+          for (uint32_t component = 0; component < 4; ++component) {
+            const spv::Id value_component =
+                builder_->createCompositeExtract(value, type_float_, int(component));
+            builder_->createStore(
+                builder_->createUnaryOp(spv::OpBitcast, type_uint_, value_component),
+                builder_->createAccessChain(
+                    spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+                    std::vector<spv::Id>{builder_->makeIntConstant(DiagnosticBuffer::kRecordsMember),
+                                         record_index, builder_->makeIntConstant(9),
+                                         builder_->makeIntConstant(int(component))}));
+          }
+        }
+      }
+      const spv::Id padding_index = builder_->createBinOp(
+          spv::OpIAdd, type_uint_, trace_count, builder_->makeUintConstant(20));
+      auto store_padding_member = [&](uint32_t member, spv::Id value) {
+        builder_->createStore(
+            value, builder_->createAccessChain(
+                       spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+                       std::vector<spv::Id>{builder_->makeIntConstant(DiagnosticBuffer::kRecordsMember),
+                                            padding_index, builder_->makeIntConstant(int(member))}));
+      };
+      store_padding_member(0, builder_->makeUintConstant(uint32_t(current_hash)));
+      store_padding_member(1, builder_->makeUintConstant(uint32_t(current_hash >> 32)));
+      store_padding_member(2, builder_->makeUintConstant(0xF00000FFu));
+      store_padding_member(3, builder_->makeUintConstant(UINT32_MAX));
+      store_padding_member(4, invocation_x);
+      store_padding_member(5, invocation_y);
+      store_padding_member(6, first_record);
+      store_padding_member(7, depth_bits);
+      store_padding_member(10, builder_->makeUintConstant(1));
+      trace_bounds_if.makeBeginElse();
+      std::unique_ptr<spv::Instruction> trace_overflow =
+          std::make_unique<spv::Instruction>(builder_->getUniqueId(), type_uint_, spv::OpAtomicExchange);
+      trace_overflow->addIdOperand(builder_->createAccessChain(
+          spv::StorageClassStorageBuffer, diagnostic_storage_buffer_,
+          std::vector<spv::Id>{builder_->makeIntConstant(DiagnosticBuffer::kOverflowMember)}));
+      trace_overflow->addIdOperand(builder_->makeUintConstant(1));
+      trace_overflow->addIdOperand(builder_->makeUintConstant(0));
+      trace_overflow->addIdOperand(builder_->makeUintConstant(1));
+      builder_->getBuildPoint()->addInstruction(std::move(trace_overflow));
+      trace_bounds_if.makeEndIf();
+    }
+    recording_if.makeEndIf();
+  }
+
+  // [DEBUG-face-stage] Diagnostic images only. Mode 0 leaves the guest output
+  // untouched. Preserve guest alpha even in probe modes (same blending/tests).
+  if (!is_depth_only_fragment_shader_ &&
+      current_shader().ucode_data_hash() == UINT64_C(0x79A3448304FA0D22)) {
+    std::vector<spv::Id> indices{builder_->makeIntConstant(kSystemConstantFaceStageMode)};
+    spv::Id mode = builder_->createLoad(builder_->createAccessChain(
+        spv::StorageClassUniform, uniform_system_constants_, indices), spv::NoPrecision);
+    spv::Id original = builder_->createLoad(output_or_var_fragment_data_[0], spv::NoPrecision);
+    spv::Id alpha = builder_->createCompositeExtract(original, type_float_, 3);
+    spv::Id diffuse = builder_->createLoad(face_stage_samples_[0], spv::NoPrecision);
+    spv::Id scalar = builder_->createCompositeExtract(
+        builder_->createLoad(face_stage_samples_[1], spv::NoPrecision), type_float_, 0);
+    spv::Id light = builder_->createLoad(face_stage_samples_[2], spv::NoPrecision);
+    spv::Id light_alpha = builder_->createCompositeExtract(light, type_float_, 3);
+    spv::Id product = builder_->createBinOp(spv::OpFMul, type_float4_, diffuse, light);
+    spv::Id addend = builder_->createBinOp(spv::OpFMul, type_float_, scalar, light_alpha);
+    std::vector<spv::Id> scalar_rgb{scalar, scalar, scalar, alpha};
+    std::vector<spv::Id> alpha_rgb{light_alpha, light_alpha, light_alpha, alpha};
+    std::vector<spv::Id> addend_rgb{addend, addend, addend, alpha};
+    spv::Id tf0_uv = builder_->createLoad(face_stage_samples_[3], spv::NoPrecision);
+    std::vector<spv::Id> uv_diffuse_components{
+        builder_->createCompositeExtract(tf0_uv, type_float_, 0),
+        builder_->createCompositeExtract(tf0_uv, type_float_, 1),
+        builder_->createCompositeExtract(diffuse, type_float_, 1),
+        alpha,
+    };
+    spv::Id uv_and_diffuse_green =
+        builder_->createCompositeConstruct(type_float4_, uv_diffuse_components);
+    // Mode 9: pure white, to obtain an exact coverage mask for this shader.
+    std::vector<spv::Id> white_rgb{builder_->makeFloatConstant(1.0f),
+                                   builder_->makeFloatConstant(1.0f),
+                                   builder_->makeFloatConstant(1.0f), alpha};
+    spv::Id coverage_white = builder_->createCompositeConstruct(type_float4_, white_rgb);
+    // Mode 10: coordinates and green from the same fetch instruction.
+    spv::Id paired = builder_->createLoad(face_stage_samples_[4], spv::NoPrecision);
+    // Modes 11..14: the same, per individual 2D tf0 fetch of the shader.
+    spv::Id fetch0 = builder_->createLoad(face_stage_samples_[5], spv::NoPrecision);
+    spv::Id fetch1 = builder_->createLoad(face_stage_samples_[6], spv::NoPrecision);
+    spv::Id fetch2 = builder_->createLoad(face_stage_samples_[7], spv::NoPrecision);
+    spv::Id fetch3 = builder_->createLoad(face_stage_samples_[8], spv::NoPrecision);
+    // Mode 15: coordinates with the fractional part of their 8-bit value.
+    spv::Id precise_uv = builder_->createLoad(face_stage_samples_[9], spv::NoPrecision);
+    // Mode 16: the raw sampled RGBA, untouched.
+    spv::Id raw_sample = builder_->createLoad(face_stage_samples_[10], spv::NoPrecision);
+    spv::Id choices[] = {
+        diffuse,
+        builder_->createCompositeConstruct(type_float4_, scalar_rgb),
+        light,
+        builder_->createCompositeConstruct(type_float4_, alpha_rgb),
+        product,
+        builder_->createCompositeConstruct(type_float4_, addend_rgb),
+        tf0_uv,
+        uv_and_diffuse_green,
+        coverage_white,
+        paired,
+        fetch0,
+        fetch1,
+        fetch2,
+        fetch3,
+        precise_uv,
+        raw_sample,
+    };
+    spv::Id selected = original;
+    for (uint32_t i = 0; i < 16; ++i) {
+      // Modes 15 and 16 keep their own alpha so all four components remain
+      // available; the other modes preserve guest alpha to keep coverage valid.
+      spv::Id value =
+          (i >= 14) ? choices[i]
+                    : builder_->createCompositeInsert(alpha, choices[i], type_float4_, 3);
+      selected = builder_->createTriOp(spv::OpSelect, type_float4_,
+          builder_->createBinOp(spv::OpIEqual, type_bool_, mode, builder_->makeUintConstant(i + 1)),
+          value, selected);
+    }
+    builder_->createStore(selected, output_or_var_fragment_data_[0]);
+  }
+  if (!is_depth_only_fragment_shader_ && quad_partner_valid_ != spv::NoResult) {
+    const spv::Id uv = builder_->createLoad(quad_partner_values_[0], spv::NoPrecision);
+    const spv::Id negative_uv = builder_->createUnaryOp(spv::OpFNegate, type_float2_, uv);
+    spv::Id nonzero = builder_->makeBoolConstant(false);
+    spv::Id finite = builder_->makeBoolConstant(true);
+    for (uint32_t c = 0; c < 2; ++c) {
+      const spv::Id component = builder_->createCompositeExtract(uv, type_float_, c);
+      nonzero = builder_->createBinOp(spv::OpLogicalOr, type_bool_, nonzero,
+          builder_->createBinOp(spv::OpFOrdNotEqual, type_bool_, component, const_float_0_));
+      const spv::Id invalid = builder_->createBinOp(spv::OpLogicalOr, type_bool_,
+          builder_->createUnaryOp(spv::OpIsNan, type_bool_, component),
+          builder_->createUnaryOp(spv::OpIsInf, type_bool_, component));
+      finite = builder_->createBinOp(spv::OpLogicalAnd, type_bool_, finite,
+          builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, invalid));
+    }
+    const spv::Id valid = builder_->createBinOp(spv::OpLogicalAnd, type_bool_,
+        builder_->createLoad(quad_partner_valid_, spv::NoPrecision),
+        builder_->createBinOp(spv::OpLogicalAnd, type_bool_, nonzero, finite));
+    std::vector<spv::Id> marker;
+    std::vector<spv::Id> component_marker;
+    for (uint32_t axis = 0; axis < 2; ++axis) {
+      const spv::Id gradient = builder_->createLoad(quad_partner_values_[1 + axis], spv::NoPrecision);
+      spv::Id matches[2] = {valid, valid};
+      spv::Id component_matches = builder_->makeBoolConstant(false);
+      for (uint32_t sign = 0; sign < 2; ++sign) {
+        for (uint32_t c = 0; c < 2; ++c) {
+          const spv::Id equal = builder_->createBinOp(spv::OpFOrdEqual, type_bool_,
+                  builder_->createCompositeExtract(gradient, type_float_, c),
+                  builder_->createCompositeExtract(sign ? negative_uv : uv, type_float_, c));
+          matches[sign] = builder_->createBinOp(spv::OpLogicalAnd, type_bool_, matches[sign], equal);
+          const spv::Id nonzero_component = builder_->createBinOp(
+              spv::OpFOrdNotEqual, type_bool_,
+              builder_->createCompositeExtract(uv, type_float_, c), const_float_0_);
+          component_matches = builder_->createBinOp(spv::OpLogicalOr, type_bool_, component_matches,
+              builder_->createBinOp(spv::OpLogicalAnd, type_bool_, valid,
+                  builder_->createBinOp(spv::OpLogicalAnd, type_bool_, equal, nonzero_component)));
+        }
+      }
+      marker.push_back(builder_->createTriOp(spv::OpSelect, type_float_,
+          builder_->createBinOp(spv::OpLogicalOr, type_bool_, matches[0], matches[1]),
+          const_float_1_, const_float_0_));
+      component_marker.push_back(builder_->createTriOp(spv::OpSelect, type_float_,
+          component_matches, const_float_1_, const_float_0_));
+    }
+    const spv::Id original = builder_->createLoad(output_or_var_fragment_data_[0], spv::NoPrecision);
+    marker.push_back(const_float_1_);  // Coverage, independent of signature.
+    marker.push_back(builder_->createCompositeExtract(original, type_float_, 3));
+    component_marker.push_back(const_float_1_);
+    component_marker.push_back(builder_->createCompositeExtract(original, type_float_, 3));
+    const spv::Id mode = builder_->createLoad(builder_->createAccessChain(
+        spv::StorageClassUniform, uniform_system_constants_,
+        std::vector<spv::Id>{builder_->makeIntConstant(kSystemConstantFaceStageMode)}), spv::NoPrecision);
+    const spv::Id selected = builder_->createTriOp(spv::OpSelect, type_float4_,
+        builder_->createBinOp(spv::OpIEqual, type_bool_, mode,
+            builder_->makeUintConstant(vulkan::diagnostics::kQuadPartnerMarkerMode)),
+        builder_->createCompositeConstruct(type_float4_, marker), original);
+    builder_->createStore(builder_->createTriOp(spv::OpSelect, type_float4_,
+        builder_->createBinOp(spv::OpIEqual, type_bool_, mode,
+            builder_->makeUintConstant(vulkan::diagnostics::kQuadPartnerComponentMarkerMode)),
+        builder_->createCompositeConstruct(type_float4_, component_marker), selected),
+        output_or_var_fragment_data_[0]);
+  }
   // Loaded if needed.
   spv::Id msaa_samples = spv::NoResult;
 

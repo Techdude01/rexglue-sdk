@@ -17,7 +17,7 @@
 #include <rex/cvar.h>
 #include <rex/math.h>
 
-REXCVAR_DEFINE_BOOL(clock_no_scaling, false, "Clock",
+REXCVAR_DEFINE_BOOL(clock_no_scaling, true, "Clock",
                     "Disable clock scaling (inverted: false = scaling enabled)");
 
 REXCVAR_DEFINE_BOOL(clock_source_raw, false, "Clock", "Use raw clock source without scaling");

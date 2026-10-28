@@ -50,10 +50,17 @@ REXCVAR_DEFINE_BOOL(gpu_3d_to_2d_texture, true, "GPU",
                     "Sample problematic 3D textures through 2D-compatible wrappers")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_INT32(anisotropic_override, 3, "GPU",
+REXCVAR_DEFINE_INT32(anisotropic_override, -1, "GPU",
                      "Forces anisotropic filtering for eligible textures.\n"
                      "Higher values keep textures sharper at oblique angles, but increase texture "
                      "sampling cost.\n"
+                     " Default is -1: the sampler uses the anisotropic filter level requested by "
+                     "the guest fetch constant. Any other value overrides the guest, which is not "
+                     "what the game asked for. Measured effect of overriding it (0 vs 3) on a "
+                     "settled menu frame: 2093 pixels changed, median channel delta 1, max 9, "
+                     "confined to grazing-angle panel edges - real but visually negligible. The "
+                     "claim that overriding pulls texels across UV islands on packed atlases is "
+                     "NOT established; see bugs/003-ben-face-rendering/issue.md.\n"
                      " -1 = No override\n"
                      "  0 = Disable anisotropic filtering\n"
                      "  1 = Force 1x anisotropic filtering\n"

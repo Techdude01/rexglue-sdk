@@ -14,7 +14,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
+#include <fstream>
+#include <iterator>
 #include <memory>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -31,11 +35,15 @@
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
+#include <rex/graphics/vulkan/quad_partner_marker.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
+
+REXCVAR_DEFINE_BOOL(vulkan_dump_unsigned_depth_columns, true, "GPU/Vulkan",
+    "Use equivalent unsigned arithmetic for EDRAM depth-dump column addresses");
 
 REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
@@ -69,6 +77,15 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/host_depth_store_1xmsaa_cs.h"
 #include "../shaders/vulkan_spirv/host_depth_store_2xmsaa_cs.h"
 #include "../shaders/vulkan_spirv/host_depth_store_4xmsaa_cs.h"
+#include "../shaders/vulkan_spirv/diagnostic_snapshot_color_cs.h"
+#include "../shaders/vulkan_spirv/diagnostic_snapshot_color_float_cs.h"
+#include "../shaders/vulkan_spirv/diagnostic_snapshot_depth_cs.h"
+#include "../shaders/vulkan_spirv/diagnostic_snapshot_color_single_sample_cs.h"
+#include "../shaders/vulkan_spirv/diagnostic_snapshot_color_float_single_sample_cs.h"
+#include "../shaders/vulkan_spirv/diagnostic_snapshot_depth_single_sample_cs.h"
+#include "../shaders/vulkan_spirv/diagnostic_snapshot_color_packed_cs.h"
+#include "../shaders/vulkan_spirv/diagnostic_snapshot_color_packed_single_sample_cs.h"
+#include "../shaders/vulkan_spirv/diagnostic_snapshot_depth_packed_cs.h"
 #include "../shaders/vulkan_spirv/passthrough_position_xy_vs.h"
 #include "../shaders/vulkan_spirv/resolve_clear_32bpp_cs.h"
 #include "../shaders/vulkan_spirv/resolve_clear_32bpp_scaled_cs.h"
@@ -974,6 +991,45 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
+  if (diagnostic_snapshot_mapping_) {
+    dfn.vkUnmapMemory(device, diagnostic_snapshot_memory_);
+    diagnostic_snapshot_mapping_ = nullptr;
+  }
+  if (diagnostic_snapshot_constants_mapping_) {
+    dfn.vkUnmapMemory(device, diagnostic_snapshot_constants_memory_);
+    diagnostic_snapshot_constants_mapping_ = nullptr;
+  }
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         diagnostic_snapshot_constants_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         diagnostic_snapshot_constants_memory_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         diagnostic_snapshot_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         diagnostic_snapshot_memory_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                         diagnostic_snapshot_color_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                         diagnostic_snapshot_color_float_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                         diagnostic_snapshot_depth_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(
+      dfn.vkDestroyPipeline, device, diagnostic_snapshot_color_single_sample_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(
+      dfn.vkDestroyPipeline, device, diagnostic_snapshot_color_float_single_sample_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(
+      dfn.vkDestroyPipeline, device, diagnostic_snapshot_depth_single_sample_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                         diagnostic_snapshot_color_packed_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(
+      dfn.vkDestroyPipeline, device, diagnostic_snapshot_color_packed_single_sample_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                         diagnostic_snapshot_depth_packed_pipeline_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         diagnostic_snapshot_color_pipeline_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         diagnostic_snapshot_depth_pipeline_layout_);
+
   // Destroy all render targets before the descriptor set pool is destroyed -
   // may happen if shutting down the VulkanRenderTargetCache by destroying it,
   // so ShutdownCommon is called by the RenderTargetCache destructor, when it's
@@ -1138,6 +1194,62 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                  draw_resolution_scale_y(), IsFixedRG16TruncatedToMinus1To1(),
                                  IsFixedRGBA16TruncatedToMinus1To1(), resolve_info)) {
     return false;
+  }
+
+  const uint64_t diagnostic_frame = command_processor_.GetCurrentFrame();
+  const uint32_t diagnostic_ordinal = command_processor_.GetFragmentDiagnosticLastDrawOrdinal();
+  constexpr uint64_t kBenFrontbufferBase = UINT64_C(0x0F018000);
+  constexpr uint64_t kBenFrontbufferLength = UINT64_C(0x00398000);
+  const uint64_t copy_extent_start = resolve_info.copy_dest_extent_start;
+  const uint64_t copy_extent_end = copy_extent_start + resolve_info.copy_dest_extent_length;
+  if (diagnostic_frame == 6000 &&
+      copy_extent_start < kBenFrontbufferBase + kBenFrontbufferLength &&
+      copy_extent_end > kBenFrontbufferBase) {
+    const auto surface_info = register_file().Get<reg::RB_SURFACE_INFO>();
+    const auto copy_dest_pitch = register_file().Get<reg::RB_COPY_DEST_PITCH>();
+    const bool copying_depth = resolve_info.IsCopyingDepth();
+    const auto& edram = copying_depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
+    REXGPU_INFO(
+        "[DEBUG-BEN-RESOLVE-7C2A] frame={} draw={} dst_guest_range=[0x{:08X},0x{:08X}) "
+        "dst_base=0x{:08X} dst_format={} dst_pitch={}x{} dst_tile_offset=({},{} div8) "
+        "src_kind={} src_base=0x{:X} src_edram_offset=({},{} div8) src_extent={}x{} "
+        "src_base_tile={} src_surface_pitch={} msaa={} edram_surface_pitch={} scale={}x{}",
+        diagnostic_frame, diagnostic_ordinal,
+        uint32_t(resolve_info.copy_dest_extent_start), uint32_t(copy_extent_end),
+        resolve_info.copy_dest_base, uint32_t(resolve_info.copy_dest_info.copy_dest_format),
+        uint32_t(copy_dest_pitch.copy_dest_pitch), uint32_t(copy_dest_pitch.copy_dest_height),
+        uint32_t(resolve_info.copy_dest_coordinate_info.offset_x_div_8),
+        uint32_t(resolve_info.copy_dest_coordinate_info.offset_y_div_8),
+        copying_depth ? "depth" : "color",
+        copying_depth ? resolve_info.depth_original_base : resolve_info.color_original_base,
+        uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8),
+        uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8),
+        uint32_t(resolve_info.coordinate_info.width_div_8) * 8u,
+        resolve_info.height_div_8 * 8u, uint32_t(edram.base_tiles), uint32_t(edram.pitch_tiles),
+        uint32_t(surface_info.msaa_samples), surface_info.surface_pitch,
+        uint32_t(resolve_info.coordinate_info.draw_resolution_scale_x),
+        uint32_t(resolve_info.coordinate_info.draw_resolution_scale_y));
+  }
+  if (diagnostic_frame == 6000 && diagnostic_ordinal >= 240 && diagnostic_ordinal <= 275) {
+    REXGPU_INFO(
+        "RT provenance resolve: frame={} ordinal={} copy_control=0x{:08X} "
+        "src_select={} sample_select={} copy_command={} color_clear={} depth_clear={} "
+        "color_base=0x{:X} depth_base=0x{:X} rect=({},{} {}x{}) dst_base=0x{:X} "
+        "dst_start=0x{:X} dst_length=0x{:X} rb_color_clear=0x{:08X} "
+        "rb_color_clear_lo=0x{:08X} rb_depth_clear=0x{:08X}",
+        diagnostic_frame, diagnostic_ordinal, resolve_info.rb_copy_control.value,
+        uint32_t(resolve_info.rb_copy_control.copy_src_select),
+        uint32_t(resolve_info.rb_copy_control.copy_sample_select),
+        uint32_t(resolve_info.rb_copy_control.copy_command),
+        uint32_t(resolve_info.rb_copy_control.color_clear_enable),
+        uint32_t(resolve_info.rb_copy_control.depth_clear_enable), resolve_info.color_original_base,
+        resolve_info.depth_original_base,
+        uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8),
+        uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8),
+        uint32_t(resolve_info.coordinate_info.width_div_8),
+        resolve_info.height_div_8, resolve_info.copy_dest_base,
+        resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
+        resolve_info.rb_color_clear, resolve_info.rb_color_clear_lo, resolve_info.rb_depth_clear);
   }
 
   // Nothing to copy/clear.
@@ -1336,6 +1448,34 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                   clear_rectangle.height_pixels < height_pixels) {
                 can_promote = false;
                 break;
+              }
+            }
+          }
+
+          if (diagnostic_frame == 6000 && diagnostic_ordinal >= 240 &&
+              diagnostic_ordinal <= 275) {
+            for (uint32_t i = 0; i < 2; ++i) {
+              const RenderTarget* rt = clear_render_targets[i];
+              const std::vector<Transfer>& transfers = clear_transfers_[i];
+              const VulkanRenderTarget* vk_rt = rt ? static_cast<const VulkanRenderTarget*>(rt) : nullptr;
+              REXGPU_INFO(
+                  "RT provenance resolve-clear-target: frame={} ordinal={} slot={} "
+                  "image=0x{:X} key=0x{:08X} pending_before={} promote={} "
+                  "rect=({},{} {}x{}) transfer_count={}",
+                  diagnostic_frame, diagnostic_ordinal, i,
+                  reinterpret_cast<uintptr_t>(vk_rt ? vk_rt->image() : VK_NULL_HANDLE),
+                  rt ? rt->key().key : 0, vk_rt && vk_rt->has_pending_clear(), can_promote,
+                  clear_rectangle.x_pixels, clear_rectangle.y_pixels,
+                  clear_rectangle.width_pixels, clear_rectangle.height_pixels, transfers.size());
+              for (size_t transfer_index = 0; transfer_index < transfers.size(); ++transfer_index) {
+                const Transfer& transfer = transfers[transfer_index];
+                REXGPU_INFO(
+                    "RT provenance resolve-clear-transfer: frame={} ordinal={} slot={} index={} "
+                    "tiles=[{},{}] source=0x{:X} host_depth_source=0x{:X}",
+                    diagnostic_frame, diagnostic_ordinal, i, transfer_index,
+                    transfer.start_tiles, transfer.end_tiles,
+                    reinterpret_cast<uintptr_t>(transfer.source),
+                    reinterpret_cast<uintptr_t>(transfer.host_depth_source));
               }
             }
           }
@@ -1547,6 +1687,31 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
   return true;
 }
 
+bool VulkanRenderTargetCache::HasAnyPendingClear() const {
+  RenderTarget* const* rts = last_update_accumulated_render_targets();
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (rts[i] && static_cast<const VulkanRenderTarget*>(rts[i])->has_pending_clear()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+VkImageView VulkanRenderTargetCache::GetLastUpdateDrawAttachmentView(uint32_t index) const {
+  if (index >= 1 + xenos::kMaxColorRenderTargets ||
+      !(last_update_render_pass_key_.depth_and_color_used & (1u << index))) {
+    return VK_NULL_HANDLE;
+  }
+  const RenderTarget* target = last_update_accumulated_render_targets()[index];
+  if (!target) return VK_NULL_HANDLE;
+  const auto* vulkan_target = static_cast<const VulkanRenderTarget*>(target);
+  return index ? vulkan_target->view_depth_color() : vulkan_target->view_depth_stencil();
+}
+
+bool VulkanRenderTargetCache::CanRetainColorAttachmentsForDepthOnlyDraw() const {
+  return command_processor_.CanRetainActiveRenderTargetAttachments() && !HasAnyPendingClear();
+}
+
 void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
     VkRenderingAttachmentInfo* color_attachments, uint32_t* color_attachment_count_out,
     VkRenderingAttachmentInfo* depth_attachment,
@@ -1604,6 +1769,653 @@ void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
     }
   }
   *color_attachment_count_out = color_attachment_count;
+
+  // Narrow provenance trace for the frame-6000 face-stage snapshot. This is
+  // emitted at the point where pending clears become Vulkan load operations,
+  // before ClearPendingClear() makes that information unavailable.
+  if (command_processor_.GetCurrentFrame() == 6000 &&
+      command_processor_.GetFragmentDiagnosticLastDrawOrdinal() >= 240 &&
+      command_processor_.GetFragmentDiagnosticLastDrawOrdinal() <= 275) {
+    const uint32_t ordinal = command_processor_.GetFragmentDiagnosticLastDrawOrdinal();
+    REXGPU_INFO(
+        "RT provenance begin: frame={} ordinal={} rpkey=0x{:08X} colors={} "
+        "depth_used={} msaa={} framebuffer=0x{:X}",
+        command_processor_.GetCurrentFrame(), ordinal, key.key, color_attachment_count,
+        (key.depth_and_color_used & 1) != 0, uint32_t(key.msaa_samples),
+        reinterpret_cast<uintptr_t>(last_update_framebuffer_
+                                        ? last_update_framebuffer_->framebuffer
+                                        : VK_NULL_HANDLE));
+    for (uint32_t i = 0; i < color_attachment_count; ++i) {
+      const VkRenderingAttachmentInfo& a = color_attachments[i];
+      const RenderTarget* rt = rts[1 + i];
+      REXGPU_INFO(
+          "RT provenance color: ordinal={} index={} image=0x{:X} view=0x{:X} "
+          "format={} layout={} load={} store={} clear=({:.9g},{:.9g},{:.9g},{:.9g}) "
+          "prior_layout={} prior_access=0x{:X}",
+          ordinal, i, reinterpret_cast<uintptr_t>(static_cast<const VulkanRenderTarget*>(rt)->image()),
+          reinterpret_cast<uintptr_t>(a.imageView), uint32_t(rt->key().GetColorFormat()),
+          uint32_t(a.imageLayout), uint32_t(a.loadOp), uint32_t(a.storeOp),
+          a.clearValue.color.float32[0], a.clearValue.color.float32[1],
+          a.clearValue.color.float32[2], a.clearValue.color.float32[3],
+          uint32_t(static_cast<const VulkanRenderTarget*>(rt)->current_layout()),
+          uint32_t(static_cast<const VulkanRenderTarget*>(rt)->current_access_mask()));
+    }
+    if (depth_attachment->sType == VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO) {
+      const RenderTarget* rt = rts[0];
+      REXGPU_INFO(
+          "RT provenance depth: ordinal={} image=0x{:X} view=0x{:X} format={} "
+          "layout={} load={} store={} clear_depth={:.9g} clear_stencil={} "
+          "prior_layout={} prior_access=0x{:X}",
+          ordinal, reinterpret_cast<uintptr_t>(static_cast<const VulkanRenderTarget*>(rt)->image()),
+          reinterpret_cast<uintptr_t>(depth_attachment->imageView), uint32_t(rt->key().GetDepthFormat()),
+          uint32_t(depth_attachment->imageLayout), uint32_t(depth_attachment->loadOp),
+          uint32_t(depth_attachment->storeOp), depth_attachment->clearValue.depthStencil.depth,
+          depth_attachment->clearValue.depthStencil.stencil,
+          uint32_t(static_cast<const VulkanRenderTarget*>(rt)->current_layout()),
+          uint32_t(static_cast<const VulkanRenderTarget*>(rt)->current_access_mask()));
+    }
+  }
+}
+
+void VulkanRenderTargetCache::LogLastUpdateDepthAttachmentState(uint64_t frame,
+                                                                 uint32_t draw) const {
+  const RenderPassKey key = last_update_render_pass_key_;
+  RenderTarget* const* rts = last_update_accumulated_render_targets();
+  if (!(key.depth_and_color_used & 1) || !rts[0]) {
+    REXGPU_WARN("BEN_DEPTH_ATTACHMENT: frame={} draw={} bound=false pass_key=0x{:X}", frame,
+                draw, key.key);
+    return;
+  }
+  const auto* rt = static_cast<const VulkanRenderTarget*>(rts[0]);
+  const auto depth_key = rt->key();
+  const uint32_t depth_width = depth_key.GetWidth() * draw_resolution_scale_x();
+  const uint32_t depth_height = GetRenderTargetHeight(depth_key.pitch_tiles_at_32bpp,
+                                                       depth_key.msaa_samples) *
+                                draw_resolution_scale_y();
+  const uint32_t depth_samples = uint32_t(1) << uint32_t(depth_key.msaa_samples);
+  VkFormat color_vk_format = VK_FORMAT_UNDEFINED;
+  uint32_t color_width = 0;
+  uint32_t color_height = 0;
+  uint32_t color_host_samples = 0;
+  if ((key.depth_and_color_used & 0b10) && rts[1]) {
+    const auto color_key = static_cast<const VulkanRenderTarget*>(rts[1])->key();
+    color_vk_format = GetColorOwnershipTransferVulkanFormat(color_key.GetColorFormat(),
+                                                            color_key.msaa_samples);
+    color_width = color_key.GetWidth() * draw_resolution_scale_x();
+    color_height = GetRenderTargetHeight(color_key.pitch_tiles_at_32bpp, color_key.msaa_samples) *
+                   draw_resolution_scale_y();
+    color_host_samples = uint32_t(1) << uint32_t(color_key.msaa_samples);
+  }
+  const bool pending_clear = rt->has_pending_clear();
+  const auto clear_value = rt->pending_clear_value();
+  REXGPU_WARN(
+      "BEN_DEPTH_ATTACHMENT: frame={} draw={} bound=true pass_key=0x{:X} "
+      "image=0x{:X} view=0x{:X} format={} pending_clear={} clear_depth={:.9g} "
+      "clear_stencil={} extent={}x{} samples={} vk_format={} color_extent={}x{} "
+      "color_samples={} color_vk_format={} layout={} access=0x{:X}",
+      frame, draw, key.key, reinterpret_cast<uintptr_t>(rt->image()),
+      reinterpret_cast<uintptr_t>(rt->view_depth_stencil()),
+      uint32_t(rt->key().GetDepthFormat()), pending_clear,
+      clear_value.depthStencil.depth, clear_value.depthStencil.stencil,
+      depth_width, depth_height, depth_samples,
+      uint32_t(GetDepthVulkanFormat(depth_key.GetDepthFormat())), color_width, color_height,
+      color_host_samples, uint32_t(color_vk_format),
+      uint32_t(rt->current_layout()), uint32_t(rt->current_access_mask()));
+}
+
+namespace {
+xenos::MsaaSamples DiagnosticHostMsaa(xenos::MsaaSamples guest) {
+  if (diagnostics::ForceHostSingleSample() && guest == xenos::MsaaSamples::k2X) {
+    return xenos::MsaaSamples::k1X;
+  }
+  return guest;
+}
+}  // namespace
+
+bool VulkanRenderTargetCache::CaptureDiagnosticSnapshot(
+    const diagnostics::RenderTargetSnapshotRequest& request,
+    diagnostics::RenderTargetSnapshotBoundary boundary,
+    diagnostics::BenOcclusionSnapshotBoundaryMetadata metadata) {
+  using namespace diagnostics;
+  if (!request.valid() || !request.color || (!request.compact_ben && !request.depth) ||
+      (path_ != Path::kHostRenderTargets)) {
+    return false;
+  }
+  if (diagnostic_snapshot_frame_ && diagnostic_snapshot_frame_ != request.frame) return false;
+  if (!diagnostic_snapshot_frame_) {
+    diagnostic_snapshot_frame_ = request.frame;
+    diagnostic_snapshot_request_ = request;
+    diagnostic_snapshot_boundaries_.clear();
+    diagnostic_snapshot_ben_metadata_.clear();
+    diagnostic_snapshot_boundary_count_ = 0;
+    diagnostic_snapshot_overflow_logged_ = false;
+
+    const VkDeviceSize one_boundary_bytes = request.payload_bytes();
+    const VkDeviceSize kDiagnosticSnapshotBufferMaxBytes = request.compact_ben
+        ? std::min<VkDeviceSize>(
+              VkDeviceSize(kBenOcclusionSnapshotMaxBytes),
+              command_processor_.GetVulkanDevice()->properties().maxStorageBufferRange)
+        : VkDeviceSize(16 * 1024 * 1024);
+    const VkDeviceSize usable_snapshot_bytes =
+        kDiagnosticSnapshotBufferMaxBytes > sizeof(uint32_t)
+            ? kDiagnosticSnapshotBufferMaxBytes - sizeof(uint32_t)
+            : 0;
+    diagnostic_snapshot_max_boundaries_ = uint32_t(std::min<uint64_t>(
+        request.compact_ben ? kBenOcclusionSnapshotMaxBoundaries
+                            : kRenderTargetSnapshotMaxBoundaries,
+        usable_snapshot_bytes / std::max<VkDeviceSize>(one_boundary_bytes, 1)));
+    // Reserve one final word as a GPU-dispatch/readback canary. It is not part
+    // of the serialized sample payload.
+    diagnostic_snapshot_capacity_bytes_ =
+        VkDeviceSize(diagnostic_snapshot_max_boundaries_) * one_boundary_bytes + sizeof(uint32_t);
+    if (request.compact_ben) {
+      REXGPU_INFO(
+          "Ben color snapshot storage cap: max_storage_range={} payload_per_boundary={} max_boundaries={}",
+          kDiagnosticSnapshotBufferMaxBytes, one_boundary_bytes,
+          diagnostic_snapshot_max_boundaries_);
+    }
+    if (!diagnostic_snapshot_max_boundaries_ ||
+        !ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            command_processor_.GetVulkanDevice(), diagnostic_snapshot_capacity_bytes_,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, ui::vulkan::util::MemoryPurpose::kReadback,
+            diagnostic_snapshot_buffer_, diagnostic_snapshot_memory_,
+            &diagnostic_snapshot_memory_type_, &diagnostic_snapshot_memory_size_)) {
+      diagnostic_snapshot_frame_ = 0;
+      return false;
+    }
+    if (command_processor_.GetVulkanDevice()->functions().vkMapMemory(
+            command_processor_.GetVulkanDevice()->device(), diagnostic_snapshot_memory_, 0,
+            VK_WHOLE_SIZE, 0, &diagnostic_snapshot_mapping_) != VK_SUCCESS) {
+      ui::vulkan::util::DestroyAndNullHandle(
+          command_processor_.GetVulkanDevice()->functions().vkDestroyBuffer,
+          command_processor_.GetVulkanDevice()->device(), diagnostic_snapshot_buffer_);
+      ui::vulkan::util::DestroyAndNullHandle(
+          command_processor_.GetVulkanDevice()->functions().vkFreeMemory,
+          command_processor_.GetVulkanDevice()->device(), diagnostic_snapshot_memory_);
+      diagnostic_snapshot_frame_ = 0;
+      return false;
+    }
+    std::memset(diagnostic_snapshot_mapping_, 0, size_t(diagnostic_snapshot_capacity_bytes_));
+    ui::vulkan::util::FlushMappedMemoryRange(
+        command_processor_.GetVulkanDevice(), diagnostic_snapshot_memory_,
+        diagnostic_snapshot_memory_type_, 0, diagnostic_snapshot_memory_size_,
+        diagnostic_snapshot_capacity_bytes_);
+
+    const VkDeviceSize storage_alignment = std::max<VkDeviceSize>(
+        std::max<VkDeviceSize>(
+            command_processor_.GetVulkanDevice()->properties().minStorageBufferOffsetAlignment,
+            command_processor_.GetVulkanDevice()->properties().nonCoherentAtomSize),
+        1);
+    constexpr VkDeviceSize kSnapshotControlSize = 32;
+    diagnostic_snapshot_constants_stride_ =
+        ((kSnapshotControlSize + storage_alignment - 1) / storage_alignment) * storage_alignment;
+    const VkDeviceSize constants_size =
+        diagnostic_snapshot_constants_stride_ * diagnostic_snapshot_max_boundaries_;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            command_processor_.GetVulkanDevice(), constants_size,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, ui::vulkan::util::MemoryPurpose::kUpload,
+            diagnostic_snapshot_constants_buffer_, diagnostic_snapshot_constants_memory_,
+            &diagnostic_snapshot_constants_memory_type_,
+            &diagnostic_snapshot_constants_memory_size_) ||
+        command_processor_.GetVulkanDevice()->functions().vkMapMemory(
+            command_processor_.GetVulkanDevice()->device(), diagnostic_snapshot_constants_memory_,
+            0, VK_WHOLE_SIZE, 0, &diagnostic_snapshot_constants_mapping_) != VK_SUCCESS) {
+      diagnostic_snapshot_frame_ = 0;
+      return false;
+    }
+  }
+
+  if (diagnostic_snapshot_boundary_count_ >= diagnostic_snapshot_max_boundaries_) {
+    if (!diagnostic_snapshot_overflow_logged_) {
+      diagnostic_snapshot_overflow_logged_ = true;
+      REXGPU_WARN("Render target snapshot reached its {}-boundary capacity at frame {}",
+                  diagnostic_snapshot_max_boundaries_, request.frame);
+    }
+    return false;
+  }
+
+  RenderPassKey pass_key = last_update_render_pass_key_;
+  RenderTarget* const* render_targets = last_update_accumulated_render_targets();
+  const uint32_t color_attachment = request.color_target + 1;
+  auto* color_rt = (request.color && (pass_key.depth_and_color_used & (1u << color_attachment)) &&
+                    render_targets[color_attachment])
+                       ? static_cast<VulkanRenderTarget*>(render_targets[color_attachment])
+                       : nullptr;
+  auto* depth_rt = (request.depth && (pass_key.depth_and_color_used & 0b1) && render_targets[0])
+                       ? static_cast<VulkanRenderTarget*>(render_targets[0])
+                       : nullptr;
+  if (request.ben_pixel_history) {
+    metadata.renderpass_attachment_mask = pass_key.depth_and_color_used;
+    metadata.depth_attachment_bound = (pass_key.depth_and_color_used & 1u) != 0 ? 1u : 0u;
+    metadata.host_color_vk_format = color_rt
+        ? uint32_t(GetColorVulkanFormat(color_rt->key().GetColorFormat()))
+        : uint32_t(VK_FORMAT_UNDEFINED);
+  }
+
+  const VkDeviceSize one_boundary_bytes = request.payload_bytes();
+  const uint32_t destination_word_offset = uint32_t(
+      (VkDeviceSize(diagnostic_snapshot_boundary_count_) * one_boundary_bytes) / sizeof(uint32_t));
+  boundary.frame = request.frame;
+  boundary.point = uint32_t(boundary.point);
+  boundary.width = request.width;
+  boundary.height = request.height;
+  boundary.payload_word_offset = destination_word_offset;
+  boundary.color_image = 0;
+  boundary.depth_image = 0;
+  boundary.color_format = UINT32_MAX;
+  boundary.depth_format = UINT32_MAX;
+  boundary.capture_flags &= 0xFFFF0000u;
+
+  uint32_t host_samples = 0;
+  uint32_t sample_0 = 0;
+  uint32_t sample_1 = 0;
+  if (depth_rt) {
+    const auto key = depth_rt->key();
+    const xenos::MsaaSamples depth_msaa = DiagnosticHostMsaa(key.msaa_samples);
+    host_samples = uint32_t(1) << uint32_t(depth_msaa);
+    if (depth_msaa == xenos::MsaaSamples::k2X && !msaa_2x_attachments_supported_) {
+      host_samples = 4;
+      sample_1 = 3;
+    } else if (host_samples > 1) {
+      sample_1 = 1;
+    }
+    boundary.depth_image = uint64_t(reinterpret_cast<uintptr_t>(depth_rt->image()));
+    boundary.depth_format = uint32_t(key.GetDepthFormat());
+    boundary.capture_flags |= 2;
+  }
+  if (color_rt) {
+    const auto key = color_rt->key();
+    bool source_is_uint = false;
+    GetColorOwnershipTransferVulkanFormat(key.GetColorFormat(), key.msaa_samples,
+                                          &source_is_uint);
+    const xenos::MsaaSamples color_msaa = DiagnosticHostMsaa(key.msaa_samples);
+    const uint32_t color_samples = uint32_t(1) << uint32_t(color_msaa);
+    if (color_msaa == xenos::MsaaSamples::k2X && !msaa_2x_attachments_supported_) {
+      host_samples = 4;
+      sample_0 = 0;
+      sample_1 = 3;
+    } else if (!host_samples) {
+      host_samples = color_samples;
+      sample_1 = color_samples > 1 ? 1 : 0;
+    }
+    boundary.color_image = uint64_t(reinterpret_cast<uintptr_t>(color_rt->image()));
+    boundary.color_format = uint32_t(key.GetColorFormat());
+    if (source_is_uint) boundary.capture_flags |= 1 | 4;
+  }
+  if (request.compact_ben) {
+    if ((host_samples != 1 && host_samples != 2) || !color_rt || (boundary.capture_flags & 4u)) {
+      REXGPU_WARN(
+          "Ben color snapshot unsupported target format/sample count at draw {} (samples={}, color={}, integer={})",
+          boundary.draw_ordinal, host_samples, color_rt != nullptr,
+          (boundary.capture_flags & 4u) != 0);
+      return false;
+    }
+    if (host_samples == 1) boundary.capture_flags |= 16u;
+  }
+  boundary.host_sample_count = host_samples;
+  boundary.guest_sample_0_host_index = sample_0;
+  boundary.guest_sample_1_host_index = sample_1;
+  if (!color_rt && !depth_rt) {
+    boundary.capture_flags = 0;
+    diagnostic_snapshot_boundaries_.push_back(boundary);
+    ++diagnostic_snapshot_boundary_count_;
+    REXGPU_INFO("Render target snapshot boundary: frame={} draw={} point={} no_color_depth=1",
+                boundary.frame, boundary.draw_ordinal, boundary.point);
+    return true;
+  }
+  if (host_samples == 0 || sample_0 >= host_samples || sample_1 >= host_samples) return false;
+
+  const auto& dfn = command_processor_.GetVulkanDevice()->functions();
+  const VkDevice device = command_processor_.GetVulkanDevice()->device();
+  struct SnapshotConstants {
+    int32_t origin[2];
+    uint32_t extent[2];
+    uint32_t destination_word_offset;
+    uint32_t host_sample_0;
+    uint32_t host_sample_1;
+    uint32_t canary_word_index;
+  };
+  static_assert(sizeof(SnapshotConstants) == 32);
+  const VkDeviceSize constants_offset =
+      diagnostic_snapshot_boundary_count_ * diagnostic_snapshot_constants_stride_;
+  const uint32_t capture_origin_y = request.ben_pixel_history
+                                       ? metadata.capture_origin_y
+                                       : request.y;
+  SnapshotConstants constants{{int32_t(request.x), int32_t(capture_origin_y)},
+                               {request.width, request.height}, destination_word_offset,
+                               sample_0, sample_1,
+                               uint32_t(diagnostic_snapshot_capacity_bytes_ / sizeof(uint32_t) - 1)};
+  std::memcpy(static_cast<uint8_t*>(diagnostic_snapshot_constants_mapping_) + constants_offset,
+              &constants, sizeof(constants));
+  ui::vulkan::util::FlushMappedMemoryRange(
+      command_processor_.GetVulkanDevice(), diagnostic_snapshot_constants_memory_,
+      diagnostic_snapshot_constants_memory_type_, constants_offset,
+      diagnostic_snapshot_constants_memory_size_, sizeof(constants));
+  if (diagnostic_snapshot_color_pipeline_ == VK_NULL_HANDLE) {
+    VkDescriptorSetLayout color_sets[] = {
+        command_processor_.GetSingleTransientDescriptorLayout(
+            VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferPairCompute),
+        descriptor_set_layout_sampled_image_};
+    VkDescriptorSetLayout depth_sets[] = {
+        command_processor_.GetSingleTransientDescriptorLayout(
+            VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferPairCompute),
+        descriptor_set_layout_sampled_image_x2_};
+    VkPipelineLayoutCreateInfo layout_info{};
+    layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.setLayoutCount = 2;
+    layout_info.pSetLayouts = color_sets;
+    if (dfn.vkCreatePipelineLayout(device, &layout_info, nullptr,
+                                   &diagnostic_snapshot_color_pipeline_layout_) != VK_SUCCESS) {
+      return false;
+    }
+    layout_info.pSetLayouts = depth_sets;
+    if (dfn.vkCreatePipelineLayout(device, &layout_info, nullptr,
+                                   &diagnostic_snapshot_depth_pipeline_layout_) != VK_SUCCESS) {
+      return false;
+    }
+    diagnostic_snapshot_color_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+        command_processor_.GetVulkanDevice(), diagnostic_snapshot_color_pipeline_layout_,
+        shaders::diagnostic_snapshot_color_cs, sizeof(shaders::diagnostic_snapshot_color_cs));
+    diagnostic_snapshot_color_float_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+        command_processor_.GetVulkanDevice(), diagnostic_snapshot_color_pipeline_layout_,
+        shaders::diagnostic_snapshot_color_float_cs,
+        sizeof(shaders::diagnostic_snapshot_color_float_cs));
+    diagnostic_snapshot_depth_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+        command_processor_.GetVulkanDevice(), diagnostic_snapshot_depth_pipeline_layout_,
+        shaders::diagnostic_snapshot_depth_cs, sizeof(shaders::diagnostic_snapshot_depth_cs));
+    diagnostic_snapshot_color_single_sample_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+        command_processor_.GetVulkanDevice(), diagnostic_snapshot_color_pipeline_layout_,
+        shaders::diagnostic_snapshot_color_single_sample_cs,
+        sizeof(shaders::diagnostic_snapshot_color_single_sample_cs));
+    diagnostic_snapshot_color_float_single_sample_pipeline_ =
+        ui::vulkan::util::CreateComputePipeline(
+            command_processor_.GetVulkanDevice(), diagnostic_snapshot_color_pipeline_layout_,
+            shaders::diagnostic_snapshot_color_float_single_sample_cs,
+            sizeof(shaders::diagnostic_snapshot_color_float_single_sample_cs));
+    diagnostic_snapshot_depth_single_sample_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+        command_processor_.GetVulkanDevice(), diagnostic_snapshot_depth_pipeline_layout_,
+        shaders::diagnostic_snapshot_depth_single_sample_cs,
+        sizeof(shaders::diagnostic_snapshot_depth_single_sample_cs));
+    diagnostic_snapshot_color_packed_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+        command_processor_.GetVulkanDevice(), diagnostic_snapshot_color_pipeline_layout_,
+        shaders::diagnostic_snapshot_color_packed_cs,
+        sizeof(shaders::diagnostic_snapshot_color_packed_cs));
+    diagnostic_snapshot_color_packed_single_sample_pipeline_ =
+        ui::vulkan::util::CreateComputePipeline(
+            command_processor_.GetVulkanDevice(), diagnostic_snapshot_color_pipeline_layout_,
+            shaders::diagnostic_snapshot_color_packed_single_sample_cs,
+            sizeof(shaders::diagnostic_snapshot_color_packed_single_sample_cs));
+    diagnostic_snapshot_depth_packed_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+        command_processor_.GetVulkanDevice(), diagnostic_snapshot_depth_pipeline_layout_,
+        shaders::diagnostic_snapshot_depth_packed_cs,
+        sizeof(shaders::diagnostic_snapshot_depth_packed_cs));
+    if (diagnostic_snapshot_color_pipeline_ == VK_NULL_HANDLE ||
+        diagnostic_snapshot_color_float_pipeline_ == VK_NULL_HANDLE ||
+        diagnostic_snapshot_depth_pipeline_ == VK_NULL_HANDLE ||
+        diagnostic_snapshot_color_single_sample_pipeline_ == VK_NULL_HANDLE ||
+        diagnostic_snapshot_color_float_single_sample_pipeline_ == VK_NULL_HANDLE ||
+        diagnostic_snapshot_depth_single_sample_pipeline_ == VK_NULL_HANDLE ||
+        diagnostic_snapshot_color_packed_pipeline_ == VK_NULL_HANDLE ||
+        diagnostic_snapshot_color_packed_single_sample_pipeline_ == VK_NULL_HANDLE ||
+        diagnostic_snapshot_depth_packed_pipeline_ == VK_NULL_HANDLE) {
+      return false;
+    }
+  }
+
+  VkDescriptorSet output_set = command_processor_.AllocateSingleTransientDescriptor(
+      VulkanCommandProcessor::SingleTransientDescriptorLayout::kStorageBufferPairCompute);
+  if (output_set == VK_NULL_HANDLE) return false;
+  VkDescriptorBufferInfo buffer_infos[2]{};
+  buffer_infos[0].buffer = diagnostic_snapshot_buffer_;
+  buffer_infos[0].range = diagnostic_snapshot_capacity_bytes_;
+  buffer_infos[1].buffer = diagnostic_snapshot_constants_buffer_;
+  buffer_infos[1].offset = constants_offset;
+  buffer_infos[1].range = sizeof(SnapshotConstants);
+  VkWriteDescriptorSet writes[2]{};
+  for (uint32_t i = 0; i < 2; ++i) {
+    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[i].dstSet = output_set;
+    writes[i].dstBinding = i;
+    writes[i].descriptorCount = 1;
+    writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[i].pBufferInfo = &buffer_infos[i];
+  }
+  dfn.vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+
+  const uint32_t capture_width = request.width;
+  const uint32_t capture_height = request.height;
+  if ((color_rt && (request.x + capture_width > color_rt->key().GetWidth() ||
+                    capture_origin_y + capture_height > GetRenderTargetHeight(
+                        color_rt->key().pitch_tiles_at_32bpp,
+                        color_rt->key().msaa_samples))) ||
+      (depth_rt && (request.x + capture_width > depth_rt->key().GetWidth() ||
+                    capture_origin_y + capture_height > GetRenderTargetHeight(
+                        depth_rt->key().pitch_tiles_at_32bpp,
+                        depth_rt->key().msaa_samples)))) {
+    return false;
+  }
+
+  command_processor_.EndRenderPass();
+  auto transition_to_compute = [&](VulkanRenderTarget& rt) {
+    VkPipelineStageFlags dst_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    VkAccessFlags dst_access = VK_ACCESS_SHADER_READ_BIT;
+    const bool is_depth = rt.key().is_depth;
+    const VkImageSubresourceRange range = ui::vulkan::util::InitializeSubresourceRange(
+        is_depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT
+                 : VK_IMAGE_ASPECT_COLOR_BIT);
+    command_processor_.PushImageMemoryBarrier(
+        rt.image(), range, rt.current_stage_mask(), dst_stage, rt.current_access_mask(),
+        dst_access, rt.current_layout(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    rt.SetUsage(dst_stage, dst_access, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  };
+  if (color_rt) transition_to_compute(*color_rt);
+  if (depth_rt) transition_to_compute(*depth_rt);
+  command_processor_.SubmitBarriers(true);
+
+  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  if (color_rt) {
+    VkDescriptorSet descriptors[] = {output_set, color_rt->GetDescriptorSetTransferSource()};
+    const bool integer_view = (boundary.capture_flags & 4) != 0;
+    // Vulkan requires OpTypeImage.MS to match the image's sample count.
+    // A texture2DMS fetch against a single-sample image is invalid even when
+    // the requested sample index is zero (VUID-RuntimeSpirv-samples-08726).
+    const bool single_sample =
+        DiagnosticHostMsaa(color_rt->key().msaa_samples) == xenos::MsaaSamples::k1X;
+    command_processor_.BindExternalComputePipeline(
+        request.compact_ben
+            ? (single_sample ? diagnostic_snapshot_color_packed_single_sample_pipeline_
+                             : diagnostic_snapshot_color_packed_pipeline_)
+        : single_sample
+            ? (integer_view ? diagnostic_snapshot_color_single_sample_pipeline_
+                            : diagnostic_snapshot_color_float_single_sample_pipeline_)
+            : (integer_view ? diagnostic_snapshot_color_pipeline_
+                            : diagnostic_snapshot_color_float_pipeline_));
+    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                           diagnostic_snapshot_color_pipeline_layout_, 0, 2,
+                                           descriptors, 0, nullptr);
+    command_buffer.CmdVkDispatch((request.width + 7) / 8, (request.height + 7) / 8, 1);
+    if (!integer_view) boundary.capture_flags |= 8;
+  }
+  if (depth_rt) {
+    VkDescriptorSet descriptors[] = {output_set, depth_rt->GetDescriptorSetTransferSource()};
+    const bool single_sample =
+        DiagnosticHostMsaa(depth_rt->key().msaa_samples) == xenos::MsaaSamples::k1X;
+    command_processor_.BindExternalComputePipeline(
+        request.compact_ben ? diagnostic_snapshot_depth_packed_pipeline_
+        : single_sample ? diagnostic_snapshot_depth_single_sample_pipeline_
+                        : diagnostic_snapshot_depth_pipeline_);
+    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                           diagnostic_snapshot_depth_pipeline_layout_, 0, 2,
+                                           descriptors, 0, nullptr);
+    command_buffer.CmdVkDispatch((request.width + 7) / 8, (request.height + 7) / 8, 1);
+  }
+  command_processor_.PushBufferMemoryBarrier(
+      diagnostic_snapshot_buffer_, 0, diagnostic_snapshot_capacity_bytes_,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+      VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+
+  auto transition_to_draw = [&](VulkanRenderTarget& rt) {
+    VkPipelineStageFlags dst_stage;
+    VkAccessFlags dst_access;
+    VkImageLayout dst_layout;
+    rt.GetDrawUsage(&dst_stage, &dst_access, &dst_layout);
+    const bool is_depth = rt.key().is_depth;
+    const VkImageSubresourceRange range = ui::vulkan::util::InitializeSubresourceRange(
+        is_depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT
+                 : VK_IMAGE_ASPECT_COLOR_BIT);
+    command_processor_.PushImageMemoryBarrier(
+        rt.image(), range, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, dst_stage,
+        VK_ACCESS_SHADER_READ_BIT, dst_access, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        dst_layout);
+    rt.SetUsage(dst_stage, dst_access, dst_layout);
+  };
+  if (color_rt) transition_to_draw(*color_rt);
+  if (depth_rt) transition_to_draw(*depth_rt);
+  command_processor_.SubmitBarriers(true);
+  command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+      last_update_render_pass_, last_update_framebuffer_);
+
+  diagnostic_snapshot_boundaries_.push_back(boundary);
+  if (request.compact_ben) diagnostic_snapshot_ben_metadata_.push_back(metadata);
+  REXGPU_INFO(
+      "Render target snapshot boundary: frame={} draw={} point={} color_image=0x{:X} "
+      "depth_image=0x{:X} color_format={} depth_format={} host_samples={} sample_map={},{} "
+      "flags={:X} depth_control={:08X} color_control={:08X} blend0={:08X} "
+      "stencil_ref_mask={:08X} coverage={:08X} color_mask={:08X}",
+      boundary.frame, boundary.draw_ordinal, boundary.point, boundary.color_image,
+      boundary.depth_image, boundary.color_format, boundary.depth_format,
+      boundary.host_sample_count, boundary.guest_sample_0_host_index,
+      boundary.guest_sample_1_host_index, boundary.capture_flags,
+      boundary.depth_control, boundary.color_control, boundary.blend_control_0,
+      boundary.stencil_ref_mask, boundary.coverage_control, boundary.color_write_mask);
+  ++diagnostic_snapshot_boundary_count_;
+  return true;
+}
+
+void VulkanRenderTargetCache::FinishDiagnosticSnapshotCapture(uint64_t completed_frame) {
+  using namespace diagnostics;
+  if (!diagnostic_snapshot_frame_ || completed_frame != diagnostic_snapshot_frame_ ||
+      !diagnostic_snapshot_mapping_ || !diagnostic_snapshot_boundary_count_) {
+    return;
+  }
+  const auto* vulkan_device = command_processor_.GetVulkanDevice();
+  const VkDevice device = vulkan_device->device();
+  const auto& dfn = vulkan_device->functions();
+  VkMappedMemoryRange invalidate{};
+  invalidate.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  invalidate.memory = diagnostic_snapshot_memory_;
+  invalidate.size = VK_WHOLE_SIZE;
+  if (!(vulkan_device->memory_types().host_coherent &
+        (uint32_t(1) << diagnostic_snapshot_memory_type_)) &&
+      dfn.vkInvalidateMappedMemoryRanges(device, 1, &invalidate) != VK_SUCCESS) {
+    REXGPU_ERROR("Failed to invalidate the render target diagnostic snapshot buffer");
+    return;
+  }
+  if (diagnostic_snapshot_request_.compact_ben &&
+      diagnostic_snapshot_request_.depth == false) {
+    auto* words = static_cast<uint32_t*>(diagnostic_snapshot_mapping_);
+    const uint64_t samples_per_boundary =
+        uint64_t(diagnostic_snapshot_request_.width) *
+        diagnostic_snapshot_request_.height * 2u;
+    for (uint32_t boundary = 0; boundary < diagnostic_snapshot_boundary_count_; ++boundary) {
+      const uint64_t first_word =
+          uint64_t(boundary) * diagnostic_snapshot_request_.payload_bytes() / sizeof(uint32_t);
+      for (uint64_t sample = 0; sample < samples_per_boundary; ++sample) {
+        words[first_word + sample * 2u + 1u] = UINT32_C(0x7FC00000);
+      }
+    }
+  }
+  const uint32_t compute_canary =
+      static_cast<const uint32_t*>(diagnostic_snapshot_mapping_)[
+          diagnostic_snapshot_capacity_bytes_ / sizeof(uint32_t) - 1];
+  RenderTargetSnapshotFileHeader header{};
+  header.magic = kRenderTargetSnapshotMagic;
+  header.version = kRenderTargetSnapshotVersion;
+  header.frame = diagnostic_snapshot_frame_;
+  header.x = diagnostic_snapshot_request_.x;
+  header.y = diagnostic_snapshot_request_.y;
+  header.width = diagnostic_snapshot_request_.width;
+  header.height = diagnostic_snapshot_request_.height;
+  header.boundary_count = diagnostic_snapshot_boundary_count_;
+  header.sample_count_per_pixel = 2;
+  header.sample_record_size = sizeof(RenderTargetSnapshotSample);
+  header.overflow = diagnostic_snapshot_overflow_logged_;
+  BenOcclusionSnapshotFileHeader ben_header{};
+  ben_header.magic = kBenOcclusionSnapshotMagic;
+  ben_header.version = diagnostic_snapshot_request_.ben_pixel_history
+                           ? kBenPixelHistorySnapshotVersion
+                           : kBenOcclusionSnapshotVersion;
+  ben_header.frame = diagnostic_snapshot_frame_;
+  ben_header.x = diagnostic_snapshot_request_.x;
+  ben_header.y = diagnostic_snapshot_request_.y;
+  ben_header.width = diagnostic_snapshot_request_.width;
+  ben_header.height = diagnostic_snapshot_request_.height;
+  ben_header.boundary_count = diagnostic_snapshot_boundary_count_;
+  ben_header.logical_samples_per_pixel = 2;
+  ben_header.sample_record_size = 8;
+  ben_header.overflow = diagnostic_snapshot_overflow_logged_;
+  ben_header.color_encoding = 1;
+  ben_header.depth_encoding = 0;
+  const uint32_t ben_metadata_size = diagnostic_snapshot_request_.ben_pixel_history
+                                         ? sizeof(BenOcclusionSnapshotBoundaryMetadata)
+                                         : 32u;
+  ben_header.boundary_metadata_size = ben_metadata_size;
+  const char* output_path = diagnostic_snapshot_request_.ben_pixel_history
+                                ? kBenPixelHistorySnapshotOutputPath
+                                : diagnostic_snapshot_request_.compact_ben
+                                      ? kBenOcclusionSnapshotOutputPath
+                                      : kRenderTargetSnapshotOutputPath;
+  FILE* output = std::fopen(output_path, "wb");
+  bool saved = false;
+  size_t boundary_bytes = 0;
+  size_t sample_bytes = 0;
+  if (output) {
+    const bool header_saved = diagnostic_snapshot_request_.compact_ben
+        ? std::fwrite(&ben_header, sizeof(ben_header), 1, output) == 1
+        : std::fwrite(&header, sizeof(header), 1, output) == 1;
+    boundary_bytes = std::fwrite(diagnostic_snapshot_boundaries_.data(),
+                                 sizeof(RenderTargetSnapshotBoundary),
+                                 diagnostic_snapshot_boundary_count_, output);
+    size_t metadata_bytes = 0;
+    if (diagnostic_snapshot_request_.compact_ben) {
+      for (uint32_t i = 0; i < diagnostic_snapshot_boundary_count_; ++i) {
+        const size_t written = std::fwrite(&diagnostic_snapshot_ben_metadata_[i],
+                                           ben_metadata_size, 1, output);
+        if (written != 1) break;
+        metadata_bytes += ben_metadata_size;
+      }
+    }
+    sample_bytes = std::fwrite(diagnostic_snapshot_mapping_, 1,
+                               size_t(diagnostic_snapshot_boundary_count_) *
+                                   size_t(diagnostic_snapshot_request_.payload_bytes()),
+                               output);
+    saved = header_saved && boundary_bytes == diagnostic_snapshot_boundary_count_ &&
+            (!diagnostic_snapshot_request_.compact_ben ||
+             metadata_bytes == size_t(diagnostic_snapshot_boundary_count_) * ben_metadata_size) &&
+            sample_bytes == size_t(diagnostic_snapshot_boundary_count_) *
+                                size_t(diagnostic_snapshot_request_.payload_bytes());
+    saved &= std::fclose(output) == 0;
+  }
+  REXGPU_INFO(
+      "Render target snapshot complete: frame={} boundaries={} roi={},{} {}x{} samples=2 "
+      "record_bytes={} overflow={} compute_canary={:08X} status={} path='{}'",
+      diagnostic_snapshot_frame_, diagnostic_snapshot_boundary_count_,
+      diagnostic_snapshot_request_.x, diagnostic_snapshot_request_.y,
+      diagnostic_snapshot_request_.width, diagnostic_snapshot_request_.height,
+      diagnostic_snapshot_request_.compact_ben ? 8u : uint32_t(sizeof(RenderTargetSnapshotSample)),
+      diagnostic_snapshot_overflow_logged_,
+      compute_canary,
+      saved ? "saved" : "save_failed", saved ? output_path : "");
+  diagnostic_snapshot_frame_ = 0;
+  diagnostic_snapshot_request_ = {};
+  diagnostic_snapshot_boundaries_.clear();
+  diagnostic_snapshot_ben_metadata_.clear();
+  diagnostic_snapshot_boundary_count_ = 0;
+  std::memset(diagnostic_snapshot_mapping_, 0,
+              size_t(diagnostic_snapshot_capacity_bytes_));
+  ui::vulkan::util::FlushMappedMemoryRange(
+      vulkan_device, diagnostic_snapshot_memory_, diagnostic_snapshot_memory_type_, 0,
+      diagnostic_snapshot_memory_size_, diagnostic_snapshot_capacity_bytes_);
 }
 
 VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassKey key) {
@@ -1615,7 +2427,7 @@ VkRenderPass VulkanRenderTargetCache::GetHostRenderTargetsRenderPass(RenderPassK
   }
 
   VkSampleCountFlagBits samples;
-  switch (key.msaa_samples) {
+  switch (DiagnosticHostMsaa(key.msaa_samples)) {
     case xenos::MsaaSamples::k1X:
       samples = VK_SAMPLE_COUNT_1_BIT;
       break;
@@ -1921,10 +2733,11 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
   image_create_info.extent.depth = 1;
   image_create_info.mipLevels = 1;
   image_create_info.arrayLayers = 1;
-  if (key.msaa_samples == xenos::MsaaSamples::k2X && !msaa_2x_attachments_supported_) {
+  const xenos::MsaaSamples image_msaa = DiagnosticHostMsaa(key.msaa_samples);
+  if (image_msaa == xenos::MsaaSamples::k2X && !msaa_2x_attachments_supported_) {
     image_create_info.samples = VK_SAMPLE_COUNT_4_BIT;
   } else {
-    image_create_info.samples = VkSampleCountFlagBits(uint32_t(1) << uint32_t(key.msaa_samples));
+    image_create_info.samples = VkSampleCountFlagBits(uint32_t(1) << uint32_t(image_msaa));
   }
   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
   image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -3020,17 +3833,12 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
     // in the pixel index within the source 32bpp tile.
     uint32_t source_32bpp_tile_half_pixels =
         tile_width_samples >> (1 + source_pixel_width_dwords_log2);
-    source_tile_pixel_x = builder.createUnaryOp(
-        spv::OpBitcast, type_uint,
-        builder.createBinOp(
-            spv::OpIAdd, type_int,
-            builder.createUnaryOp(spv::OpBitcast, type_int, source_tile_pixel_x),
-            builder.createTriOp(
-                spv::OpSelect, type_int,
-                builder.createBinOp(spv::OpULessThan, builder.makeBoolType(), source_tile_pixel_x,
-                                    builder.makeUintConstant(source_32bpp_tile_half_pixels)),
-                builder.makeIntConstant(int32_t(source_32bpp_tile_half_pixels)),
-                builder.makeIntConstant(-int32_t(source_32bpp_tile_half_pixels)))));
+    spv::Id half = builder.makeUintConstant(source_32bpp_tile_half_pixels);
+    source_tile_pixel_x = builder.createTriOp(
+        spv::OpSelect, type_uint,
+        builder.createBinOp(spv::OpULessThan, builder.makeBoolType(), source_tile_pixel_x, half),
+        builder.createBinOp(spv::OpIAdd, type_uint, source_tile_pixel_x, half),
+        builder.createBinOp(spv::OpISub, type_uint, source_tile_pixel_x, half));
   }
 
   // Transform the destination 32bpp tile index into the source. After the
@@ -4714,6 +5522,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
   uint64_t current_submission = command_processor_.GetCurrentSubmission();
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
 
+  const uint32_t transfer_profile_query = command_processor_.BeginTransferProfile();
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
   VkClearRect resolve_clear_rect;
   if (resolve_clear_needed) {
@@ -5006,7 +5815,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                                             << uint32_t(need_stencil_bit_draws));
       uint32_t rt_sort_index = 0;
       TransferShaderKey new_transfer_shader_key;
-      new_transfer_shader_key.dest_msaa_samples = dest_rt_key.msaa_samples;
+      new_transfer_shader_key.dest_msaa_samples = DiagnosticHostMsaa(dest_rt_key.msaa_samples);
       new_transfer_shader_key.dest_resource_format = dest_rt_key.resource_format;
       uint32_t stencil_clear_rectangle_count = 0;
       for (uint32_t j = 0; j <= uint32_t(need_stencil_bit_draws); ++j) {
@@ -5038,13 +5847,14 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             source_vulkan_rt.SetTemporarySortIndex(rt_sort_index++);
           }
           RenderTargetKey source_rt_key = source_vulkan_rt.key();
-          new_transfer_shader_key.source_msaa_samples = source_rt_key.msaa_samples;
+          new_transfer_shader_key.source_msaa_samples =
+              DiagnosticHostMsaa(source_rt_key.msaa_samples);
           new_transfer_shader_key.source_resource_format = source_rt_key.resource_format;
           bool host_depth_source_is_copy = host_depth_source_vulkan_rt == &dest_vulkan_rt;
           // The host depth copy buffer has only raw samples.
           new_transfer_shader_key.host_depth_source_msaa_samples =
               (host_depth_source_vulkan_rt && !host_depth_source_is_copy)
-                  ? host_depth_source_vulkan_rt->key().msaa_samples
+                  ? DiagnosticHostMsaa(host_depth_source_vulkan_rt->key().msaa_samples)
                   : xenos::MsaaSamples::k1X;
           if (j) {
             new_transfer_shader_key.mode = source_rt_key.is_depth
@@ -5448,6 +6258,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       command_buffer.CmdVkClearAttachments(1, &resolve_clear_attachment, 1, &resolve_clear_rect);
     }
   }
+  command_processor_.EndTransferProfile(transfer_profile_query);
 }
 
 VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
@@ -5629,17 +6440,27 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
     // Swap 40-sample columns in the depth buffer in the destination address to
     // get the final address of the sample in the EDRAM.
     uint32_t tile_width_half = tile_width >> 1;
-    edram_sample_address = builder.createUnaryOp(
-        spv::OpBitcast, type_uint,
-        builder.createBinOp(
-            spv::OpIAdd, type_int,
-            builder.createUnaryOp(spv::OpBitcast, type_int, edram_sample_address),
-            builder.createTriOp(
-                spv::OpSelect, type_int,
-                builder.createBinOp(spv::OpULessThan, builder.makeBoolType(), tile_sample_x,
-                                    builder.makeUintConstant(tile_width_half)),
-                builder.makeIntConstant(int32_t(tile_width_half)),
-                builder.makeIntConstant(-int32_t(tile_width_half)))));
+    if (REXCVAR_GET(vulkan_dump_unsigned_depth_columns)) {
+      // Equivalent mapping without a signed negative displacement in SPIR-V.
+      spv::Id half = builder.makeUintConstant(tile_width_half);
+      edram_sample_address = builder.createTriOp(
+          spv::OpSelect, type_uint,
+          builder.createBinOp(spv::OpULessThan, builder.makeBoolType(), tile_sample_x, half),
+          builder.createBinOp(spv::OpIAdd, type_uint, edram_sample_address, half),
+          builder.createBinOp(spv::OpISub, type_uint, edram_sample_address, half));
+    } else {
+      edram_sample_address = builder.createUnaryOp(
+          spv::OpBitcast, type_uint,
+          builder.createBinOp(
+              spv::OpIAdd, type_int,
+              builder.createUnaryOp(spv::OpBitcast, type_int, edram_sample_address),
+              builder.createTriOp(
+                  spv::OpSelect, type_int,
+                  builder.createBinOp(spv::OpULessThan, builder.makeBoolType(), tile_sample_x,
+                                      builder.makeUintConstant(tile_width_half)),
+                  builder.makeIntConstant(int32_t(tile_width_half)),
+                  builder.makeIntConstant(-int32_t(tile_width_half)))));
+    }
   }
 
   // Get the linear tile index within the source texture.
@@ -6065,7 +6886,7 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
       vulkan_rt.SetTemporarySortIndex(rt_sort_index++);
     }
     DumpPipelineKey pipeline_key;
-    pipeline_key.msaa_samples = rt_key.msaa_samples;
+    pipeline_key.msaa_samples = DiagnosticHostMsaa(rt_key.msaa_samples);
     pipeline_key.resource_format = rt_key.resource_format;
     pipeline_key.is_depth = rt_key.is_depth;
     dump_invocations_.emplace_back(rectangle, pipeline_key);

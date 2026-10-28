@@ -18,6 +18,7 @@
 
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/vulkan/shader.h>
+#include <rex/graphics/vulkan/fragment_diagnostic.h>
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/hash.h>
 #include <rex/ui/vulkan/mem_alloc.h>
@@ -89,7 +90,8 @@ class VulkanTextureCache final : public TextureCache {
   VkImageView GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
                                               xenos::FetchOpDimension dimension, bool is_signed);
 
-  SamplerParameters GetSamplerParameters(const VulkanShader::SamplerBinding& binding) const;
+  SamplerParameters GetSamplerParameters(const VulkanShader::SamplerBinding& binding,
+                                         bool force_min_mag_linear = false) const;
 
   // Must be called for every used sampler at least once in a single submission,
   // and a submission must be open for this to be callable.
@@ -329,6 +331,7 @@ class VulkanTextureCache final : public TextureCache {
   xenos::ClampMode NormalizeClampMode(xenos::ClampMode clamp_mode) const;
 
   VulkanCommandProcessor& command_processor_;
+  diagnostics::FragmentDiagnosticDescriptorLog diagnostic_descriptor_log_;
   VkPipelineStageFlags guest_shader_pipeline_stages_;
 
   // Using the Vulkan Memory Allocator because texture count in games is

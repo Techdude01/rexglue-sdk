@@ -12,12 +12,18 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdint>
+#include <functional>
+#include <thread>
 #include <utility>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#if REX_PLATFORM_MAC
+#include <pthread.h>
+#endif
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 
@@ -28,6 +34,9 @@
 
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
+
+REXCVAR_DEFINE_BOOL(present_skip_unchanged_guest_output, false, "UI/Presenter",
+                    "Skip UI-thread presents when the guest output image is unchanged");
 
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                     "Enable letterboxing for non-native aspect ratios");
@@ -86,6 +95,17 @@ REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace {
+
+uint64_t HostThreadId() {
+#if REX_PLATFORM_MAC
+  uint64_t tid = 0;
+  pthread_threadid_np(nullptr, &tid);
+  return tid;
+#else
+  return uint64_t(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+#endif
+}
+
 using GuestOutputPaintConfig = rex::ui::Presenter::GuestOutputPaintConfig;
 
 GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name) {
@@ -576,6 +596,10 @@ bool Presenter::RefreshGuestOutput(
     guest_output_active_last_refresh_ = false;
   }
 
+  // Published before the mailbox release so a consumer that acquires this slot
+  // observes the serial.
+  writable_properties.publish_serial = ++guest_output_publish_serial_;
+
   // Make the new image the next to present on the host (the "ready" one),
   // replacing the one already specified as the next (dropping it instead of
   // enqueueing the new image after it) to achieve the lowest latency (also,
@@ -767,6 +791,9 @@ void Presenter::RemoveUIDrawerFromUIThread(UIDrawer* drawer) {
 }
 
 void Presenter::RequestUIPaintFromUIThread() {
+  // A UI mutation must paint once even if the guest publish serial is the
+  // same (in particular, to erase a dialog that has just closed).
+  NoteSwapchainNeedsPresent();
   if (is_in_ui_thread_paint_) {
     // The paint request will be done once in the end of PaintFromUIThread
     // according to the actual state at the moment that happens. It's common for
@@ -848,6 +875,69 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
     *properties_out = properties;
   }
   return std::move(consumer_lock);
+}
+
+static std::atomic<uint64_t> g_skip_check_calls{0};
+static std::atomic<uint64_t> g_skip_reject_cvar_off{0};
+static std::atomic<uint64_t> g_skip_reject_ui_drawers{0};
+static std::atomic<uint64_t> g_skip_reject_swapchain_create{0};
+static std::atomic<uint64_t> g_skip_reject_not_presented{0};
+static std::atomic<uint64_t> g_skip_reject_serial_mismatch{0};
+static std::atomic<uint64_t> g_skip_success{0};
+
+bool Presenter::ShouldSkipUnchangedGuestOutputPaint(bool execute_ui_drawers) {
+  uint64_t call_num = g_skip_check_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (call_num % 120 == 0) {
+    REXLOG_INFO(
+        "[PRESENT_SKIP_DIAG] calls={} cvar_off={} ui_drawers={} swapchain_create={} "
+        "not_presented={} serial_mismatch={} skips={} last_serial={}",
+        call_num, g_skip_reject_cvar_off.load(std::memory_order_relaxed),
+        g_skip_reject_ui_drawers.load(std::memory_order_relaxed),
+        g_skip_reject_swapchain_create.load(std::memory_order_relaxed),
+        g_skip_reject_not_presented.load(std::memory_order_relaxed),
+        g_skip_reject_serial_mismatch.load(std::memory_order_relaxed),
+        g_skip_success.load(std::memory_order_relaxed),
+        last_presented_publish_serial_.load(std::memory_order_relaxed));
+  }
+  if (!REXCVAR_GET(present_skip_unchanged_guest_output)) {
+    g_skip_reject_cvar_off.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  if (execute_ui_drawers &&
+      std::any_of(ui_drawers_.begin(), ui_drawers_.end(),
+                  [](const auto& entry) { return entry.second.drawer->NeedsPaint(); })) {
+    g_skip_reject_ui_drawers.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  if (present_after_swapchain_create_.load(std::memory_order_acquire)) {
+    g_skip_reject_swapchain_create.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  if (!has_presented_.load(std::memory_order_acquire)) {
+    g_skip_reject_not_presented.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  uint32_t mailbox_index = UINT32_MAX;
+  GuestOutputProperties properties;
+  std::unique_lock<std::mutex> consumer_lock(
+      ConsumeGuestOutput(mailbox_index, &properties, nullptr));
+  uint64_t last_serial = last_presented_publish_serial_.load(std::memory_order_acquire);
+  if (properties.publish_serial != last_serial) {
+    g_skip_reject_serial_mismatch.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  g_skip_success.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+void Presenter::NoteSwapchainNeedsPresent() {
+  present_after_swapchain_create_.store(true, std::memory_order_release);
+}
+
+void Presenter::NoteGuestOutputPresented(uint64_t publish_serial) {
+  last_presented_publish_serial_.store(publish_serial, std::memory_order_release);
+  has_presented_.store(true, std::memory_order_release);
+  present_after_swapchain_create_.store(false, std::memory_order_release);
 }
 
 Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
@@ -1495,6 +1585,24 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
 }
 
 Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
+  static std::atomic<bool> queue_lock_paint_logged{false};
+  if (!queue_lock_paint_logged.load(std::memory_order_relaxed) &&
+      (REXCVAR_QUERY(bool, gpu_frame_timeline_enable) ||
+       REXCVAR_QUERY(bool, gpu_frame_audit_enable)) &&
+      !queue_lock_paint_logged.exchange(true, std::memory_order_relaxed)) {
+    const char* paint_mode = "none";
+    if (paint_mode_ == PaintMode::kUIThreadOnRequest) {
+      paint_mode = "ui_thread_on_request";
+    } else if (paint_mode_ == PaintMode::kGuestOutputThreadImmediately) {
+      paint_mode = "guest_output_thread";
+    }
+    REXLOG_INFO(
+        "[QUEUE_LOCK] paint_mode={} implicit_vsync={} execute_ui_drawers={} "
+        "ui_drawers={} host_present_from_non_ui_thread={} thread={}",
+        paint_mode, surface_paint_connection_has_implicit_vsync_ ? 1 : 0,
+        execute_ui_drawers ? 1 : 0, ui_drawers_.empty() ? 0 : 1,
+        REXCVAR_GET(host_present_from_non_ui_thread) ? 1 : 0, HostThreadId());
+  }
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
@@ -1521,6 +1629,7 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
 }
 
 void Presenter::HandleUIDrawersChangeFromUIThread(bool drawers_were_empty) {
+  NoteSwapchainNeedsPresent();
   if (is_in_ui_thread_paint_) {
     // Defer the refresh so no dangerous lifecycle-related changes happen during
     // drawing.
