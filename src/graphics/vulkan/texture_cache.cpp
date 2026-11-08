@@ -22,6 +22,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/util/draw.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/vulkan/command_processor.h>
@@ -34,6 +35,10 @@
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
+REXCVAR_DEFINE_BOOL(gpu_fused_resolve_sampled_image, false, "GPU/Vulkan",
+                    "Experimental fused resolve output to a sampled image (restart required)");
+REXCVAR_DEFINE_BOOL(gpu_fused_resolve_image_parity, false, "GPU/Vulkan",
+                    "Compare fused resolve sampled images against the legacy load");
 
 namespace rex::graphics::vulkan {
 
@@ -98,6 +103,135 @@ namespace shaders {
 }  // namespace shaders
 
 namespace {
+
+// Default-off direct storage-image load shader (the R8G8B8A8_UNORM slice).
+//
+// This is a 32bpp scaled-resolve load with the destination changed from the
+// scratch storage buffer to the sampleable storage image. The guest tiled
+// address computation, the scaled-resolve source addressing, the destination
+// texel ordering (two 16-byte words = eight R8G8B8A8 texels) and the endianness
+// handling are identical to texture_load_32bpb_scaled_cs, so the only
+// behavioural difference is the final destination write: instead of storing two
+// 16-byte words into the scratch buffer and then copying them into the image
+// with vkCmdCopyBufferToImage, the eight texels are stored as normalized RGBA8
+// image stores.
+//
+// A byte value stored as float(byte) / 255.0 is converted back to exactly the
+// same byte by the UNORM8 conversion (always normalizes to round-to-nearest, and
+// byte / 255 in binary32 is within far less than half an ulp of an integer when
+// rescaled by 255) - see DirectStorageImageEncodeByte in direct_storage_image.h
+// and its exhaustive unit test.
+//
+// 3D tiling is not implemented here and is excluded by the eligibility check
+// before dispatch; the early return below is a guard, not a supported path.
+#include "direct_storage_image_sources.h"
+
+#if 0  // Rejected hand-port retained temporarily until parity validates shared XeSL.
+static constexpr char kRejectedDirectStorageImageLoadShaderSource[] = R"(#version 450
+layout(local_size_x = 4, local_size_y = 32, local_size_z = 1) in;
+
+layout(push_constant) uniform XeTextureLoadDirectConstants {
+  uint xe_is_tiled_3d_endian_scale;
+  uint xe_guest_offset;
+  uint xe_guest_pitch_aligned;
+  uint xe_guest_z_stride_block_rows_aligned;
+  uvec3 xe_size_blocks;
+  uint xe_host_offset;
+  uint xe_host_pitch;
+  uint xe_height_texels;
+};
+
+layout(set = 1, binding = 0, std430) readonly buffer XeTextureLoadDirectSource {
+  uvec4 xe_source[];
+};
+
+layout(set = 0, binding = 0, rgba8) writeonly uniform image2D xe_dest;
+
+vec4 xe_direct_storage_image_unpack(uint texel) {
+  return vec4(float(texel & 255u), float((texel >> 8u) & 255u),
+              float((texel >> 16u) & 255u), float((texel >> 24u) & 255u)) *
+         (1.0 / 255.0);
+}
+
+uvec4 xe_direct_storage_image_swap_endian(uvec4 value, uint endian) {
+  if (endian == 1u || endian == 2u) {
+    value = ((value & 0x00FF00FFu) << 8u) | ((value & 0xFF00FF00u) >> 8u);
+  }
+  if (endian == 2u || endian == 3u) {
+    value = (value << 16u) | (value >> 16u);
+  }
+  return value;
+}
+
+void xe_direct_storage_image_store_word(uvec4 word, uint x, uint y, uint width) {
+  if (x < width) {
+    imageStore(xe_dest, ivec2(int(x), int(y)), xe_direct_storage_image_unpack(word.x));
+  }
+  if (x + 1u < width) {
+    imageStore(xe_dest, ivec2(int(x + 1u), int(y)), xe_direct_storage_image_unpack(word.y));
+  }
+  if (x + 2u < width) {
+    imageStore(xe_dest, ivec2(int(x + 2u), int(y)), xe_direct_storage_image_unpack(word.z));
+  }
+  if (x + 3u < width) {
+    imageStore(xe_dest, ivec2(int(x + 3u), int(y)), xe_direct_storage_image_unpack(word.w));
+  }
+}
+
+void main() {
+  uvec3 invocation = gl_GlobalInvocationID;
+  uvec2 pixel = uvec2(invocation.x << 3u, invocation.y);
+  if (any(greaterThanEqual(pixel, xe_size_blocks.xy))) {
+    return;
+  }
+  // Force_load_3d_tiling is not part of the supported slice.
+  if ((xe_is_tiled_3d_endian_scale & 2u) != 0u) {
+    return;
+  }
+  uint scale_x = (xe_is_tiled_3d_endian_scale >> 4u) & 7u;
+  uint scale_y = (xe_is_tiled_3d_endian_scale >> 7u) & 7u;
+  uint endian = (xe_is_tiled_3d_endian_scale >> 2u) & 3u;
+
+  // Guest tiled address of the block start, exactly as in
+  // texture_load_32bpb_scaled_cs (2D tiling).
+  int block_x = int(pixel.x >> 2u);
+  int block_y = int(pixel.y);
+  int block_pitch = int(xe_guest_pitch_aligned >> 5u);
+  int tile_index = (block_x >> 5) + ((block_y >> 5) * block_pitch);
+  int tile_base = tile_index << 9;
+  int inner = ((block_x & 7) + ((block_y & 14) << 2)) << 2;
+  int swapped = ((tile_base + ((inner & -16) << 1)) + (inner & 15)) + ((block_y & 1) << 4);
+  uint guest_address = uint(((swapped & -512) << 3) + ((block_y & 16) << 7) +
+                            ((swapped & 448) << 2) + (((((block_y & 8) >> 2) + (block_x >> 3)) & 3) << 6) +
+                            (swapped & 63));
+
+  // Scaled-resolve source addressing.
+  uvec2 block = uvec2(pixel.x >> 2u, pixel.y) / uvec2(scale_x, scale_y);
+  uvec2 in_block = uvec2(pixel.x >> 2u, pixel.y) - block * uvec2(scale_x, scale_y);
+  uint combined_scale = scale_x * scale_y;
+  uint source_index =
+      (xe_guest_offset + guest_address * combined_scale +
+       ((((in_block.x * scale_y) + in_block.y) << 2u) + (pixel.x & 3u)) << 2u) >> 4u;
+  uvec4 word_0 = xe_direct_storage_image_swap_endian(xe_source[source_index], endian);
+
+  // Second 16-byte destination word, as in the buffer path.
+  uint second_delta;
+  if (scale_x > 1u) {
+    second_delta = ((in_block.x + 1u == scale_x) ? (32u * scale_x - (in_block.x << 4u)) : 16u) * scale_y;
+  } else {
+    second_delta = 32u * scale_y;
+  }
+  uvec4 word_1 = xe_direct_storage_image_swap_endian(
+      xe_source[source_index + (second_delta >> 4u)], endian);
+
+  uint width = xe_size_blocks.x;
+  uint y = pixel.y;
+  xe_direct_storage_image_store_word(word_0, pixel.x, y, width);
+  xe_direct_storage_image_store_word(word_1, pixel.x + 4u, y, width);
+}
+)";
+
+#endif
 
 // Keep invalid fetch constant texture reads aligned with D3D12 null SRV
 // descriptors, which force all sampled channels to 0.
@@ -441,6 +575,8 @@ VulkanTextureCache::~VulkanTextureCache() {
     dfn.vkDestroySampler(device, sampler_pair.second.sampler, nullptr);
   }
   samplers_.clear();
+  last_sampler_parameters_.value = UINT32_MAX;
+  last_sampler_ = VK_NULL_HANDLE;
   custom_border_color_sampler_count_ = 0;
   COUNT_profile_set("gpu/texture_cache/vulkan/samplers", 0);
   sampler_used_last_ = nullptr;
@@ -485,14 +621,269 @@ VulkanTextureCache::~VulkanTextureCache() {
   // Textures memory is allocated using the Vulkan Memory Allocator, destroy all
   // textures before destroying VMA.
   DestroyAllTextures(true);
+  CompleteFusedImageParity(UINT64_MAX);
+  pending_fused_resolve_image_.reset();
+  retired_fused_resolve_images_.clear();
+  resolved_images_.Clear();
+  resolved_images_.CompletedSubmissionUpdated(UINT64_MAX);
+  if (direct_storage_image_pipeline_) dfn.vkDestroyPipeline(device, direct_storage_image_pipeline_, nullptr);
+  if (direct_storage_image_depth_pipeline_) dfn.vkDestroyPipeline(device, direct_storage_image_depth_pipeline_, nullptr);
+  if (direct_storage_image_pipeline_layout_) dfn.vkDestroyPipelineLayout(device, direct_storage_image_pipeline_layout_, nullptr);
+  if (direct_storage_image_descriptor_pool_) dfn.vkDestroyDescriptorPool(device, direct_storage_image_descriptor_pool_, nullptr);
+  if (direct_storage_image_descriptor_set_layout_) dfn.vkDestroyDescriptorSetLayout(device, direct_storage_image_descriptor_set_layout_, nullptr);
 
   if (vma_allocator_ != VK_NULL_HANDLE) {
+    for (auto& job : parity_readbacks_) {
+      REXGPU_ERROR("[DIRECT_IMAGE_PARITY_ERROR] reason=not_observed_complete_before_shutdown frame={}", job.frame);
+      vmaDestroyBuffer(vma_allocator_, job.buffer, job.allocation);
+    }
+    for (auto& job : direct_resolve_parity_readbacks_) {
+      REXGPU_ERROR("[DIRECT_HOST_RESOLVE_PARITY_ERROR] reason=not_observed_complete_before_shutdown frame={}", job.frame);
+      if (job.candidate_buffer) vmaDestroyBuffer(vma_allocator_, job.candidate_buffer, job.candidate_allocation);
+      if (job.readback_buffer) vmaDestroyBuffer(vma_allocator_, job.readback_buffer, job.readback_allocation);
+    }
     vmaDestroyAllocator(vma_allocator_);
   }
 }
 
+void VulkanTextureCache::ClearCache() {
+  pending_fused_resolve_image_.reset();
+  retired_fused_resolve_images_.clear();
+  fused_image_pool_.clear();
+  fused_producer_by_resource_.clear();
+  resolved_images_.Clear();
+  DrainResolvedImageInvalidations();
+  TextureCache::ClearCache();
+}
+
+VulkanTextureCache::FusedResolveImage VulkanTextureCache::PrepareFusedResolveImage(
+    uint32_t base, uint32_t length, uint32_t width, uint32_t height, xenos::Endian endian) {
+  if (!REXCVAR_GET(gpu_fused_resolve_sampled_image) || pending_fused_resolve_image_) return {};
+  DrainResolvedImageInvalidations();
+  const TextureKey* observed = FindUniqueResolvedTextureKey(base, length);
+  if (!observed) return {};
+  TextureKey key = *observed;
+  if (key.dimension != xenos::DataDimension::k2DOrStacked || key.format != xenos::TextureFormat::k_8_8_8_8 ||
+      key.signed_separate || key.packed_mips || key.mip_max_level ||
+      key.depth_or_array_size_minus_1 || !key.tiled || !key.scaled_resolve ||
+      key.endianness != endian || width != 320 || height != 184 ||
+      key.GetWidth() != 320 || key.GetHeight() != 180 || length != 245760) return {};
+  std::unique_ptr<Texture> image;
+  if (!fused_image_pool_.empty()) {
+    image = std::move(fused_image_pool_.back());
+    fused_image_pool_.pop_back();
+  } else {
+    image = CreateTextureResource(key, false);
+  }
+  if (!image) return {};
+  auto& vk_image = static_cast<VulkanTexture&>(*image);
+  if (!vk_image.direct_storage_image()) return {};
+  FusedResolveImage result{vk_image.image(), vk_image.direct_storage_image_descriptor_set(),
+                           key.GetWidth() * draw_resolution_scale_x(),
+                           key.GetHeight() * draw_resolution_scale_y()};
+  pending_fused_resolve_image_ = std::move(image);
+  return result;
+}
+
+void VulkanTextureCache::PublishFusedResolveImage() {
+  if (!pending_fused_resolve_image_) return;
+  DrainResolvedImageInvalidations();
+  auto& image = static_cast<VulkanTexture&>(*pending_fused_resolve_image_);
+  image.SetUsage(VulkanTexture::Usage::kComputeStorageWrite);
+  const TextureKey key = image.key();
+  VmaAllocationInfo allocation_info;
+  vmaGetAllocationInfo(vma_allocator_, image.image_resource_->allocation, &allocation_info);
+  resolved_images_.RetainForSubmission(image.image_resource_, command_processor_.GetCurrentSubmission());
+  resolved_images_.Publish(key.base_page << 12, image.GetGuestBaseSize(), key,
+                           image.image_resource_, allocation_info.size);
+  if (command_processor_.IsResolveChainAuditFrame()) {
+    REXGPU_INFO("[FUSED_IMAGE_PUBLISHED] frame={} base=0x{:08X} guest_bytes={} image={}x{}",
+                command_processor_.GetCurrentFrame(), uint32_t(key.base_page) << 12,
+                image.GetGuestBaseSize(), key.GetWidth() * draw_resolution_scale_x(),
+                key.GetHeight() * draw_resolution_scale_y());
+  }
+  fused_producer_by_resource_[image.image_resource_.get()] = &image;
+  retired_fused_resolve_images_.emplace_back(command_processor_.GetCurrentSubmission(),
+                                              std::move(pending_fused_resolve_image_));
+}
+
+void VulkanTextureCache::SwapTextureImage(VulkanTexture& a, VulkanTexture& b) {
+  a.image_resource_.swap(b.image_resource_);
+  a.views_.swap(b.views_);
+  a.texture_3d_as_2d_.swap(b.texture_3d_as_2d_);
+  std::swap(a.image_view_3d_as_2d_unsigned_, b.image_view_3d_as_2d_unsigned_);
+  std::swap(a.image_view_3d_as_2d_signed_, b.image_view_3d_as_2d_signed_);
+  std::swap(a.direct_storage_image_view_, b.direct_storage_image_view_);
+  std::swap(a.direct_storage_image_descriptor_set_, b.direct_storage_image_descriptor_set_);
+}
+
+bool VulkanTextureCache::TryReuseFusedResolveImage(VulkanTexture& texture, bool load_base,
+                                                   bool load_mips) {
+  if (!REXCVAR_GET(gpu_fused_resolve_sampled_image) || fused_image_parity_reentry_ ||
+      !load_base || load_mips) return false;
+  const TextureKey key = texture.key();
+  auto image = resolved_images_.Find(key.base_page << 12, texture.GetGuestBaseSize(), key);
+  if (!image) return false;
+  if (texture.image_resource_ != image) {
+    auto producer_it = fused_producer_by_resource_.find(image.get());
+    if (producer_it == fused_producer_by_resource_.end() || !producer_it->second) return false;
+    VulkanTexture* producer = producer_it->second;
+    fused_producer_by_resource_.erase(producer_it);
+    SwapTextureImage(texture, *producer);
+    fused_producer_by_resource_[producer->image_resource_.get()] = producer;
+  }
+  resolved_images_.RetainForSubmission(std::move(image), command_processor_.GetCurrentSubmission());
+  texture.MarkAsUsed();
+  if (command_processor_.IsResolveChainAuditFrame()) {
+    REXGPU_INFO("[FUSED_IMAGE_ADOPTED] frame={} base=0x{:08X} guest_bytes={}",
+                command_processor_.GetCurrentFrame(), uint32_t(key.base_page) << 12,
+                texture.GetGuestBaseSize());
+  }
+  if (REXCVAR_GET(gpu_fused_resolve_image_parity) && key.GetWidth() == 320 &&
+      key.GetHeight() == 180 && texture.GetGuestBaseSize() == 245760 &&
+      command_processor_.IsResolveChainAuditFrame() && fused_image_parity_recorded_ < 7) {
+    auto legacy = CreateTextureResource(key, false);
+    bool loaded = false;
+    if (legacy) {
+      fused_image_parity_reentry_ = true;
+      loaded = LoadTextureDataFromResidentMemoryImpl(*legacy, true, false);
+      fused_image_parity_reentry_ = false;
+    }
+    if (!loaded || !RecordFusedImageParity(texture, static_cast<VulkanTexture&>(*legacy))) {
+      REXGPU_ERROR("[FUSED_IMAGE_PARITY_ERROR] frame={} unable to compare", command_processor_.GetCurrentFrame());
+    } else {
+      ++fused_image_parity_recorded_;
+    }
+    if (legacy) retired_fused_resolve_images_.emplace_back(command_processor_.GetCurrentSubmission(),
+                                                           std::move(legacy));
+  }
+  return true;
+}
+
+bool VulkanTextureCache::MakeFusedResolveImageWritable(VulkanTexture& texture) {
+  if (texture.image_resource_.use_count() == 1) return true;
+  auto replacement = CreateTextureResource(texture.key(), false);
+  if (!replacement) return false;
+  SwapTextureImage(texture, static_cast<VulkanTexture&>(*replacement));
+  retired_fused_resolve_images_.emplace_back(command_processor_.GetCurrentSubmission(),
+                                              std::move(replacement));
+  return true;
+}
+
+bool VulkanTextureCache::RecordFusedImageParity(VulkanTexture& candidate, VulkanTexture& legacy) {
+  const auto key = candidate.key();
+  const uint32_t width = key.GetWidth() * draw_resolution_scale_x();
+  const uint32_t height = key.GetHeight() * draw_resolution_scale_y();
+  const VkDeviceSize bytes = VkDeviceSize(width) * height * 4;
+  VkBufferCreateInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  info.size = bytes * 2;
+  info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  VmaAllocationCreateInfo allocation_info{};
+  allocation_info.usage = VMA_MEMORY_USAGE_AUTO;
+  allocation_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+  VkBuffer buffer;
+  VmaAllocation allocation;
+  VmaAllocationInfo mapped;
+  if (vmaCreateBuffer(vma_allocator_, &info, &allocation_info, &buffer, &allocation, &mapped) != VK_SUCCESS) return false;
+  std::memset(mapped.pMappedData, 0xA5, size_t(bytes));
+  std::memset(static_cast<uint8_t*>(mapped.pMappedData) + bytes, 0x5A, size_t(bytes));
+  if (vmaFlushAllocation(vma_allocator_, allocation, 0, VK_WHOLE_SIZE) != VK_SUCCESS) {
+    vmaDestroyBuffer(vma_allocator_, buffer, allocation);
+    return false;
+  }
+  VulkanTexture* images[] = {&candidate, &legacy};
+  for (uint32_t i = 0; i < 2; ++i) {
+    VkPipelineStageFlags stage;
+    VkAccessFlags access;
+    VkImageLayout layout;
+    GetTextureUsageMasks(images[i]->image_resource_->usage, stage, access, layout);
+    command_processor_.PushImageMemoryBarrier(
+        images[i]->image(), ui::vulkan::util::InitializeSubresourceRange(), stage,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, access, VK_ACCESS_TRANSFER_READ_BIT, layout,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    command_processor_.SubmitBarriers(true);
+    VkBufferImageCopy region{};
+    region.bufferOffset = bytes * i;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = {width, height, 1};
+    command_processor_.deferred_command_buffer().CmdVkCopyImageToBuffer(
+        images[i]->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, region);
+    command_processor_.PushImageMemoryBarrier(
+        images[i]->image(), ui::vulkan::util::InitializeSubresourceRange(),
+        VK_PIPELINE_STAGE_TRANSFER_BIT, stage, VK_ACCESS_TRANSFER_READ_BIT, access,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, layout);
+  }
+  command_processor_.PushBufferMemoryBarrier(buffer, 0, bytes * 2,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+      VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+  fused_image_parity_readbacks_.push_back({buffer, allocation, mapped.pMappedData,
+      command_processor_.GetCurrentSubmission(), bytes, command_processor_.GetCurrentFrame(),
+      uint32_t(key.base_page) << 12});
+  return true;
+}
+
+void VulkanTextureCache::CompleteFusedImageParity(uint64_t completed) {
+  auto it = fused_image_parity_readbacks_.begin();
+  while (it != fused_image_parity_readbacks_.end()) {
+    if (it->submission > completed) { ++it; continue; }
+    if (vmaInvalidateAllocation(vma_allocator_, it->allocation, 0, VK_WHOLE_SIZE) != VK_SUCCESS) {
+      REXGPU_ERROR("[FUSED_IMAGE_PARITY_ERROR] frame={} invalidate failed", it->frame);
+    } else {
+      const auto* data = static_cast<const uint8_t*>(it->mapping);
+      uint64_t mismatches = 0;
+      for (VkDeviceSize i = 0; i < it->bytes; ++i) mismatches += data[i] != data[it->bytes + i];
+      REXGPU_INFO("[FUSED_IMAGE_PARITY] frame={} submission={} base=0x{:08X} compared_bytes={} mismatched_bytes={}",
+                  it->frame, it->submission, it->base, it->bytes, mismatches);
+    }
+    vmaDestroyBuffer(vma_allocator_, it->buffer, it->allocation);
+    it = fused_image_parity_readbacks_.erase(it);
+  }
+}
+
+void VulkanTextureCache::InvalidateResolvedImages(uint32_t address, uint32_t length) {
+  if (!REXCVAR_GET(gpu_fused_resolve_sampled_image) || !length) return;
+  std::lock_guard<std::mutex> lock(resolved_image_invalidation_mutex_);
+  if (resolved_image_invalidations_.size() >= 256) {
+    resolved_image_invalidations_.assign(1, {0, 0x20000000u});
+  } else {
+    resolved_image_invalidations_.emplace_back(address & 0x1FFFFFFFu, length);
+  }
+  has_resolved_image_invalidations_.store(true, std::memory_order_release);
+}
+
+void VulkanTextureCache::DrainResolvedImageInvalidations() {
+  if (!has_resolved_image_invalidations_.load(std::memory_order_acquire)) return;
+  std::vector<std::pair<uint32_t, uint32_t>> pending;
+  {
+    std::lock_guard<std::mutex> lock(resolved_image_invalidation_mutex_);
+    pending.swap(resolved_image_invalidations_);
+    has_resolved_image_invalidations_.store(false, std::memory_order_release);
+  }
+  for (const auto& range : pending) resolved_images_.Invalidate(range.first, range.second);
+}
+
 void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
   TextureCache::BeginSubmission(new_submission_index);
+  DrainResolvedImageInvalidations();
+  const uint64_t completed = command_processor_.GetCompletedSubmission();
+  CompleteFusedImageParity(completed);
+  resolved_images_.CompletedSubmissionUpdated(completed);
+  for (auto it = retired_fused_resolve_images_.begin(); it != retired_fused_resolve_images_.end(); ) {
+    if (it->first <= completed) {
+      if (it->second) {
+        auto& vk_tex = static_cast<VulkanTexture&>(*it->second);
+        fused_producer_by_resource_.erase(vk_tex.image_resource_.get());
+        if (fused_image_pool_.size() < 8) {
+          fused_image_pool_.push_back(std::move(it->second));
+        }
+      }
+      it = retired_fused_resolve_images_.erase(it);
+    } else {
+      ++it;
+    }
+  }
 
   if (!null_images_cleared_ && null_image_2d_array_cube_ != VK_NULL_HANDLE &&
       null_image_3d_ != VK_NULL_HANDLE) {
@@ -526,12 +917,36 @@ void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
 }
 
 void VulkanTextureCache::BeginFrame() {
+  ProcessParityReadbacks();
+  ProcessDirectResolveParityReadbacks();
+  if (IsInGpuFrameAuditWindow()) {
+    direct_storage_image_audit_frame_start_ = GetDirectStorageImageStats();
+  }
   TextureCache::BeginFrame();
 
   std::memset(unsupported_format_features_used_, 0, sizeof(unsupported_format_features_used_));
 }
 
 void VulkanTextureCache::EndFrame() {
+  if (IsInGpuFrameAuditWindow()) {
+    const DirectStorageImageStats end_stats = GetDirectStorageImageStats();
+    const DirectStorageImageStats& start_stats = direct_storage_image_audit_frame_start_;
+    const uint64_t frame = command_processor_.GetCurrentFrame();
+    REXGPU_INFO(
+        "[DIRECT_STORAGE_IMAGE] frame={} direct_loads={} fallbacks={} copy_bytes_avoided={} "
+        "legacy_copy_bytes={}",
+        frame, end_stats.direct_loads - start_stats.direct_loads,
+        end_stats.fallbacks - start_stats.fallbacks,
+        end_stats.copy_bytes_avoided - start_stats.copy_bytes_avoided,
+        end_stats.legacy_copy_bytes - start_stats.legacy_copy_bytes);
+    for (size_t i = 0; i < size_t(DirectStorageImageFallback::kCount); ++i) {
+      const uint64_t delta = end_stats.fallbacks_by_reason[i] - start_stats.fallbacks_by_reason[i];
+      if (delta) {
+        REXGPU_INFO("[DIRECT_STORAGE_IMAGE_FALLBACK] frame={} reason={} count={}", frame,
+                    DirectStorageImageFallbackName(DirectStorageImageFallback(i)), delta);
+      }
+    }
+  }
   bool unsupported_header_written = false;
   for (uint32_t i = 0; i < 64; ++i) {
     uint32_t unsupported_features = unsupported_format_features_used_[i];
@@ -603,10 +1018,11 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
         VkAccessFlags src_access_mask;
         VkImageLayout old_layout;
         GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask, old_layout);
-        command_processor_.PushImageMemoryBarrier(binding_texture->image(),
-                                                  ui::vulkan::util::InitializeSubresourceRange(),
-                                                  src_stage_mask, dst_stage_mask, src_access_mask,
-                                                  dst_access_mask, old_layout, new_layout);
+        command_processor_.PushImageMemoryBarrier(
+            binding_texture->image(), ui::vulkan::util::InitializeSubresourceRange(),
+            src_stage_mask, dst_stage_mask, src_access_mask, dst_access_mask, old_layout,
+            new_layout, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, true,
+            VulkanCommandProcessor::BarrierRequester::kTextureCache);
       }
     }
     VulkanTexture* binding_texture_signed = static_cast<VulkanTexture*>(binding->texture_signed);
@@ -619,10 +1035,11 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
         VkAccessFlags src_access_mask;
         VkImageLayout old_layout;
         GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask, old_layout);
-        command_processor_.PushImageMemoryBarrier(binding_texture_signed->image(),
-                                                  ui::vulkan::util::InitializeSubresourceRange(),
-                                                  src_stage_mask, dst_stage_mask, src_access_mask,
-                                                  dst_access_mask, old_layout, new_layout);
+        command_processor_.PushImageMemoryBarrier(
+            binding_texture_signed->image(), ui::vulkan::util::InitializeSubresourceRange(),
+            src_stage_mask, dst_stage_mask, src_access_mask, dst_access_mask, old_layout,
+            new_layout, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, true,
+            VulkanCommandProcessor::BarrierRequester::kTextureCache);
       }
     }
   }
@@ -807,6 +1224,11 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
   assert_true(command_processor_.submission_open());
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
 
+  if (last_sampler_parameters_.value == parameters.value && last_sampler_ != VK_NULL_HANDLE) {
+    has_overflown_out = false;
+    return last_sampler_;
+  }
+
   // Try to find an existing sampler.
   auto it_existing = samplers_.find(parameters);
   if (it_existing != samplers_.end()) {
@@ -830,6 +1252,8 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
       }
     }
     has_overflown_out = false;
+    last_sampler_parameters_ = parameters;
+    last_sampler_ = sampler.second.sampler;
     return sampler.second.sampler;
   }
 
@@ -867,6 +1291,10 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
     sampler_used_first_ = sampler_used_first_->second.used_next;
     assert_true(it_reuse != samplers_.end());
     if (it_reuse != samplers_.end()) {
+      if (it_reuse->first.value == last_sampler_parameters_.value) {
+        last_sampler_parameters_.value = UINT32_MAX;
+        last_sampler_ = VK_NULL_HANDLE;
+      }
       // This destroys the Sampler object.
       samplers_.erase(it_reuse);
       COUNT_profile_set("gpu/texture_cache/vulkan/samplers", samplers_.size());
@@ -1002,6 +1430,8 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
     sampler_used_first_ = &new_sampler;
   }
   sampler_used_last_ = &new_sampler;
+  last_sampler_parameters_ = parameters;
+  last_sampler_ = vulkan_sampler;
   return vulkan_sampler;
 }
 
@@ -1164,6 +1594,11 @@ uint32_t VulkanTextureCache::GetMaxHostTextureDepthOrArraySize(
 }
 
 std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(TextureKey key) {
+  return CreateTextureResource(key, true);
+}
+
+std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTextureResource(
+    TextureKey key, bool track_usage) {
   VkFormat formats[] = {VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
   const HostFormatPair& host_format = GetHostFormatPair(key);
   if (host_format.format_signed.format == VK_FORMAT_UNDEFINED) {
@@ -1243,12 +1678,51 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
 
   VkImage image;
   VmaAllocation allocation;
+
+  // Default-off direct storage-image path: add VK_IMAGE_USAGE_STORAGE_BIT only
+  // for images on this path (the R8G8B8A8_UNORM scaled-resolve slice), and only
+  // when the device accepts STORAGE usage for these exact image parameters.
+  bool direct_storage_image = false;
+  if (direct_storage_image_enabled_ && direct_storage_image_pipeline_ != VK_NULL_HANDLE) {
+    const bool host_format_is_signed =
+        IsSignedVersionSeparateForFormat(key) && key.signed_separate;
+    const HostFormat& direct_host_format =
+        host_format_is_signed ? host_format.format_signed : host_format.format_unsigned;
+    DirectStorageImageCriteria criteria;
+    criteria.enabled = true;
+    criteria.scaled_resolve = key.scaled_resolve != 0;
+    criteria.tiled = key.tiled != 0;
+    criteria.signed_separate = key.signed_separate != 0;
+    criteria.packed_mips = key.packed_mips != 0;
+    criteria.is_2d = key.dimension == xenos::DataDimension::k2DOrStacked;
+    criteria.guest_format = uint32_t(key.format);
+    criteria.host_format = uint32_t(direct_host_format.format);
+    criteria.load_shader = uint32_t(direct_host_format.load_shader);
+    criteria.mip_max_level = key.mip_max_level;
+    criteria.depth_or_array_size = depth_or_array_size;
+    criteria.device_supported = true;
+    if (EvaluateDirectStorageImage(criteria) == DirectStorageImageFallback::kNone &&
+        (formats[0] == VK_FORMAT_R8G8B8A8_UNORM ||
+         (formats[0] == VK_FORMAT_R32_SFLOAT && direct_storage_image_depth_pipeline_ != VK_NULL_HANDLE))) {
+      image_create_info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+      if (REXCVAR_GET(gpu_direct_storage_image_parity_loads) > 0 ||
+          REXCVAR_GET(gpu_fused_resolve_image_parity))
+        image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+      if (QueryDirectStorageImageSupport(image_create_info)) {
+        direct_storage_image = true;
+      } else {
+        image_create_info.usage &= ~VkImageUsageFlags(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+      }
+    }
+  }
+
   if (vmaCreateImage(vma_allocator_, &image_create_info, &allocation_create_info, &image,
                      &allocation, nullptr)) {
     return nullptr;
   }
 
-  return std::unique_ptr<Texture>(new VulkanTexture(*this, key, image, allocation));
+  return std::unique_ptr<Texture>(
+      new VulkanTexture(*this, key, image, allocation, track_usage, direct_storage_image));
 }
 
 bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled,
@@ -1262,9 +1736,35 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
   return EnsureScaledResolveBufferAllocated(start_scaled, length_scaled);
 }
 
+void VulkanTextureCache::AuditResolveProducer(const draw_util::ResolveInfo& info) {
+  if (!command_processor_.IsResolveChainAuditFrame()) return;
+  const uint64_t frame = command_processor_.GetCurrentFrame();
+  resolve_chain_audit_.ObserveFrame(frame);
+  if (audit_resolve_frame_ != frame) {
+    audit_resolve_frame_ = frame;
+    audit_resolve_ordinal_ = 0;
+  }
+  const uint32_t start = info.copy_dest_extent_start & 0x1FFFFFFF;
+  const uint32_t length = std::min(info.copy_dest_extent_length, 0x20000000u - start);
+  const uint64_t producer = resolve_chain_audit_.Write(start, length);
+  const auto source = info.IsCopyingDepth() ? info.depth_edram_info : info.color_edram_info;
+  REXGPU_INFO("[CHAIN_PRODUCER] frame={} submission={} producer={} ordinal={} "
+              "start={} length={} dest_base={} dest_format={} source_depth={} source_format={} "
+              "source_base={} msaa_enum={} guest_width={} guest_height={} scale_x={} scale_y={}",
+              frame, command_processor_.GetCurrentSubmission(), producer, ++audit_resolve_ordinal_,
+              start, length, info.copy_dest_base,
+              uint32_t(info.copy_dest_info.copy_dest_format), info.IsCopyingDepth(),
+              uint32_t(source.format), info.IsCopyingDepth() ? info.depth_original_base : info.color_original_base,
+              uint32_t(source.msaa_samples), uint32_t(info.coordinate_info.width_div_8) * 8,
+              info.height_div_8 * 8, draw_resolution_scale_x(), draw_resolution_scale_y());
+}
+
 bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                                bool load_mips) {
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
+  DrainResolvedImageInvalidations();
+  if (TryReuseFusedResolveImage(vulkan_texture, load_base, load_mips)) return true;
+  if (!MakeFusedResolveImageWritable(vulkan_texture)) return false;
   TextureKey texture_key = vulkan_texture.key();
 
   // Get the pipeline.
@@ -1413,12 +1913,63 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         level_host_layout.y_pitch_blocks * level_guest_z_extent_texels;
     host_buffer_size += level_host_layout.slice_size_bytes * array_size;
   }
+  uint64_t legacy_copy_bytes = 0;
+  for (uint32_t level = level_first; level <= level_last; ++level) {
+    const HostLayout& level_host_layout =
+        level != 0 ? host_layout_mips[std::min(level, level_packed)] : host_layout_base;
+    const uint32_t level_width = std::max((width * texture_resolution_scale_x) >> level, UINT32_C(1));
+    const uint32_t level_height =
+        std::max((height * texture_resolution_scale_y) >> level, UINT32_C(1));
+    const uint32_t level_depth = std::max(depth >> level, UINT32_C(1));
+    legacy_copy_bytes +=
+        uint64_t((level_width + host_block_width - 1) / host_block_width) *
+        ((level_height + host_block_height - 1) / host_block_height) * level_depth * array_size *
+        load_shader_info.bytes_per_host_block;
+  }
+
+  DirectStorageImageFallback direct_storage_image_fallback =
+      DirectStorageImageFallback::kPathDisabled;
+  bool use_direct_storage_image = false;
+  if (direct_storage_image_enabled_ && !parity_reentry_ && direct_storage_image_pipeline_ != VK_NULL_HANDLE &&
+      pipeline_float_convert == VK_NULL_HANDLE && !vulkan_texture.force_load_3d_tiling()) {
+    DirectStorageImageCriteria criteria;
+    criteria.enabled = true;
+    criteria.scaled_resolve = texture_key.scaled_resolve != 0;
+    criteria.tiled = texture_key.tiled != 0;
+    criteria.signed_separate = texture_key.signed_separate != 0;
+    criteria.packed_mips = texture_key.packed_mips != 0;
+    criteria.is_2d = texture_key.dimension == xenos::DataDimension::k2DOrStacked;
+    criteria.guest_format = uint32_t(texture_key.format);
+    criteria.host_format = uint32_t(host_format.format);
+    criteria.load_shader = uint32_t(load_shader);
+    criteria.mip_max_level = texture_key.mip_max_level;
+    criteria.depth_or_array_size = depth_or_array_size;
+    criteria.device_supported = vulkan_texture.direct_storage_image();
+    direct_storage_image_fallback = EvaluateDirectStorageImage(criteria);
+    if (direct_storage_image_fallback == DirectStorageImageFallback::kNone) {
+      if (level_first != 0 || level_last != 0) {
+        direct_storage_image_fallback = DirectStorageImageFallback::kMipLevels;
+      } else if (!vulkan_texture.direct_storage_image()) {
+        direct_storage_image_fallback = DirectStorageImageFallback::kDeviceUnsupported;
+      } else {
+        use_direct_storage_image = true;
+      }
+    }
+  }
+
+  const size_t parity_index = use_direct_storage_image
+      ? BeginParityReadback(texture, load_base, load_mips) : SIZE_MAX;
+
   VulkanCommandProcessor::ScratchBufferAcquisition scratch_buffer_acquisition(
       command_processor_.AcquireScratchGpuBuffer(
-          host_buffer_size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT));
+          use_direct_storage_image ? VkDeviceSize(0)
+                                   : host_buffer_size,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT));
   VkBuffer scratch_buffer = scratch_buffer_acquisition.buffer();
-  if (scratch_buffer == VK_NULL_HANDLE) {
-    return false;
+  if (!use_direct_storage_image) {
+    if (scratch_buffer == VK_NULL_HANDLE) {
+      return false;
+    }
   }
 
   // Begin loading.
@@ -1430,13 +1981,14 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   VulkanSharedMemory& vulkan_shared_memory = static_cast<VulkanSharedMemory&>(shared_memory());
   std::array<VkWriteDescriptorSet, 3> write_descriptor_sets;
   uint32_t write_descriptor_set_count = 0;
-  VkDescriptorSet descriptor_set_dest = command_processor_.AllocateSingleTransientDescriptor(
-      VulkanCommandProcessor::SingleTransientDescriptorLayout ::kStorageBufferCompute);
-  if (!descriptor_set_dest) {
-    return false;
-  }
+  VkDescriptorSet descriptor_set_dest = VK_NULL_HANDLE;
   VkDescriptorBufferInfo write_descriptor_set_dest_buffer_info;
-  {
+  if (!use_direct_storage_image) {
+    descriptor_set_dest = command_processor_.AllocateSingleTransientDescriptor(
+        VulkanCommandProcessor::SingleTransientDescriptorLayout ::kStorageBufferCompute);
+    if (!descriptor_set_dest) {
+      return false;
+    }
     write_descriptor_set_dest_buffer_info.buffer = scratch_buffer;
     write_descriptor_set_dest_buffer_info.offset = 0;
     write_descriptor_set_dest_buffer_info.range = host_buffer_size;
@@ -1557,11 +2109,44 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
 
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
 
-  command_processor_.BindExternalComputePipeline(pipeline);
+  const VkPipeline active_load_pipeline =
+      use_direct_storage_image ? (host_format.format == VK_FORMAT_R32_SFLOAT
+          ? direct_storage_image_depth_pipeline_ : direct_storage_image_pipeline_) : pipeline;
+  const VkPipelineLayout active_load_pipeline_layout =
+      use_direct_storage_image ? direct_storage_image_pipeline_layout_ : load_pipeline_layout_;
 
-  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, load_pipeline_layout_,
-                                         kLoadDescriptorSetIndexDestination, 1,
-                                         &descriptor_set_dest, 0, nullptr);
+  if (use_direct_storage_image) {
+    vulkan_texture.MarkAsUsed();
+    VulkanTexture::Usage texture_old_usage =
+        vulkan_texture.SetUsage(VulkanTexture::Usage::kComputeStorageWrite);
+    if (texture_old_usage != VulkanTexture::Usage::kComputeStorageWrite) {
+      VkPipelineStageFlags texture_src_stage_mask, texture_dst_stage_mask;
+      VkAccessFlags texture_src_access_mask, texture_dst_access_mask;
+      VkImageLayout texture_old_layout, texture_new_layout;
+      GetTextureUsageMasks(texture_old_usage, texture_src_stage_mask, texture_src_access_mask,
+                           texture_old_layout);
+      GetTextureUsageMasks(VulkanTexture::Usage::kComputeStorageWrite, texture_dst_stage_mask,
+                           texture_dst_access_mask, texture_new_layout);
+      command_processor_.PushImageMemoryBarrier(
+          vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
+          texture_src_stage_mask, texture_dst_stage_mask, texture_src_access_mask,
+          texture_dst_access_mask, texture_old_layout, texture_new_layout);
+    }
+    command_processor_.SubmitBarriers(true);
+  }
+
+  command_processor_.BindExternalComputePipeline(active_load_pipeline);
+
+  if (use_direct_storage_image) {
+    VkDescriptorSet descriptor_set_dest_image = vulkan_texture.direct_storage_image_descriptor_set();
+    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, active_load_pipeline_layout,
+                                           kLoadDescriptorSetIndexDestination, 1,
+                                           &descriptor_set_dest_image, 0, nullptr);
+  } else {
+    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, active_load_pipeline_layout,
+                                           kLoadDescriptorSetIndexDestination, 1, &descriptor_set_dest,
+                                           0, nullptr);
+  }
 
   VkDescriptorSet descriptor_set_source_current = VK_NULL_HANDLE;
 
@@ -1583,9 +2168,10 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         is_base ? descriptor_set_source_base : descriptor_set_source_mips;
     if (descriptor_set_source_current != descriptor_set_source) {
       descriptor_set_source_current = descriptor_set_source;
-      command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, load_pipeline_layout_,
-                                             kLoadDescriptorSetIndexSource, 1,
-                                             &descriptor_set_source, 0, nullptr);
+      command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                             active_load_pipeline_layout,
+                                             kLoadDescriptorSetIndexSource, 1, &descriptor_set_source,
+                                             0, nullptr);
     }
 
     // TODO(Triang3l): guest_offset relative to the storage buffer origin.
@@ -1640,7 +2226,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     load_constants.host_pitch =
         load_shader_info.bytes_per_host_block * level_host_layout.x_pitch_blocks;
 
-    command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+    command_buffer.CmdVkPushConstants(active_load_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                       sizeof(load_constants), &load_constants);
 
     uint32_t level_array_slice_stride_bytes_scaled =
@@ -1648,20 +2234,78 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         (texture_resolution_scale_x * texture_resolution_scale_y);
     for (uint32_t slice = 0; slice < array_size; ++slice) {
       if (slice != 0) {
-        command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
+        command_buffer.CmdVkPushConstants(active_load_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                                           offsetof(LoadConstants, guest_offset),
                                           sizeof(load_constants.guest_offset),
                                           &load_constants.guest_offset);
-        command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
+        command_buffer.CmdVkPushConstants(active_load_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                                           offsetof(LoadConstants, host_offset),
                                           sizeof(load_constants.host_offset),
                                           &load_constants.host_offset);
       }
       command_processor_.SubmitBarriers(true);
-      command_buffer.CmdVkDispatch(group_count_x, group_count_y, load_constants.size_blocks[2]);
+      command_buffer.CmdVkDispatch(group_count_x, group_count_y, load_constants.size_blocks[2],
+                                   texture_key.scaled_resolve ? WorkPurpose::kTextureScaledResolve
+                                                              : WorkPurpose::kTextureGuest);
       load_constants.guest_offset += level_array_slice_stride_bytes_scaled;
       load_constants.host_offset += uint32_t(level_host_layout.slice_size_bytes);
     }
+  }
+
+  if (use_direct_storage_image) {
+    const bool chain_audit = command_processor_.IsResolveChainAuditFrame();
+    const uint64_t audit_frame = command_processor_.GetCurrentFrame();
+    const uint64_t load_id = chain_audit ? ++audit_next_load_id_ : 0;
+    if (chain_audit) {
+      resolve_chain_audit_.ObserveFrame(audit_frame);
+      if (!vulkan_texture.audit_texture_id_) {
+        vulkan_texture.audit_texture_id_ = ++audit_next_texture_id_;
+      }
+      REXGPU_INFO(
+          "[CHAIN_LOAD] frame={} submission={} load={} texture={} base_page={} mip_page={} "
+          "guest_format={} vk_format={} signed_separate={} scaled={} tiled={} packed_mips={} "
+          "pitch={} guest_width={} guest_height={} depth_or_layers={} load_base={} load_mips={} "
+          "level_first={} level_last={} load_shader={} float_conversion={} "
+          "direct_storage_image=1 optimal_storage_bit=1",
+          audit_frame, command_processor_.GetCurrentSubmission(), load_id,
+          vulkan_texture.audit_texture_id_, uint32_t(texture_key.base_page),
+          uint32_t(texture_key.mip_page), uint32_t(texture_key.format), uint32_t(host_format.format),
+          uint32_t(texture_key.signed_separate), uint32_t(texture_key.scaled_resolve),
+          uint32_t(texture_key.tiled), uint32_t(texture_key.packed_mips), uint32_t(texture_key.pitch),
+          width, height, depth_or_array_size, load_base, load_mips, level_first, level_last,
+          uint32_t(load_shader), false);
+      for (uint32_t part = 0; part < 2; ++part) {
+        if (!(part ? load_mips : load_base)) {
+          continue;
+        }
+        const uint32_t start = (part ? texture_key.mip_page : texture_key.base_page) << 12;
+        const uint32_t length = part ? texture.GetGuestMipsSize() : texture.GetGuestBaseSize();
+        const auto sample =
+            resolve_chain_audit_.Load(vulkan_texture.audit_texture_id_, part != 0, start, length);
+        const auto invalidations = texture.audit_invalidations(part != 0);
+        const auto previous = vulkan_texture.audit_last_invalidations_[part];
+        REXGPU_INFO(
+            "[CHAIN_SOURCE] frame={} load={} texture={} mip={} start={} length={} valid={} "
+            "previous_load={} same_observed_writers={} unknown_bytes={} cpu_watch_delta={} "
+            "gpu_watch_delta={}",
+            audit_frame, load_id, vulkan_texture.audit_texture_id_, part, start, length,
+            sample.valid, sample.previous, sample.same_observed_writers, sample.unknown_bytes,
+            invalidations.first - previous.first, invalidations.second - previous.second);
+        vulkan_texture.audit_last_invalidations_[part] = invalidations;
+        for (const auto& [producer, bytes] : sample.producer_bytes) {
+          REXGPU_INFO(
+              "[CHAIN_EDGE] frame={} load={} texture={} mip={} producer={} bytes={} "
+              "provenance=resolve_extent",
+              audit_frame, load_id, vulkan_texture.audit_texture_id_, part, producer, bytes);
+        }
+      }
+    }
+    if (direct_storage_image_enabled_) {
+      CountDirectStorageImageResult(DirectStorageImageFallback::kNone, legacy_copy_bytes);
+    }
+    if (parity_index != SIZE_MAX)
+      CaptureParityImage(vulkan_texture, parity_readbacks_[parity_index], true);
+    return true;
   }
 
   if (pipeline_float_convert != VK_NULL_HANDLE) {
@@ -1759,7 +2403,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         }
         command_processor_.SubmitBarriers(true);
         command_buffer.CmdVkDispatch(group_count_x, group_count_y,
-                                     load_constants_float_convert.size_blocks[2]);
+                                     load_constants_float_convert.size_blocks[2],
+                                     WorkPurpose::kTextureConvert);
         load_constants_float_convert.guest_offset += level_array_slice_stride_bytes;
         load_constants_float_convert.host_offset += level_array_slice_stride_bytes;
       }
@@ -1792,7 +2437,47 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   command_processor_.SubmitBarriers(true);
   VkBufferImageCopy* copy_regions = command_buffer.CmdCopyBufferToImageEmplace(
       scratch_buffer, vulkan_texture.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-      level_last - level_first + 1);
+      level_last - level_first + 1, host_block_width, host_block_height,
+      load_shader_info.bytes_per_host_block);
+  const bool chain_audit = command_processor_.IsResolveChainAuditFrame();
+  const uint64_t audit_frame = command_processor_.GetCurrentFrame();
+  const uint64_t load_id = chain_audit ? ++audit_next_load_id_ : 0;
+  if (chain_audit) {
+    resolve_chain_audit_.ObserveFrame(audit_frame);
+    if (!vulkan_texture.audit_texture_id_) vulkan_texture.audit_texture_id_ = ++audit_next_texture_id_;
+    VkFormatProperties audit_format_properties{};
+    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+        vulkan_device->physical_device(), host_format.format, &audit_format_properties);
+    REXGPU_INFO("[CHAIN_LOAD] frame={} submission={} load={} texture={} base_page={} mip_page={} "
+                "guest_format={} vk_format={} signed_separate={} scaled={} tiled={} packed_mips={} "
+                "pitch={} guest_width={} guest_height={} depth_or_layers={} load_base={} load_mips={} "
+                "level_first={} level_last={} load_shader={} float_conversion={} optimal_storage_bit={}",
+                audit_frame, command_processor_.GetCurrentSubmission(), load_id,
+                vulkan_texture.audit_texture_id_, uint32_t(texture_key.base_page),
+                uint32_t(texture_key.mip_page), uint32_t(texture_key.format), uint32_t(host_format.format),
+                uint32_t(texture_key.signed_separate), uint32_t(texture_key.scaled_resolve),
+                uint32_t(texture_key.tiled), uint32_t(texture_key.packed_mips), uint32_t(texture_key.pitch),
+                width, height, depth_or_array_size, load_base, load_mips, level_first, level_last,
+                uint32_t(load_shader), pipeline_float_convert != VK_NULL_HANDLE,
+                (audit_format_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0);
+    for (uint32_t part = 0; part < 2; ++part) {
+      if (!(part ? load_mips : load_base)) continue;
+      const uint32_t start = (part ? texture_key.mip_page : texture_key.base_page) << 12;
+      const uint32_t length = part ? texture.GetGuestMipsSize() : texture.GetGuestBaseSize();
+      const auto sample = resolve_chain_audit_.Load(vulkan_texture.audit_texture_id_, part != 0, start, length);
+      const auto invalidations = texture.audit_invalidations(part != 0);
+      const auto previous = vulkan_texture.audit_last_invalidations_[part];
+      REXGPU_INFO("[CHAIN_SOURCE] frame={} load={} texture={} mip={} start={} length={} valid={} "
+                  "previous_load={} same_observed_writers={} unknown_bytes={} cpu_watch_delta={} gpu_watch_delta={}",
+                  audit_frame, load_id, vulkan_texture.audit_texture_id_, part, start, length,
+                  sample.valid, sample.previous, sample.same_observed_writers, sample.unknown_bytes,
+                  invalidations.first - previous.first, invalidations.second - previous.second);
+      vulkan_texture.audit_last_invalidations_[part] = invalidations;
+      for (const auto& [producer, bytes] : sample.producer_bytes)
+        REXGPU_INFO("[CHAIN_EDGE] frame={} load={} texture={} mip={} producer={} bytes={} provenance=resolve_extent",
+                    audit_frame, load_id, vulkan_texture.audit_texture_id_, part, producer, bytes);
+    }
+  }
   for (uint32_t level = level_first; level <= level_last; ++level) {
     VkBufferImageCopy& copy_region = copy_regions[level - level_first];
     const HostLayout& level_host_layout =
@@ -1830,8 +2515,22 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     copy_region.imageExtent.height =
         std::max((height * texture_resolution_scale_y) >> level, UINT32_C(1));
     copy_region.imageExtent.depth = std::max(depth >> level, UINT32_C(1));
+    if (chain_audit) {
+      const uint64_t bytes = uint64_t((copy_region.imageExtent.width + host_block_width - 1) / host_block_width) *
+          ((copy_region.imageExtent.height + host_block_height - 1) / host_block_height) *
+          copy_region.imageExtent.depth * array_size * load_shader_info.bytes_per_host_block;
+      REXGPU_INFO("[CHAIN_COPY] frame={} load={} texture={} level={} width={} height={} depth={} "
+                  "layers={} vk_format={} bytes={} block_width={} block_height={} block_bytes={}",
+                  audit_frame, load_id, vulkan_texture.audit_texture_id_, level,
+                  copy_region.imageExtent.width, copy_region.imageExtent.height, copy_region.imageExtent.depth,
+                  array_size, uint32_t(host_format.format), bytes, host_block_width, host_block_height,
+                  load_shader_info.bytes_per_host_block);
+    }
   }
 
+  if (direct_storage_image_enabled_) {
+    CountDirectStorageImageResult(direct_storage_image_fallback, legacy_copy_bytes);
+  }
   return true;
 }
 
@@ -1891,16 +2590,84 @@ void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask)
 
 VulkanTextureCache::VulkanTexture::VulkanTexture(VulkanTextureCache& texture_cache,
                                                  const TextureKey& key, VkImage image,
-                                                 VmaAllocation allocation, bool track_usage)
-    : Texture(texture_cache, key, track_usage), image_(image), allocation_(allocation) {
+                                                 VmaAllocation allocation, bool track_usage,
+                                                 bool direct_storage_image)
+    : Texture(texture_cache, key, track_usage),
+      image_resource_(std::make_shared<ImageResource>(texture_cache.vma_allocator_, image,
+                                                       allocation)) {
   VmaAllocationInfo allocation_info;
-  vmaGetAllocationInfo(texture_cache.vma_allocator_, allocation_, &allocation_info);
+  vmaGetAllocationInfo(texture_cache.vma_allocator_, allocation, &allocation_info);
   SetHostMemoryUsage(uint64_t(allocation_info.size));
+
+  // Default-off direct storage-image path: a dedicated 2D view plus a stable
+  // descriptor set, so the load shader can write the image without touching the
+  // command processor's transient descriptor plumbing.
+  if (direct_storage_image &&
+      texture_cache.direct_storage_image_descriptor_set_layout_ != VK_NULL_HANDLE &&
+      texture_cache.direct_storage_image_descriptor_pool_ != VK_NULL_HANDLE) {
+    assert_zero(key.dimension != xenos::DataDimension::k2DOrStacked);
+    assert_zero(key.GetDepthOrArraySize() != 1);
+    const ui::vulkan::VulkanDevice* const vulkan_device =
+        texture_cache.command_processor_.GetVulkanDevice();
+    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+    const VkDevice device = vulkan_device->device();
+    VkImageViewCreateInfo view_create_info;
+    view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_create_info.pNext = nullptr;
+    view_create_info.flags = 0;
+    view_create_info.image = image;
+    view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_create_info.format = key.format == xenos::TextureFormat::k_24_8
+        ? VK_FORMAT_R32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+    view_create_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+    view_create_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+    view_create_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+    view_create_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+    view_create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    view_create_info.subresourceRange.baseMipLevel = 0;
+    view_create_info.subresourceRange.levelCount = 1;
+    view_create_info.subresourceRange.baseArrayLayer = 0;
+    view_create_info.subresourceRange.layerCount = 1;
+    if (dfn.vkCreateImageView(device, &view_create_info, nullptr,
+                              &direct_storage_image_view_) == VK_SUCCESS) {
+      VkDescriptorSetAllocateInfo descriptor_set_allocate_info;
+      descriptor_set_allocate_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+      descriptor_set_allocate_info.pNext = nullptr;
+      descriptor_set_allocate_info.descriptorPool =
+          texture_cache.direct_storage_image_descriptor_pool_;
+      descriptor_set_allocate_info.descriptorSetCount = 1;
+      descriptor_set_allocate_info.pSetLayouts =
+          &texture_cache.direct_storage_image_descriptor_set_layout_;
+      if (dfn.vkAllocateDescriptorSets(device, &descriptor_set_allocate_info,
+                                       &direct_storage_image_descriptor_set_) == VK_SUCCESS) {
+        VkDescriptorImageInfo descriptor_image_info;
+        descriptor_image_info.sampler = VK_NULL_HANDLE;
+        descriptor_image_info.imageView = direct_storage_image_view_;
+        descriptor_image_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet write_descriptor_set;
+        write_descriptor_set.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write_descriptor_set.pNext = nullptr;
+        write_descriptor_set.dstSet = direct_storage_image_descriptor_set_;
+        write_descriptor_set.dstBinding = 0;
+        write_descriptor_set.dstArrayElement = 0;
+        write_descriptor_set.descriptorCount = 1;
+        write_descriptor_set.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        write_descriptor_set.pImageInfo = &descriptor_image_info;
+        write_descriptor_set.pBufferInfo = nullptr;
+        write_descriptor_set.pTexelBufferView = nullptr;
+        dfn.vkUpdateDescriptorSets(device, 1, &write_descriptor_set, 0, nullptr);
+      } else {
+        dfn.vkDestroyImageView(device, direct_storage_image_view_, nullptr);
+        direct_storage_image_view_ = VK_NULL_HANDLE;
+      }
+    }
+  }
 }
 
 VulkanTextureCache::VulkanTexture::~VulkanTexture() {
-  const VulkanTextureCache& vulkan_texture_cache =
-      static_cast<const VulkanTextureCache&>(texture_cache());
+  VulkanTextureCache& vulkan_texture_cache =
+      static_cast<VulkanTextureCache&>(texture_cache());
+  if (audit_texture_id_) vulkan_texture_cache.resolve_chain_audit_.ForgetTexture(audit_texture_id_);
   const ui::vulkan::VulkanDevice* const vulkan_device =
       vulkan_texture_cache.command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -1914,7 +2681,15 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
   if (image_view_3d_as_2d_signed_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, image_view_3d_as_2d_signed_, nullptr);
   }
-  vmaDestroyImage(vulkan_texture_cache.vma_allocator_, image_, allocation_);
+  if (direct_storage_image_descriptor_set_ != VK_NULL_HANDLE &&
+      vulkan_texture_cache.vk_free_descriptor_sets_ != nullptr) {
+    vulkan_texture_cache.vk_free_descriptor_sets_(
+        device, vulkan_texture_cache.direct_storage_image_descriptor_pool_, 1,
+        &direct_storage_image_descriptor_set_);
+  }
+  if (direct_storage_image_view_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyImageView(device, direct_storage_image_view_, nullptr);
+  }
 }
 
 VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t host_swizzle,
@@ -2813,6 +3588,119 @@ bool VulkanTextureCache::Initialize() {
     return false;
   }
 
+  // Default-off direct storage-image load path: destination storage image (set
+  // 0) + shared source storage buffer (set 1) + the same load push constants.
+  direct_storage_image_enabled_ = REXCVAR_GET(gpu_direct_storage_image_texture_load);
+  if (direct_storage_image_enabled_) {
+    const ui::vulkan::VulkanInstance::Functions& ifn =
+        vulkan_device->vulkan_instance()->functions();
+    vk_free_descriptor_sets_ = reinterpret_cast<PFN_vkFreeDescriptorSets>(
+        ifn.vkGetDeviceProcAddr(device, "vkFreeDescriptorSets"));
+    static_assert(uint32_t(kDirectStorageImageWriteUsage.stage_mask) ==
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  "Direct storage-image write stage mismatch");
+    static_assert(uint32_t(kDirectStorageImageWriteUsage.access_mask) == VK_ACCESS_SHADER_WRITE_BIT,
+                  "Direct storage-image write access mismatch");
+    static_assert(kDirectStorageImageWriteUsage.layout == VK_IMAGE_LAYOUT_GENERAL,
+                  "Direct storage-image write layout mismatch");
+    static_assert(uint32_t(kDirectStorageImageSampledReadUsage.access_mask) ==
+                      VK_ACCESS_SHADER_READ_BIT,
+                  "Direct storage-image sampled access mismatch");
+    static_assert(kDirectStorageImageSampledReadUsage.layout ==
+                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  "Direct storage-image sampled layout mismatch");
+    static_assert(kDirectStorageImageGuestFormat == uint32_t(xenos::TextureFormat::k_8_8_8_8),
+                  "Direct storage-image guest format mismatch");
+    static_assert(kDirectStorageImageHostFormat == uint32_t(VK_FORMAT_R8G8B8A8_UNORM),
+                  "Direct storage-image host format mismatch");
+    static_assert(kDirectStorageImageDepthLoadShader == uint32_t(kLoadShaderIndexDepthUnorm));
+    static_assert(kDirectStorageImageDepthHostFormat == uint32_t(VK_FORMAT_R32_SFLOAT));
+    static_assert(kDirectStorageImageDepthGuestFormat == uint32_t(xenos::TextureFormat::k_24_8));
+    static_assert(kDirectStorageImageLoadShader == uint32_t(kLoadShaderIndex32bpb),
+                  "Direct storage-image load shader mismatch");
+
+    VkDescriptorSetLayoutBinding direct_image_binding;
+    direct_image_binding.binding = 0;
+    direct_image_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    direct_image_binding.descriptorCount = 1;
+    direct_image_binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    direct_image_binding.pImmutableSamplers = nullptr;
+    VkDescriptorSetLayoutCreateInfo direct_image_layout_create_info;
+    direct_image_layout_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    direct_image_layout_create_info.pNext = nullptr;
+    direct_image_layout_create_info.flags = 0;
+    direct_image_layout_create_info.bindingCount = 1;
+    direct_image_layout_create_info.pBindings = &direct_image_binding;
+    VkDescriptorPoolSize direct_image_pool_size;
+    direct_image_pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    direct_image_pool_size.descriptorCount = 256;
+    VkDescriptorPoolCreateInfo direct_image_pool_create_info;
+    direct_image_pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    direct_image_pool_create_info.pNext = nullptr;
+    direct_image_pool_create_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    direct_image_pool_create_info.maxSets = 256;
+    direct_image_pool_create_info.poolSizeCount = 1;
+    direct_image_pool_create_info.pPoolSizes = &direct_image_pool_size;
+    VkDescriptorSetLayout direct_image_descriptor_set_layouts[kLoadDescriptorSetCount] = {
+        VK_NULL_HANDLE, load_descriptor_set_layout_storage_buffer};
+    VkPipelineLayoutCreateInfo direct_image_pipeline_layout_create_info =
+        load_pipeline_layout_create_info;
+    direct_image_pipeline_layout_create_info.pSetLayouts = direct_image_descriptor_set_layouts;
+    bool direct_image_ready = false;
+    if (dfn.vkCreateDescriptorSetLayout(device, &direct_image_layout_create_info, nullptr,
+                                        &direct_storage_image_descriptor_set_layout_) ||
+        dfn.vkCreateDescriptorPool(device, &direct_image_pool_create_info, nullptr,
+                                   &direct_storage_image_descriptor_pool_)) {
+      REXGPU_ERROR("VulkanTexture: Failed to create the direct storage-image descriptors");
+    } else {
+      direct_image_descriptor_set_layouts[kLoadDescriptorSetIndexDestination] =
+          direct_storage_image_descriptor_set_layout_;
+      if (dfn.vkCreatePipelineLayout(device, &direct_image_pipeline_layout_create_info, nullptr,
+                                     &direct_storage_image_pipeline_layout_)) {
+        REXGPU_ERROR("VulkanTexture: Failed to create the direct storage-image pipeline layout");
+      } else {
+        std::string direct_image_compile_error;
+        std::vector<uint32_t> direct_image_spirv;
+        if (!command_processor_.CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT,
+                                                  kDirectStorageImageLoadShaderSource,
+                                                  direct_image_spirv, direct_image_compile_error)) {
+          REXGPU_ERROR("VulkanTexture: Failed to compile the direct storage-image load shader: {}",
+                       direct_image_compile_error);
+        } else {
+          direct_storage_image_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+              vulkan_device, direct_storage_image_pipeline_layout_, direct_image_spirv.data(),
+              direct_image_spirv.size() * sizeof(uint32_t));
+          if (direct_storage_image_pipeline_ == VK_NULL_HANDLE) {
+            REXGPU_ERROR("VulkanTexture: Failed to create the direct storage-image pipeline");
+          } else {
+            direct_image_ready = true;
+            direct_image_spirv.clear();
+            if (command_processor_.CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT,
+                    kDirectStorageImageDepthShaderSource, direct_image_spirv,
+                    direct_image_compile_error)) {
+              direct_storage_image_depth_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+                  vulkan_device, direct_storage_image_pipeline_layout_, direct_image_spirv.data(),
+                  direct_image_spirv.size() * sizeof(uint32_t));
+            } else {
+              REXGPU_ERROR("Direct depth image shader compilation failed: {}", direct_image_compile_error);
+            }
+            REXGPU_INFO(
+                "VulkanTexture: Direct storage-image load path enabled (R8G8B8A8_UNORM scaled "
+                "resolves)");
+          }
+        }
+      }
+    }
+    if (!direct_image_ready) {
+      // Keep the cvar state for accounting, but never dispatch the direct path
+      // without a pipeline - every load falls back to the buffer path.
+      direct_storage_image_pipeline_ = VK_NULL_HANDLE;
+      REXGPU_WARN(
+          "VulkanTexture: Direct storage-image load path unavailable, using the buffer-and-copy "
+          "path");
+    }
+  }
+
   // Load pipelines, only the ones needed for the formats that will be used.
 
   bool load_shaders_needed[kLoadShaderCount] = {};
@@ -3276,10 +4164,24 @@ void VulkanTextureCache::GetTextureUsageMasks(VulkanTexture::Usage usage,
   switch (usage) {
     case VulkanTexture::Usage::kUndefined:
       break;
+    case VulkanTexture::Usage::kParityTransferSource:
+      stage_mask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+      access_mask = VK_ACCESS_TRANSFER_READ_BIT;
+      layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      break;
     case VulkanTexture::Usage::kTransferDestination:
       stage_mask = VK_PIPELINE_STAGE_TRANSFER_BIT;
       access_mask = VK_ACCESS_TRANSFER_WRITE_BIT;
       layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      break;
+    case VulkanTexture::Usage::kComputeStorageWrite:
+      // Default-off direct storage-image load: the load compute shader owns the
+      // image in GENERAL, so the next consumer (guest fragment/compute
+      // sampling) must wait for the compute writes and transition to
+      // SHADER_READ_ONLY_OPTIMAL.
+      stage_mask = VkPipelineStageFlags(kDirectStorageImageWriteUsage.stage_mask);
+      access_mask = VkAccessFlags(kDirectStorageImageWriteUsage.access_mask);
+      layout = VkImageLayout(kDirectStorageImageWriteUsage.layout);
       break;
     case VulkanTexture::Usage::kGuestShaderSampled:
       stage_mask = guest_shader_pipeline_stages_;
@@ -3295,6 +4197,58 @@ void VulkanTextureCache::GetTextureUsageMasks(VulkanTexture::Usage usage,
       layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
       break;
   }
+}
+
+bool VulkanTextureCache::IsInGpuFrameAuditWindow() const {
+  return command_processor_.IsGpuFrameAuditWindow();
+}
+
+bool VulkanTextureCache::QueryDirectStorageImageSupport(
+    const VkImageCreateInfo& image_create_info) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanInstance* const vulkan_instance = vulkan_device->vulkan_instance();
+  const ui::vulkan::VulkanInstance::Functions& ifn = vulkan_instance->functions();
+  PFN_vkGetPhysicalDeviceImageFormatProperties get_image_format_properties =
+      reinterpret_cast<PFN_vkGetPhysicalDeviceImageFormatProperties>(ifn.vkGetInstanceProcAddr(
+          vulkan_instance->instance(), "vkGetPhysicalDeviceImageFormatProperties"));
+  if (get_image_format_properties == nullptr) {
+    return false;
+  }
+  VkImageFormatProperties image_format_properties;
+  const VkResult result = get_image_format_properties(
+      vulkan_device->physical_device(), image_create_info.format, image_create_info.imageType,
+      image_create_info.tiling, image_create_info.usage, image_create_info.flags,
+      &image_format_properties);
+  return result == VK_SUCCESS;
+}
+
+void VulkanTextureCache::CountDirectStorageImageResult(DirectStorageImageFallback fallback,
+                                                       uint64_t copy_bytes) {
+  if (fallback == DirectStorageImageFallback::kNone) {
+    direct_storage_image_loads_.fetch_add(1, std::memory_order_relaxed);
+    direct_storage_image_copy_bytes_avoided_.fetch_add(copy_bytes, std::memory_order_relaxed);
+  } else {
+    direct_storage_image_fallbacks_.fetch_add(1, std::memory_order_relaxed);
+    direct_storage_image_fallbacks_by_reason_[size_t(fallback)].fetch_add(
+        1, std::memory_order_relaxed);
+    direct_storage_image_legacy_copy_bytes_.fetch_add(copy_bytes, std::memory_order_relaxed);
+  }
+}
+
+VulkanTextureCache::DirectStorageImageStats VulkanTextureCache::GetDirectStorageImageStats()
+    const {
+  DirectStorageImageStats stats;
+  stats.direct_loads = direct_storage_image_loads_.load(std::memory_order_relaxed);
+  stats.fallbacks = direct_storage_image_fallbacks_.load(std::memory_order_relaxed);
+  stats.copy_bytes_avoided =
+      direct_storage_image_copy_bytes_avoided_.load(std::memory_order_relaxed);
+  stats.legacy_copy_bytes =
+      direct_storage_image_legacy_copy_bytes_.load(std::memory_order_relaxed);
+  for (size_t i = 0; i < size_t(DirectStorageImageFallback::kCount); ++i) {
+    stats.fallbacks_by_reason[i] =
+        direct_storage_image_fallbacks_by_reason_[i].load(std::memory_order_relaxed);
+  }
+  return stats;
 }
 
 xenos::ClampMode VulkanTextureCache::NormalizeClampMode(xenos::ClampMode clamp_mode) const {

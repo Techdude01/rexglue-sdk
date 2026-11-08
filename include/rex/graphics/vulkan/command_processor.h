@@ -231,6 +231,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   };
 
   struct ScopeProfileRecord {
+    struct PixelShaderGroup {
+      uint32_t draw_count = 0;
+      bool writes_depth = false;
+      bool kills_pixels = false;
+    };
+    std::unordered_map<uint64_t, PixelShaderGroup> pixel_shaders;
+    uint32_t pixel_shader_overflow_draw_count = 0;
     ScopeCategory category = ScopeCategory::kMainPass;
     uint32_t width = 0;
     uint32_t height = 0;
@@ -253,7 +260,11 @@ class VulkanCommandProcessor : public CommandProcessor {
                              VkAttachmentLoadOp depth_load, VkAttachmentStoreOp depth_store,
                              const std::string& description);
   void EndScopeProfile(uint32_t scope_index);
-  void NoteScopeDraw();
+  void NoteScopeDraw(const VulkanShader* pixel_shader = nullptr);
+  void RecordTransferElision();
+  void FlushRasterVariantAudit();
+  RasterVariantFrameAudit raster_variant_audit_;
+  uint32_t current_frame_early_z_draws_ = 0;
 
   uint64_t GetCurrentSubmission() const {
     return submission_completed_ + uint64_t(submissions_in_flight_fences_.size()) + 1;
@@ -270,6 +281,8 @@ class VulkanCommandProcessor : public CommandProcessor {
                         VkPipelineStageFlags wait_stage_mask);
 
   uint64_t GetCurrentFrame() const { return frame_current_; }
+  bool IsResolveChainAuditFrame() const;
+  bool IsGpuFrameAuditWindow() const;
   uint64_t GetCompletedFrame() const { return frame_completed_; }
   bool IsFragmentDiagnosticEnabledForFrame(uint64_t frame) const {
     return diagnostic_storage_enabled_ && frame == diagnostic_storage_frame_ &&
@@ -324,7 +337,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Overload for transfer operations with dynamic rendering.
   void SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer,
-      VkImageView transfer_dest_view, bool transfer_dest_is_depth);
+      VkImageView transfer_dest_view, bool transfer_dest_is_depth,
+      VkImageView transfer_depth_view = VK_NULL_HANDLE);
   // Must be called before doing anything outside the render pass scope,
   // including adding pipeline barriers that are not a part of the render pass
   // scope. Submission must be open.
@@ -979,6 +993,8 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool current_dynamic_rendering_has_stencil_ = false;
   uint32_t current_dynamic_rendering_color_count_ = 0;
   VkImageView current_dynamic_rendering_transfer_dest_view_ = VK_NULL_HANDLE;
+  VkImageView current_dynamic_rendering_transfer_depth_view_ = VK_NULL_HANDLE;
+  bool current_dynamic_rendering_transfer_dest_is_depth_ = false;
   VulkanRenderTargetCache::RenderPassKey current_dynamic_rendering_render_pass_key_ = {};
   VkRect2D current_dynamic_rendering_area_ = {};
 
@@ -1081,8 +1097,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   struct FrameCpuProfilingStats {
     uint64_t draw_count = 0;
     std::chrono::nanoseconds time_primitive_processing{0};
+    std::chrono::nanoseconds time_shader_translation{0};
+    std::chrono::nanoseconds time_sampler_preparation{0};
+    std::chrono::nanoseconds time_texture_request{0};
     std::chrono::nanoseconds time_render_target_update{0};
     std::chrono::nanoseconds time_pipeline_configuration{0};
+    std::chrono::nanoseconds time_dynamic_state{0};
     std::chrono::nanoseconds time_binding_updates{0};
     std::chrono::nanoseconds time_shared_memory_residency{0};
     std::chrono::nanoseconds time_barriers_and_render_pass{0};
@@ -1109,8 +1129,12 @@ class VulkanCommandProcessor : public CommandProcessor {
     void Reset() {
       draw_count = 0;
       time_primitive_processing = std::chrono::nanoseconds{0};
+      time_shader_translation = std::chrono::nanoseconds{0};
+      time_sampler_preparation = std::chrono::nanoseconds{0};
+      time_texture_request = std::chrono::nanoseconds{0};
       time_render_target_update = std::chrono::nanoseconds{0};
       time_pipeline_configuration = std::chrono::nanoseconds{0};
+      time_dynamic_state = std::chrono::nanoseconds{0};
       time_binding_updates = std::chrono::nanoseconds{0};
       time_shared_memory_residency = std::chrono::nanoseconds{0};
       time_barriers_and_render_pass = std::chrono::nanoseconds{0};
@@ -1129,6 +1153,8 @@ class VulkanCommandProcessor : public CommandProcessor {
       transfer_guest_scope_reuses = 0;
     }
   } frame_cpu_profiling_stats_;
+
+  WorkPurposeAudit work_purpose_audit_;
 
   // Frame-time and workload audit instrumentation (docs/fps-frame-time-audit-plan.md).
   struct FrameWorkCounters {
@@ -1151,6 +1177,8 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t pass_count = 0;
     uint32_t main_pass_count = 0;
     uint32_t transfer_pass_count = 0;
+    uint32_t merged_guest_passes = 0;
+    uint32_t elided_dead_transfers = 0;
     uint64_t main_render_area_pixels = 0;
     uint64_t main_full_area_pixels = 0;
     uint32_t bounded_main_pass_count = 0;

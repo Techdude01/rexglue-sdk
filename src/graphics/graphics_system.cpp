@@ -296,6 +296,33 @@ void GraphicsSystem::SetInterruptCallback(uint32_t callback, uint32_t user_data)
   REXGPU_INFO("SetInterruptCallback({:08X}, {:08X})", callback, user_data);
 }
 
+bool GraphicsSystem::SetDrawObserver(system::GpuDrawObserver observer, void* user) {
+  if (!command_processor_) {
+    return false;
+  }
+  command_processor_->SetDrawObserver(observer, user);
+  REXGPU_INFO("Draw observer {}", observer ? "set" : "cleared");
+  return true;
+}
+
+bool GraphicsSystem::SetHostRendering(bool enabled) {
+  if (!command_processor_) {
+    return false;
+  }
+  command_processor_->SetHostRendering(enabled);
+  REXGPU_INFO("Host rendering {}", enabled ? "enabled" : "disabled");
+  return true;
+}
+
+bool GraphicsSystem::SetSignalGate(system::GpuSignalGate gate, void* user) {
+  if (!command_processor_) {
+    return false;
+  }
+  command_processor_->SetSignalGate(gate, user);
+  REXGPU_INFO("Signal gate {}", gate ? "set" : "removed");
+  return true;
+}
+
 void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   if (!interrupt_callback_) {
     return;

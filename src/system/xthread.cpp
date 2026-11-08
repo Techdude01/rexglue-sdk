@@ -439,11 +439,15 @@ X_STATUS XThread::Create() {
     // Set thread ID override. This is used by logging.
     rex::thread::set_current_thread_id(handle());
 
-    // Set name immediately, if we have one.
-    thread_->set_name(thread_name_);
-
-    PROFILE_THREAD_ENTER(thread_name_.c_str());
-    PROFILE_THREAD_CREATED();
+    // Serialize startup naming with XThread::set_name. Both paths update the host
+    // Thread's std::string as well as reading thread_name_; concurrent assignment
+    // can free the same allocation while a newly created guest thread starts.
+    {
+      std::lock_guard<std::mutex> lock(thread_lock_);
+      thread_->set_name(thread_name_);
+      PROFILE_THREAD_ENTER(thread_name_.c_str());
+      PROFILE_THREAD_CREATED();
+    }
 
     // Execute user code.
     current_xthread_tls_ = this;

@@ -27,6 +27,20 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 
+REXCVAR_DEFINE_BOOL(gpu_resolve_chain_audit, false, "GPU",
+                    "Log resolve-to-texture provenance within the frame audit window; diagnostic only")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(gpu_direct_storage_image_parity_loads, 0, "GPU",
+    "Debug only: compare N direct loads against legacy image readback in the resolve audit window")
+    .range(0, 64).lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(
+    gpu_direct_storage_image_texture_load, true, "GPU",
+    "Default-on: write eligible scaled-resolve textures directly into the storage image instead of "
+    "materialising a scratch buffer and copying it into the image")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
                      "Texture cache memory limit for render-to-texture (MB)")
     .range(1, 256)
@@ -304,6 +318,10 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
     assert_true(found_texture_it != textures_.end());
     if (found_texture_it != textures_.end()) {
       assert_true(found_texture_it->second.get() == texture);
+      if (texture->key().scaled_resolve) {
+        uint64_t range_key = (uint64_t(texture->key().base_page << 12) << 32) | texture->GetGuestBaseSize();
+        scaled_resolve_texture_keys_.erase(range_key);
+      }
       textures_.erase(found_texture_it);
       // `texture` is invalid now.
     }
@@ -877,14 +895,26 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
                                  void* context, void* data, uint64_t argument,
                                  bool invalidated_by_gpu) {
   Texture& texture = *static_cast<Texture*>(context);
+  if (REXCVAR_GET(gpu_resolve_chain_audit)) {
+    texture.AuditInvalidation(argument != 0, invalidated_by_gpu);
+  }
   texture.WatchCallback(global_lock, argument != 0);
   texture.texture_cache().texture_became_outdated_.store(true, std::memory_order_release);
 }
 
 void TextureCache::DestroyAllTextures(bool from_destructor) {
   ResetTextureBindings(from_destructor);
+  scaled_resolve_texture_keys_.clear();
   textures_.clear();
   COUNT_profile_set("gpu/texture_cache/textures", 0);
+}
+
+const TextureCache::TextureKey* TextureCache::FindUniqueResolvedTextureKey(
+    uint32_t address, uint32_t length) const {
+  address &= 0x1FFFFFFFu;
+  uint64_t range_key = (uint64_t(address) << 32) | length;
+  auto it = scaled_resolve_texture_keys_.find(range_key);
+  return (it != scaled_resolve_texture_keys_.end()) ? it->second : nullptr;
 }
 
 TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
@@ -1000,6 +1030,10 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     }
     assert_true(new_texture->key() == key);
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
+    if (key.scaled_resolve) {
+      uint64_t range_key = (uint64_t(key.base_page << 12) << 32) | texture->GetGuestBaseSize();
+      scaled_resolve_texture_keys_[range_key] = &texture->key();
+    }
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
@@ -1201,6 +1235,7 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
     const std::unique_lock<std::recursive_mutex>& global_lock, uint32_t address_first,
     uint32_t address_last, bool invalidated_by_gpu) {
   assert_true(IsDrawResolutionScaled());
+  InvalidateResolvedImages(address_first, address_last - address_first + 1);
   if (invalidated_by_gpu) {
     // Resolves themselves do exactly the opposite of what this should do.
     return;

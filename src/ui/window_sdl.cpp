@@ -33,6 +33,8 @@
 #elif REX_PLATFORM_MAC
 #include <CoreFoundation/CoreFoundation.h>
 #include <SDL3/SDL_metal.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
 
 #include <rex/ui/surface_mac.h>
 #else
@@ -235,6 +237,19 @@ void* WindowSDL::GetNativeWindowHandle() const {
   }
   return SDL_GetPointerProperty(SDL_GetWindowProperties(sdl_window_),
                                 SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+#elif REX_PLATFORM_MAC
+  if (!sdl_window_) {
+    return nullptr;
+  }
+  SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
+  void* nswindow = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, nullptr);
+  if (!nswindow) {
+    return nullptr;
+  }
+  SEL sel = sel_registerName("contentView");
+  using MsgSend = void* (*)(const void*, SEL);
+  auto send = reinterpret_cast<MsgSend>(objc_msgSend);
+  return send(nswindow, sel);
 #else
   return nullptr;
 #endif

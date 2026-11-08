@@ -962,13 +962,19 @@ class Shader {
   uint32_t early_alpha_register() const { return early_alpha_register_; }
   // Vector component index (0=X, 1=Y, 2=Z, 3=W) of the early alpha register, or UINT32_MAX.
   uint32_t early_alpha_component() const { return early_alpha_component_; }
+  uint32_t c0_alpha_copy_src_reg() const { return c0_alpha_copy_src_reg_; }
 
   // Host translations with the specified modification bits. Not thread-safe
   // with respect to translation creation/destruction.
   const std::unordered_map<uint64_t, Translation*>& translations() const { return translations_; }
   Translation* GetTranslation(uint64_t modification) const {
+    if (last_translation_ && last_translation_modification_ == modification) {
+      return last_translation_;
+    }
     auto it = translations_.find(modification);
     if (it != translations_.cend()) {
+      last_translation_modification_ = modification;
+      last_translation_ = it->second;
       return it->second;
     }
     return nullptr;
@@ -1045,6 +1051,8 @@ class Shader {
 
   // Modification bits -> translation.
   std::unordered_map<uint64_t, Translation*> translations_;
+  mutable uint64_t last_translation_modification_ = UINT64_MAX;
+  mutable Translation* last_translation_ = nullptr;
 
   uint32_t ucode_storage_index_ = UINT32_MAX;
 

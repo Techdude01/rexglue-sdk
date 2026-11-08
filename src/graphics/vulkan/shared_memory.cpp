@@ -331,7 +331,8 @@ bool VulkanSharedMemory::UploadRanges(
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
         command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
-                                       uint32_t(upload_regions_.size()), upload_regions_.data());
+                                       uint32_t(upload_regions_.size()), upload_regions_.data(),
+                                       WorkPurpose::kSharedUpload);
         upload_regions_.clear();
       }
       upload_buffer_previous = upload_buffer;
@@ -350,7 +351,8 @@ bool VulkanSharedMemory::UploadRanges(
   if (!upload_regions_.empty()) {
     assert_true(upload_buffer_previous != VK_NULL_HANDLE);
     command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
-                                   uint32_t(upload_regions_.size()), upload_regions_.data());
+                                   uint32_t(upload_regions_.size()), upload_regions_.data(),
+                                   WorkPurpose::kSharedUpload);
     upload_regions_.clear();
   }
   return successful;

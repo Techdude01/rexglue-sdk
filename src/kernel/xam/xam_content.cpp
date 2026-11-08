@@ -62,12 +62,18 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
                                      u32 content_flags, u32 items_per_enumerate,
                                      mapped_u32 buffer_size_ptr, mapped_u32 handle_out) {
   assert_not_null(handle_out);
+  REXKRNL_INFO(
+      "XamContentCreateEnumerator(user={:08X}, device={:08X}, type={:08X}, flags={:08X}, "
+      "items={})",
+      uint32_t(user_index), uint32_t(device_id), uint32_t(content_type), uint32_t(content_flags),
+      uint32_t(items_per_enumerate));
 
   auto device_info = device_id == 0 ? nullptr : GetDummyDeviceInfo(device_id);
   if ((device_id && device_info == nullptr) || !handle_out) {
     if (buffer_size_ptr) {
       *buffer_size_ptr = 0;
     }
+    REXKRNL_WARN("XamContentCreateEnumerator: invalid args device={:08X}", uint32_t(device_id));
     return X_E_INVALIDARG;
   }
 
@@ -107,7 +113,7 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
     // TODO(gibbed): disc drive content
   }
 
-  REXKRNL_DEBUG("XamContentCreateEnumerator: added {} items to enumerator", e->item_count());
+  REXKRNL_INFO("XamContentCreateEnumerator: added {} items to enumerator", e->item_count());
 
   *handle_out = e->handle();
   return X_ERROR_SUCCESS;
@@ -120,6 +126,12 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
                        mapped_u32 license_mask_ptr, u32 cache_size, u64 content_size,
                        mapped_void overlapped_ptr) {
   uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
+  REXKRNL_INFO(
+      "XamContentCreate*(user={:08X}, root='{}', data_size={}, flags={:08X}, cache={}, "
+      "content_size={:016X}, overlapped={:08X}, xuid={:016X})",
+      uint32_t(user_index), root_name ? root_name.value() : std::string_view{},
+      uint32_t(content_data_size), uint32_t(flags), uint32_t(cache_size), uint64_t(content_size),
+      overlapped_ptr.guest_address(), xuid);
 
   XCONTENT_AGGREGATE_DATA content_data;
   if (content_data_size == sizeof(XCONTENT_DATA)) {
@@ -128,8 +140,13 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
     content_data = *content_data_ptr.as<XCONTENT_AGGREGATE_DATA*>();
   } else {
     assert_always();
+    REXKRNL_WARN("XamContentCreate*: invalid content_data_size={}", uint32_t(content_data_size));
     return X_ERROR_INVALID_PARAMETER;
   }
+  REXKRNL_INFO("XamContentCreate*: type={:08X} device={:08X} display='{}' file='{}'",
+               static_cast<uint32_t>(content_data.content_type.get()),
+               uint32_t(content_data.device_id), rex::string::to_utf8(content_data.display_name()),
+               content_data.file_name());
 
   if (content_data.content_type == XContentType::kMarketplaceContent) {
     xuid = 0;
@@ -215,6 +232,9 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
     } else if (disposition == kDispositionState::Open) {
       result = content_manager->OpenContent(root_name, xuid, content_data, content_license);
     }
+
+    REXKRNL_INFO("XamContentCreate*: disposition={} result={:#x}",
+                 static_cast<uint32_t>(disposition), uint32_t(result));
 
     if (license_mask_ptr && XSUCCEEDED(result)) {
       *license_mask_ptr = content_license;

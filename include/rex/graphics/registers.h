@@ -57,6 +57,12 @@ enum Register {
 #undef XE_GPU_REGISTER
 };
 
+// Pixel c0..c255 are in the second float-constant bank. Share this address
+// calculation between constant uploads and CPU-side shader-state inspection.
+constexpr uint32_t PixelFloatConstantRegister(uint32_t index, uint32_t component) {
+  return XE_GPU_REG_SHADER_CONSTANT_256_X + 4 * index + component;
+}
+
 namespace reg {
 
 /*******************************************************************************

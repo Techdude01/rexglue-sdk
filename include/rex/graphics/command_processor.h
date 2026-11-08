@@ -27,6 +27,7 @@
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
 #include <rex/memory/ring_buffer.h>
+#include <rex/system/interfaces/graphics.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
 #include <rex/ui/presenter.h>
@@ -90,6 +91,18 @@ class CommandProcessor {
 
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
+
+  // See system::IGraphicsSystem::SetDrawObserver.
+  void SetDrawObserver(system::GpuDrawObserver observer, void* user);
+
+  // See system::IGraphicsSystem::SetHostRendering.
+  void SetHostRendering(bool enabled) { host_rendering_.store(enabled, std::memory_order_relaxed); }
+  // See system::IGraphicsSystem::SetSignalGate.
+  void SetSignalGate(system::GpuSignalGate gate, void* user) {
+    signal_gate_user_ = user;
+    signal_gate_.store(gate, std::memory_order_release);
+  }
+  bool host_rendering() const { return host_rendering_.load(std::memory_order_relaxed); }
 
   virtual bool Initialize();
   virtual void Shutdown();
@@ -274,6 +287,24 @@ class CommandProcessor {
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
+
+  // Draw observer (SetDrawObserver), and the physical address of the type-3 packet being executed,
+  // kept only while an observer is set.
+  std::atomic<system::GpuDrawObserver> draw_observer_{nullptr};
+  void* draw_observer_user_ = nullptr;
+  uint32_t observed_packet_address_ = 0;
+
+  // Host rendering flag (SetHostRendering).
+  std::atomic<bool> host_rendering_{true};
+
+  // Passed before every signal to the guest (SetSignalGate).
+  void PassSignalGate() {
+    if (auto gate = signal_gate_.load(std::memory_order_acquire)) {
+      gate(signal_gate_user_);
+    }
+  }
+  std::atomic<system::GpuSignalGate> signal_gate_{nullptr};
+  void* signal_gate_user_ = nullptr;
 
   bool paused_ = false;
 

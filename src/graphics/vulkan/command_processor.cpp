@@ -58,6 +58,10 @@
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
+#ifndef REX_UNLIKELY
+#define REX_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#endif
+
 REXCVAR_DECLARE(bool, gpu_wait_correlation);
 
 // Record only candidate destinations covering the diagnostic address.
@@ -114,6 +118,80 @@ REXCVAR_DEFINE_BOOL(
     "transient attachments that are cleared before load and never resolved or sampled.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(
+    vulkan_elide_dead_edram_transfers, false, "GPU/Vulkan",
+    "Elide redundant EDRAM transfers whose destination attachment is overwritten or "
+    "cleared before being read.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    vulkan_elide_intertile_transfers, false, "GPU/Vulkan",
+    "Elide redundant intermediate EDRAM depth transfers between predicated scene tiles.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    vulkan_merge_matching_attachment_passes, false, "GPU/Vulkan",
+    "Coalesce consecutive draws with matching framebuffer and attachment configurations into "
+    "the same render pass, avoiding pass restart stalls on dynamic scissor changes.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    vulkan_prune_transfer_stencil, false, "GPU/Vulkan",
+    "Use DONT_CARE for stencil load/store in depth transfer passes to eliminate VRAM traffic.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    vulkan_alias_4x_depth_to_1x, false, "GPU/Vulkan",
+    "Alias depth-only 4x MSAA passes to 1x host render target to avoid EDRAM transfer thrashing.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    vulkan_elide_intermediate_depth_transfers, false, "GPU/Vulkan",
+    "Elide intermediate depth transfers on base-0 (shadow-cascade thrash). Default OFF: user visual "
+    "reject 2026-11-02 on catacomb — missing/dim lights and sticky Ben ground shadow/light vs real "
+    "game; Xenos A/B fixed with this false. Do not re-enable without a matched-level visual pass.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    vulkan_promote_viewport_resolve_clears, false, "GPU/Vulkan",
+    "Promote full-viewport resolve clears to attachment loadOp=CLEAR on subsequent guest passes.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    vulkan_coalesce_adjacent_clears, false, "GPU/Vulkan",
+    "Coalesce adjacent depth/color resolve clear passes with identical attachments and hoist shared upload.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    vulkan_early_z_opaque, false, "GPU/Vulkan",
+    "Restore hardware EarlyFragmentTests / TBDR HSR on eligible opaque and depth read-only draws.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_DOUBLE(
+    vulkan_ablate_viewport_scale, 1.0, "GPU/Vulkan",
+    "Diagnostic ablation: scale viewport dimensions to isolate fillrate from memory bandwidth.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    vulkan_ablate_skip_transfers, false, "GPU/Vulkan",
+    "Diagnostic ablation: completely skip all EDRAM transfers to establish upper bound of transfer tax.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    vulkan_ablate_skip_depth_transfers, false, "GPU/Vulkan",
+    "Diagnostic ablation: skip only depth EDRAM transfers.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(
+    vulkan_ablate_depth_transfer_mask, 0, "GPU/Vulkan",
+    "Diagnostic ablation: bitmask of depth transfer pass indices to elide (1 << pass_idx).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(
+    vulkan_ablate_skip_depth_transfer_width, 0, "GPU/Vulkan",
+    "Diagnostic ablation: host width of depth transfer surfaces to elide (e.g. 2080).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(
     gpu_provenance_frame, 0, "GPU/Vulkan",
     "Trace this guest frame through draws, resolve, slot-0 swap, and output capture; "
@@ -150,6 +228,10 @@ REXCVAR_DEFINE_BOOL(
     "Enable machine-readable frame-time audit logging and CSV export for matched A/B measurement")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(
+    gpu_raster_variant_audit, false, "GPU/Vulkan",
+    "Count two selected pixel shader variants and early-Z gates within a finite frame audit window");
+
 REXCVAR_DEFINE_UINT64(
     gpu_frame_audit_window_start, 0, "GPU/Vulkan",
     "First guest frame to include in detailed frame-time audit (0 = from start)")
@@ -170,12 +252,31 @@ REXCVAR_DEFINE_INT32(gpu_provenance_capture_interval, 0, "GPU/Vulkan",
     .range(0, 1000000);
 REXCVAR_DEFINE_BOOL(vulkan_reuse_transfer_scope_for_guest, false, "GPU/Vulkan",
                     "Continue compatible single-attachment transfers into guest rendering");
+REXCVAR_DEFINE_BOOL(vulkan_defer_non_conflicting_barriers, true, "GPU/Vulkan",
+                    "Do not break active dynamic rendering pass for non-conflicting buffer and texture barriers");
 REXCVAR_DEFINE_STRING(gpu_provenance_capture_directory, "", "GPU/Vulkan",
                      "Existing directory for diagnostic frame images; empty uses /tmp");
 
 namespace rex::graphics::vulkan {
 
 namespace {
+
+bool RasterVariantAuditActive(uint64_t frame) {
+  if (!REXCVAR_GET(gpu_raster_variant_audit)) return false;
+  const uint64_t start = REXCVAR_GET(gpu_frame_audit_window_start);
+  const uint64_t end = REXCVAR_GET(gpu_frame_audit_window_end);
+  const bool audit_enabled = REXCVAR_GET(gpu_frame_audit_enable);
+  if (!audit_enabled || start == 0 || end < start || end - start >= 1024) {
+    static bool warned = false;
+    if (!warned) {
+      REXGPU_ERROR("[RASTER_VARIANT_DISABLED] requires enabled frame audit, start>0, "
+                   "end>=start, and at most 1024 frames; start={} end={}", start, end);
+      warned = true;
+    }
+    return false;
+  }
+  return IsRasterVariantWindow(true, audit_enabled, frame, start, end);
+}
 
 bool IsGpuProvenanceTargetFrame(uint64_t frame) {
   int32_t selected_frame = REXCVAR_GET(gpu_provenance_frame);
@@ -2526,6 +2627,12 @@ bool VulkanCommandProcessor::SetupContext() {
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
 
+  // Always log once at GPU bring-up (NativeX may never hit depth-transfer audit).
+  REXGPU_INFO(
+      "[INTERMEDIATE_DEPTH_XFER] cvar vulkan_elide_intermediate_depth_transfers={} "
+      "(rejected default OFF — catacomb lighting)",
+      REXCVAR_GET(vulkan_elide_intermediate_depth_transfers) ? "true" : "false");
+
   return true;
 }
 
@@ -2965,6 +3072,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
 
   if (!graphics_system_)
     return;
+  if (!host_rendering()) {
+    if (submission_open_) {
+      EndSubmission(true);
+    }
+    return;
+  }
   ui::Presenter* presenter = graphics_system_->presenter();
   if (!presenter) {
     REXGPU_ERROR("XELOG_GPU PRESENT: NO PRESENTER");
@@ -3380,7 +3493,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
               VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
               VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
               "swap_gamma");
-          deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+          deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1, WorkPurpose::kSwap);
           EndScopeProfile(gamma_scope);
 
           if (use_fxaa) {
@@ -3457,7 +3570,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                 VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
                 VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
                 "swap_fxaa");
-            deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+            deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1, WorkPurpose::kFxaa);
             EndScopeProfile(fxaa_scope);
           }
 
@@ -3824,7 +3937,26 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
     }
     return false;
   }
-  if (in_render_pass_) {
+
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const bool use_dynamic_rendering =
+      REXCVAR_GET(vulkan_dynamic_rendering) && vulkan_device->properties().dynamicRendering;
+
+  bool must_end_render_pass = force_end_render_pass || !use_dynamic_rendering;
+  if (!must_end_render_pass && in_render_pass_) {
+    if (REXCVAR_GET(vulkan_defer_non_conflicting_barriers)) {
+      for (const auto& image_barrier : pending_barriers_image_memory_barriers_) {
+        if (render_target_cache_->IsImageActiveAttachment(image_barrier.image)) {
+          must_end_render_pass = true;
+          break;
+        }
+      }
+    } else {
+      must_end_render_pass = true;
+    }
+  }
+
+  if (in_render_pass_ && must_end_render_pass) {
     if (REXCVAR_GET(gpu_frame_audit_enable)) {
       ++frame_cpu_profiling_stats_.break_barrier;
       RecordBarrierBreakAttribution();
@@ -3862,6 +3994,11 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
 
 void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer) {
+  if (render_target_cache_->HasPendingDeferredClear()) {
+    if (!render_target_cache_->CanEmitDeferredClearInFramebuffer(framebuffer)) {
+      render_target_cache_->FlushPendingDeferredClear();
+    }
+  }
   SubmitBarriers(false);
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   bool use_dynamic_rendering =
@@ -3891,20 +4028,28 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
         current_render_pass_ == VK_NULL_HANDLE && !pending_clear &&
         RenderAreaContains(current_dynamic_rendering_area_, render_area) &&
         CanReuseTransferAttachment(
-            rpk.depth_and_color_used, current_dynamic_rendering_has_depth_,
+            rpk.depth_and_color_used, current_dynamic_rendering_transfer_dest_is_depth_,
             current_dynamic_rendering_transfer_dest_view_,
             render_target_cache_->GetLastUpdateDrawAttachmentView(
-                current_dynamic_rendering_has_depth_ ? 0 : 1),
-            current_framebuffer_->host_extent, framebuffer->host_extent)) {
+                current_dynamic_rendering_transfer_dest_is_depth_ ? 0 : 1),
+            current_framebuffer_->host_extent, framebuffer->host_extent,
+            current_dynamic_rendering_has_depth_,
+            current_dynamic_rendering_transfer_depth_view_,
+            render_target_cache_->GetLastUpdateDrawAttachmentView(0))) {
       // Same image view, aspects, extent and sample count as the active scope.
       // SubmitBarriers above has already ended it if an intervening dependency
       // required a break. Keep attachment load/store and all transfer commands.
       current_framebuffer_ = framebuffer;
       current_dynamic_rendering_is_transfer_ = false;
       current_dynamic_rendering_transfer_dest_view_ = VK_NULL_HANDLE;
+      current_dynamic_rendering_transfer_depth_view_ = VK_NULL_HANDLE;
+      current_dynamic_rendering_transfer_dest_is_depth_ = false;
       current_dynamic_rendering_render_pass_key_ = rpk;
       if (REXCVAR_GET(gpu_frame_audit_enable)) {
         ++frame_cpu_profiling_stats_.transfer_guest_scope_reuses;
+      }
+      if (REXCVAR_GET(vulkan_coalesce_adjacent_clears) && render_target_cache_->HasPendingDeferredClear()) {
+        render_target_cache_->TryEmitDeferredClearInDrawPass(framebuffer);
       }
       return;
     }
@@ -3914,8 +4059,16 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
         (!has_depth || current_dynamic_rendering_has_depth_) &&
         (!needs_stencil || current_dynamic_rendering_has_stencil_) &&
         (expected_color_count <= current_dynamic_rendering_color_count_) &&
-        !pending_clear && RenderAreaContains(current_dynamic_rendering_area_, render_area)) {
-      return;
+        !pending_clear) {
+      if (REXCVAR_GET(vulkan_coalesce_adjacent_clears) && render_target_cache_->HasPendingDeferredClear()) {
+        render_target_cache_->TryEmitDeferredClearInDrawPass(framebuffer);
+      }
+      if (REXCVAR_GET(vulkan_merge_matching_attachment_passes)) {
+        frame_pass_stats_.merged_guest_passes++;
+        return;
+      } else if (RenderAreaContains(current_dynamic_rendering_area_, render_area)) {
+        return;
+      }
     }
   } else {
     if (current_render_pass_ == render_pass && current_framebuffer_ == framebuffer) {
@@ -4000,14 +4153,21 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     current_dynamic_rendering_has_stencil_ = has_stencil;
     current_dynamic_rendering_color_count_ = color_attachment_count;
     current_dynamic_rendering_transfer_dest_view_ = VK_NULL_HANDLE;
+    current_dynamic_rendering_transfer_depth_view_ = VK_NULL_HANDLE;
+    current_dynamic_rendering_transfer_dest_is_depth_ = false;
     current_dynamic_rendering_render_pass_key_ = rpk;
-    current_dynamic_rendering_area_ = render_area;
+    VkRect2D pass_render_area = render_area;
+    if (REXCVAR_GET(vulkan_merge_matching_attachment_passes)) {
+      pass_render_area.offset = {0, 0};
+      pass_render_area.extent = framebuffer->host_extent;
+    }
+    current_dynamic_rendering_area_ = pass_render_area;
 
     VkRenderingInfo rendering_info = {};
     rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
     rendering_info.pNext = nullptr;
     rendering_info.flags = 0;
-    rendering_info.renderArea = render_area;
+    rendering_info.renderArea = pass_render_area;
     rendering_info.layerCount = 1;
     rendering_info.viewMask = 0;
     rendering_info.colorAttachmentCount = color_attachment_count;
@@ -4037,7 +4197,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     VkAttachmentLoadOp d_load = has_depth ? depth_attachment.loadOp : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     VkAttachmentStoreOp d_store = has_depth ? depth_attachment.storeOp : VK_ATTACHMENT_STORE_OP_DONT_CARE;
 
-    BeginScopeProfile(ScopeCategory::kMainPass, render_area.extent.width, render_area.extent.height,
+    BeginScopeProfile(ScopeCategory::kMainPass, pass_render_area.extent.width, pass_render_area.extent.height,
                       format_str, c_load, c_store, d_load, d_store, "main_pass");
     deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
   } else {
@@ -4060,6 +4220,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
                                                   VK_SUBPASS_CONTENTS_INLINE);
   }
   in_render_pass_ = true;
+  if (REXCVAR_GET(vulkan_coalesce_adjacent_clears) && render_target_cache_->HasPendingDeferredClear()) {
+    render_target_cache_->TryEmitDeferredClearInDrawPass(framebuffer);
+  }
   frame_pass_stats_.pass_count++;
   frame_pass_stats_.main_pass_count++;
   frame_pass_stats_.main_render_area_pixels +=
@@ -4075,7 +4238,11 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
 
 void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer,
-    VkImageView transfer_dest_view, bool transfer_dest_is_depth) {
+    VkImageView transfer_dest_view, bool transfer_dest_is_depth,
+    VkImageView transfer_depth_view) {
+  if (render_target_cache_->HasPendingDeferredClear()) {
+    render_target_cache_->FlushPendingDeferredClear();
+  }
   SubmitBarriers(false);
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   bool use_dynamic_rendering =
@@ -4086,7 +4253,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
         current_framebuffer_ == framebuffer &&
         current_render_pass_ == VK_NULL_HANDLE &&
         current_dynamic_rendering_transfer_dest_view_ == transfer_dest_view &&
-        current_dynamic_rendering_has_depth_ == transfer_dest_is_depth) {
+        current_dynamic_rendering_transfer_depth_view_ == transfer_depth_view &&
+        current_dynamic_rendering_transfer_dest_is_depth_ == transfer_dest_is_depth) {
       return;
     }
   } else {
@@ -4125,6 +4293,10 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
       depth_attachment.clearValue = {};
       stencil_attachment = depth_attachment;
+      if (REXCVAR_GET(vulkan_prune_transfer_stencil)) {
+        stencil_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        stencil_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+      }
     } else {
       color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
       color_attachment.pNext = nullptr;
@@ -4136,6 +4308,24 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
       color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
       color_attachment.clearValue = {};
+
+      if (transfer_depth_view != VK_NULL_HANDLE) {
+        depth_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        depth_attachment.pNext = nullptr;
+        depth_attachment.imageView = transfer_depth_view;
+        depth_attachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depth_attachment.resolveMode = VK_RESOLVE_MODE_NONE;
+        depth_attachment.resolveImageView = VK_NULL_HANDLE;
+        depth_attachment.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        depth_attachment.clearValue = {};
+        stencil_attachment = depth_attachment;
+        if (REXCVAR_GET(vulkan_prune_transfer_stencil)) {
+          stencil_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+          stencil_attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        }
+      }
     }
 
     VkRenderingInfo rendering_info = {};
@@ -4149,22 +4339,25 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     rendering_info.layerCount = 1;
     rendering_info.viewMask = 0;
     current_dynamic_rendering_is_transfer_ = true;
-    current_dynamic_rendering_has_depth_ = transfer_dest_is_depth;
-    current_dynamic_rendering_has_stencil_ = transfer_dest_is_depth;
+    current_dynamic_rendering_transfer_dest_is_depth_ = transfer_dest_is_depth;
+    const bool has_depth = transfer_dest_is_depth || (transfer_depth_view != VK_NULL_HANDLE);
+    current_dynamic_rendering_has_depth_ = has_depth;
+    current_dynamic_rendering_has_stencil_ = has_depth;
     current_dynamic_rendering_color_count_ = transfer_dest_is_depth ? 0 : 1;
     current_dynamic_rendering_transfer_dest_view_ = transfer_dest_view;
+    current_dynamic_rendering_transfer_depth_view_ = transfer_depth_view;
     current_dynamic_rendering_render_pass_key_ = {};
     rendering_info.colorAttachmentCount = transfer_dest_is_depth ? 0 : 1;
     rendering_info.pColorAttachments = transfer_dest_is_depth ? nullptr : &color_attachment;
-    rendering_info.pDepthAttachment = transfer_dest_is_depth ? &depth_attachment : nullptr;
-    rendering_info.pStencilAttachment = transfer_dest_is_depth ? &stencil_attachment : nullptr;
+    rendering_info.pDepthAttachment = has_depth ? &depth_attachment : nullptr;
+    rendering_info.pStencilAttachment = has_depth ? &stencil_attachment : nullptr;
     BeginScopeProfile(ScopeCategory::kTransferPass, framebuffer->host_extent.width, framebuffer->host_extent.height,
                       transfer_dest_is_depth ? "DEPTH_TRANSFER" : "COLOR_TRANSFER",
                       transfer_dest_is_depth ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD,
                       transfer_dest_is_depth ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE,
                       transfer_dest_is_depth ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
                       transfer_dest_is_depth ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-                      "transfer_pass");
+                      REXCVAR_GET(vulkan_prune_transfer_stencil) ? "transfer_pass_stencil_pruned" : "transfer_pass");
     deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
   } else {
     VkRenderPassBeginInfo render_pass_begin_info;
@@ -4184,6 +4377,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
                                                   VK_SUBPASS_CONTENTS_INLINE);
   }
   in_render_pass_ = true;
+  if (REXCVAR_GET(vulkan_coalesce_adjacent_clears) && render_target_cache_->HasPendingDeferredClear()) {
+    render_target_cache_->TryEmitDeferredClearInDrawPass(framebuffer);
+  }
   frame_pass_stats_.pass_count++;
   frame_pass_stats_.transfer_pass_count++;
 }
@@ -4488,30 +4684,42 @@ void VulkanCommandProcessor::BindExternalComputePipeline(VkPipeline pipeline) {
 }
 
 void VulkanCommandProcessor::SetViewport(const VkViewport& viewport) {
+  VkViewport effective_viewport = viewport;
+  double scale = REXCVAR_GET(vulkan_ablate_viewport_scale);
+  if (scale > 0.0 && scale < 1.0 && frame_current_ >= 3500) {
+    effective_viewport.width *= float(scale);
+    effective_viewport.height *= float(scale);
+  }
   if (!dynamic_viewport_update_needed_) {
-    dynamic_viewport_update_needed_ |= dynamic_viewport_.x != viewport.x;
-    dynamic_viewport_update_needed_ |= dynamic_viewport_.y != viewport.y;
-    dynamic_viewport_update_needed_ |= dynamic_viewport_.width != viewport.width;
-    dynamic_viewport_update_needed_ |= dynamic_viewport_.height != viewport.height;
-    dynamic_viewport_update_needed_ |= dynamic_viewport_.minDepth != viewport.minDepth;
-    dynamic_viewport_update_needed_ |= dynamic_viewport_.maxDepth != viewport.maxDepth;
+    dynamic_viewport_update_needed_ |= dynamic_viewport_.x != effective_viewport.x;
+    dynamic_viewport_update_needed_ |= dynamic_viewport_.y != effective_viewport.y;
+    dynamic_viewport_update_needed_ |= dynamic_viewport_.width != effective_viewport.width;
+    dynamic_viewport_update_needed_ |= dynamic_viewport_.height != effective_viewport.height;
+    dynamic_viewport_update_needed_ |= dynamic_viewport_.minDepth != effective_viewport.minDepth;
+    dynamic_viewport_update_needed_ |= dynamic_viewport_.maxDepth != effective_viewport.maxDepth;
   }
   if (dynamic_viewport_update_needed_) {
-    dynamic_viewport_ = viewport;
+    dynamic_viewport_ = effective_viewport;
     deferred_command_buffer_.CmdVkSetViewport(0, 1, &dynamic_viewport_);
     dynamic_viewport_update_needed_ = false;
   }
 }
 
 void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
+  VkRect2D effective_scissor = scissor;
+  double scale = REXCVAR_GET(vulkan_ablate_viewport_scale);
+  if (scale > 0.0 && scale < 1.0 && frame_current_ >= 3500) {
+    effective_scissor.extent.width = std::max(1u, uint32_t(float(effective_scissor.extent.width) * float(scale)));
+    effective_scissor.extent.height = std::max(1u, uint32_t(float(effective_scissor.extent.height) * float(scale)));
+  }
   if (!dynamic_scissor_update_needed_) {
-    dynamic_scissor_update_needed_ |= dynamic_scissor_.offset.x != scissor.offset.x;
-    dynamic_scissor_update_needed_ |= dynamic_scissor_.offset.y != scissor.offset.y;
-    dynamic_scissor_update_needed_ |= dynamic_scissor_.extent.width != scissor.extent.width;
-    dynamic_scissor_update_needed_ |= dynamic_scissor_.extent.height != scissor.extent.height;
+    dynamic_scissor_update_needed_ |= dynamic_scissor_.offset.x != effective_scissor.offset.x;
+    dynamic_scissor_update_needed_ |= dynamic_scissor_.offset.y != effective_scissor.offset.y;
+    dynamic_scissor_update_needed_ |= dynamic_scissor_.extent.width != effective_scissor.extent.width;
+    dynamic_scissor_update_needed_ |= dynamic_scissor_.extent.height != effective_scissor.extent.height;
   }
   if (dynamic_scissor_update_needed_) {
-    dynamic_scissor_ = scissor;
+    dynamic_scissor_ = effective_scissor;
     deferred_command_buffer_.CmdVkSetScissor(0, 1, &dynamic_scissor_);
     dynamic_scissor_update_needed_ = false;
   }
@@ -4767,14 +4975,35 @@ void VulkanCommandProcessor::EndScopeProfile(uint32_t scope_index) {
   }
 }
 
-void VulkanCommandProcessor::NoteScopeDraw() {
+void VulkanCommandProcessor::NoteScopeDraw(const VulkanShader* pixel_shader) {
   if (active_scope_index_ != UINT32_MAX) {
     uint32_t slot = frame_current_ % kMaxTimestampFramesInFlight;
     auto& scopes = frame_scopes_[slot];
     if (active_scope_index_ < scopes.size()) {
-      scopes[active_scope_index_].draw_count++;
+      auto& scope = scopes[active_scope_index_];
+      scope.draw_count++;
+      if (!pixel_shader) {
+        ++scope.pixel_shader_overflow_draw_count;
+        return;
+      }
+      uint64_t hash = pixel_shader->ucode_data_hash();
+      auto group = scope.pixel_shaders.find(hash);
+      if (group == scope.pixel_shaders.end()) {
+        if (scope.pixel_shaders.size() >= 64) {
+          ++scope.pixel_shader_overflow_draw_count;
+          return;
+        }
+        group = scope.pixel_shaders.emplace(hash, ScopeProfileRecord::PixelShaderGroup{
+            0, pixel_shader && pixel_shader->writes_depth(),
+            pixel_shader && pixel_shader->kills_pixels()}).first;
+      }
+      ++group->second.draw_count;
     }
   }
+}
+
+void VulkanCommandProcessor::RecordTransferElision() {
+  frame_pass_stats_.elided_dead_transfers++;
 }
 
 void VulkanCommandProcessor::ShutdownGpuTimingResources() {
@@ -5068,6 +5297,14 @@ void VulkanCommandProcessor::FlushCompletedAuditRows(bool force) {
         size_t category = size_t(scope.category);
         ++counts[category];
         times[category] += ms;
+        for (const auto& [shader_hash, group] : scope.pixel_shaders) {
+          REXGPU_INFO("[RASTER_SCOPE] frame={} scope={} category={} width={} height={} "
+                      "total_draws={} ps={:016X} writes_depth={} kills_pixels={} "
+                      "ps_draws={} overflow_or_unattributed_draws={}",
+                      row.frame, i, category, scope.width, scope.height, scope.draw_count,
+                      shader_hash, uint32_t(group.writes_depth), uint32_t(group.kills_pixels),
+                      group.draw_count, scope.pixel_shader_overflow_draw_count);
+        }
         std::string key = fmt::format("{}:{}x{}:{}:{}:{}:{}:{}:{}",
             category, scope.width, scope.height, scope.format,
             int(scope.color_load_op), int(scope.color_store_op),
@@ -5122,18 +5359,28 @@ void VulkanCommandProcessor::FlushCompletedAuditRows(bool force) {
                "break_barrier_shmem,break_barrier_texture,break_barrier_rt,break_barrier_prim,break_barrier_other,"
                "shmem_hoist_fallbacks,shmem_hoist_successes,"
                "break_growth_only,break_growth_framebuffer,break_framebuffer_only,"
-               "retained_depth_only_draws,transfer_guest_scope_reuses\n";
+               "retained_depth_only_draws,transfer_guest_scope_reuses,dyn_ms,shader_translate_ms,"
+               "sampler_prep_ms,texture_request_ms,sh_samp_ms\n";
       }
       double total_draw_ms = row.cpu_stats.time_draw_total.count() / 1e6;
       double prim_ms = row.cpu_stats.time_primitive_processing.count() / 1e6;
+      double shader_translate_ms = row.cpu_stats.time_shader_translation.count() / 1e6;
+      double sampler_prep_ms = row.cpu_stats.time_sampler_preparation.count() / 1e6;
+      double texture_request_ms = row.cpu_stats.time_texture_request.count() / 1e6;
       double rts_ms = row.cpu_stats.time_render_target_update.count() / 1e6;
       double pipe_ms = row.cpu_stats.time_pipeline_configuration.count() / 1e6;
+      double dyn_state_ms = row.cpu_stats.time_dynamic_state.count() / 1e6;
       double bind_ms = row.cpu_stats.time_binding_updates.count() / 1e6;
       double shmem_ms = row.cpu_stats.time_shared_memory_residency.count() / 1e6;
       double bar_rp_ms = row.cpu_stats.time_barriers_and_render_pass.count() / 1e6;
       double vk_draw_ms = row.cpu_stats.time_vk_draw.count() / 1e6;
       double fence_wait_ms = row.cpu_stats.time_fence_waits.count() / 1e6;
-      double other_ms = total_draw_ms - (prim_ms + rts_ms + pipe_ms + bind_ms + shmem_ms + bar_rp_ms + vk_draw_ms);
+      // Keep this residual aligned with the text audit's named draw phases.
+      // Opening-fence waits may be part of time_draw_total and therefore remain
+      // in other_ms; fence_wait_ms is an overlapping diagnostic counter.
+      double other_ms = total_draw_ms - (prim_ms + shader_translate_ms + sampler_prep_ms +
+                                         texture_request_ms + rts_ms + pipe_ms + dyn_state_ms +
+                                         bind_ms + shmem_ms + bar_rp_ms + vk_draw_ms);
 
       csv << row.frame << ',' << row.cpu_stats.draw_count << ','
           << fmt::format("{:.3f}", row.wall_ms) << ',' << fmt::format("{:.3f}", total_draw_ms) << ','
@@ -5204,7 +5451,13 @@ void VulkanCommandProcessor::FlushCompletedAuditRows(bool force) {
           << ',' << row.cpu_stats.break_growth_framebuffer
           << ',' << row.cpu_stats.break_framebuffer_only
           << ',' << row.cpu_stats.retained_depth_only_draws
-          << ',' << row.cpu_stats.transfer_guest_scope_reuses << '\n';
+          << ',' << row.cpu_stats.transfer_guest_scope_reuses
+          << ',' << fmt::format("{:.3f}", dyn_state_ms)
+          << ',' << fmt::format("{:.3f}", shader_translate_ms)
+          << ',' << fmt::format("{:.3f}", sampler_prep_ms)
+          << ',' << fmt::format("{:.3f}", texture_request_ms)
+          << ',' << fmt::format("{:.3f}", shader_translate_ms + sampler_prep_ms + texture_request_ms)
+          << '\n';
       csv.flush();
     }
 
@@ -5212,30 +5465,77 @@ void VulkanCommandProcessor::FlushCompletedAuditRows(bool force) {
   }
 }
 
+bool VulkanCommandProcessor::IsResolveChainAuditFrame() const {
+  const uint64_t end = REXCVAR_GET(gpu_frame_audit_window_end);
+  return REXCVAR_GET(gpu_resolve_chain_audit) && REXCVAR_GET(gpu_frame_audit_enable) &&
+      frame_open_ && frame_current_ >= REXCVAR_GET(gpu_frame_audit_window_start) &&
+      (!end || frame_current_ <= end);
+}
+
+bool VulkanCommandProcessor::IsGpuFrameAuditWindow() const {
+  const uint64_t end = REXCVAR_GET(gpu_frame_audit_window_end);
+  return REXCVAR_GET(gpu_frame_audit_enable) && frame_open_ &&
+         frame_current_ >= REXCVAR_GET(gpu_frame_audit_window_start) &&
+         (!end || frame_current_ <= end);
+}
+
 void VulkanCommandProcessor::RecordFrameAuditRow(uint64_t frame, double wall_ms) {
   double total_draw_ms = frame_cpu_profiling_stats_.time_draw_total.count() / 1e6;
   double prim_ms = frame_cpu_profiling_stats_.time_primitive_processing.count() / 1e6;
+  double shader_translate_ms = frame_cpu_profiling_stats_.time_shader_translation.count() / 1e6;
+  double sampler_prep_ms = frame_cpu_profiling_stats_.time_sampler_preparation.count() / 1e6;
+  double texture_request_ms = frame_cpu_profiling_stats_.time_texture_request.count() / 1e6;
   double rts_ms = frame_cpu_profiling_stats_.time_render_target_update.count() / 1e6;
   double pipe_ms = frame_cpu_profiling_stats_.time_pipeline_configuration.count() / 1e6;
+  double dyn_state_ms = frame_cpu_profiling_stats_.time_dynamic_state.count() / 1e6;
   double bind_ms = frame_cpu_profiling_stats_.time_binding_updates.count() / 1e6;
   double shmem_ms = frame_cpu_profiling_stats_.time_shared_memory_residency.count() / 1e6;
   double bar_rp_ms = frame_cpu_profiling_stats_.time_barriers_and_render_pass.count() / 1e6;
   double vk_draw_ms = frame_cpu_profiling_stats_.time_vk_draw.count() / 1e6;
   double fence_wait_ms = frame_cpu_profiling_stats_.time_fence_waits.count() / 1e6;
-  double other_ms = total_draw_ms - (prim_ms + rts_ms + pipe_ms + bind_ms + shmem_ms + bar_rp_ms + vk_draw_ms);
+  const double shader_samp_ms = shader_translate_ms + sampler_prep_ms + texture_request_ms;
+  // The named preparation and draw phases are disjoint. Opening-fence waits may
+  // occur inside the draw timer, so other_ms can contain that wait; the
+  // separate pre-wall counter and aggregate fence counter overlap this residual.
+  double other_ms = total_draw_ms - (prim_ms + shader_translate_ms + sampler_prep_ms +
+                                     texture_request_ms + rts_ms + pipe_ms + dyn_state_ms +
+                                     bind_ms + shmem_ms + bar_rp_ms + vk_draw_ms);
 
   REXGPU_INFO(
       "[FRAME_AUDIT] frame={} draws={} wall_ms={:.3f} total_draw_ms={:.3f} "
-      "prim_ms={:.3f} rts_ms={:.3f} pipe_ms={:.3f} bind_ms={:.3f} shmem_ms={:.3f} "
-      "bar_rp_ms={:.3f} vk_draw_ms={:.3f} fence_wait_ms={:.3f} fence_waits={} other_ms={:.3f} "
-      "resolves={}/{}/{} res_bytes={} color_clears={} depth_clears={} passes={}",
+      "prim_ms={:.3f} sh_samp_ms={:.3f} rts_ms={:.3f} pipe_ms={:.3f} dyn_ms={:.3f} "
+      "bind_ms={:.3f} shmem_ms={:.3f} "
+      "bar_rp_ms={:.3f} vk_draw_ms={:.3f} fence_wait_ms={:.3f} fence_waits={} "
+      "other_ms={:.3f} "
+      "resolves={}/{}/{} res_bytes={} color_clears={} depth_clears={} passes={} "
+      "merged_passes={} elided_transfers={} shader_translate_ms={:.3f} sampler_prep_ms={:.3f} "
+      "texture_request_ms={:.3f} pre_wall_fence_ms={:.3f} pre_wall_fence_count={}",
       frame, frame_cpu_profiling_stats_.draw_count, wall_ms, total_draw_ms,
-      prim_ms, rts_ms, pipe_ms, bind_ms, shmem_ms,
+      prim_ms, shader_samp_ms, rts_ms, pipe_ms, dyn_state_ms, bind_ms, shmem_ms,
       bar_rp_ms, vk_draw_ms, fence_wait_ms, frame_cpu_profiling_stats_.fence_wait_count, other_ms,
       frame_work_counters_.resolve_attempts, frame_work_counters_.resolve_successes,
       frame_work_counters_.resolve_empty_or_noop, frame_work_counters_.resolve_bytes,
       frame_work_counters_.color_clears, frame_work_counters_.depth_clears,
-      frame_pass_stats_.pass_count);
+      frame_pass_stats_.pass_count, frame_pass_stats_.merged_guest_passes,
+      frame_pass_stats_.elided_dead_transfers, shader_translate_ms, sampler_prep_ms,
+      texture_request_ms, frame_cpu_profiling_stats_.time_pre_wall_fence.count() / 1e6,
+      frame_cpu_profiling_stats_.pre_wall_fence_count);
+
+  REXGPU_INFO("[WORK_PLACEMENT] frame={} render_scopes={} interrupted_gaps={} "
+              "unattributed_gaps={} attribution=command_stream_not_metal",
+              frame, work_purpose_audit_.render_scopes, work_purpose_audit_.interrupted_gaps,
+              work_purpose_audit_.unattributed_gaps);
+  for (const auto& [key, row] : work_purpose_audit_.rows) {
+    REXGPU_INFO("[WORK_PURPOSE] frame={} purpose={} x={} y={} z={} bytes_each={} count={} "
+                "prologue={} before_render={} between={} tail={}",
+                frame, kWorkPurposeNames[size_t(key.purpose)], key.x, key.y, key.z, key.bytes,
+                row.count, row.prologue, row.before_render, row.between, row.tail);
+  }
+  for (size_t i = 0; i < work_purpose_audit_.gaps_by_cause.size(); ++i) {
+    if (work_purpose_audit_.gaps_by_cause[i])
+      REXGPU_INFO("[WORK_SPLIT_CAUSE] frame={} purpose={} gaps={} co_causes_nonadditive=true",
+                  frame, kWorkPurposeNames[i], work_purpose_audit_.gaps_by_cause[i]);
+  }
 
   PendingFrameAuditRow pending{};
   pending.frame = frame;
@@ -5281,6 +5581,45 @@ void VulkanCommandProcessor::RecordFrameAuditRow(uint64_t frame, double wall_ms)
   current_frame_shmem_hoist_successes_ = 0;
 }
 
+void VulkanCommandProcessor::FlushRasterVariantAudit() {
+  for (size_t i = 0; i < raster_variant_audit_.used; ++i) {
+    const auto& bucket = raster_variant_audit_.buckets[i];
+    const auto& d = bucket.decision;
+    // Tri-state gate fields: 0=not evaluated, 1=false, 2=true. Alpha func,
+    // guest MSAA and normalized depth fields use the guest register enums.
+    REXGPU_INFO("[RASTER_VARIANT] frame={} ps={:016X} mod={:016X} draws={} depth_mode={} "
+                "host_rt={} float24={} implicit_early={} writes_rt0={} coverage_initial={} "
+                "coverage_final={} alpha_to_mask={} alpha_func={} compare_pass={} "
+                "ref_le_128={} c102_ge_999={} tc_present={} fetch0_opaque={} "
+                "guest_msaa={} depth_test={} depth_write={} depth_compare={}",
+                frame_current_, d.shader_hash, d.modification, bucket.draws, d.depth_mode,
+                uint32_t(d.host_render_targets), uint32_t(d.float24_conversion),
+                uint32_t(d.implicit_early_z_write), uint32_t(d.writes_color_target0),
+                uint32_t(d.coverage_alpha_initial), uint32_t(d.coverage_alpha_final),
+                uint32_t(d.alpha_to_mask), d.alpha_func, uint32_t(d.alpha_compare_pass),
+                uint32_t(d.alpha_ref_le_128), uint32_t(d.c102_w_ge_999),
+                uint32_t(d.texture_cache_present), uint32_t(d.fetch0_opaque),
+                d.guest_msaa, d.depth_test, d.depth_write, d.depth_compare);
+  }
+  for (size_t i = 0; i < raster_variant_audit_.alpha_pairs_used; ++i) {
+    const auto& pair = raster_variant_audit_.alpha_pairs[i];
+    REXGPU_INFO("[RASTER_ALPHA] frame={} ps={:016X} mod={:016X} validity={} "
+                "alpha_ref_bits={:08X} c102_w_bits={:08X} draws={}",
+                frame_current_, pair.shader_hash, pair.modification, pair.validity,
+                pair.alpha_ref_bits, pair.c102_w_bits, pair.draws);
+  }
+  REXGPU_INFO("[RASTER_ALPHA_TOTAL] frame={} target_draws={} counted={} overflow={} invalid={}",
+              frame_current_, raster_variant_audit_.target_draws,
+              raster_variant_audit_.alpha_counted, raster_variant_audit_.alpha_overflow,
+              raster_variant_audit_.alpha_invalid);
+  REXGPU_INFO("[RASTER_VARIANT_TOTAL] frame={} target_draws={} counted={} overflow={} "
+              "invalid={} buckets={} all_guest_draws={}", frame_current_,
+              raster_variant_audit_.target_draws, raster_variant_audit_.counted,
+              raster_variant_audit_.overflow, raster_variant_audit_.invalid,
+              raster_variant_audit_.used, frame_cpu_profiling_stats_.draw_count);
+  raster_variant_audit_.Clear();
+}
+
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
                                        bool major_mode_explicit) {
@@ -5304,7 +5643,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     LogFragmentDiagnosticOutcome(frame_current_, diagnostic_vertex_hash, diagnostic_pixel_hash,
                                  diagnostic_draw_ordinal, status, count, overflow, error);
   };
-  auto finish_diagnostic_capture = [&](int*) {
+  auto finish_diagnostic_capture = [&]() {
     if (diagnostic_log_candidate) {
       LogFragmentDiagnostic(fmt::format(
           "Fragment diagnostic candidate: frame={} VS={:016X} PS={:016X} effective_PS={:016X} "
@@ -5561,10 +5900,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     diagnostic_capture_active = false;
     diagnostic_vertex_output_capture_active = false;
   };
-  // A non-null sentinel lets unique_ptr invoke this narrow, IssueDraw-local
-  // cleanup on every normal and early return without allocating memory.
-  std::unique_ptr<int, decltype(finish_diagnostic_capture)> diagnostic_cleanup(
-      reinterpret_cast<int*>(uintptr_t(1)), finish_diagnostic_capture);
+  struct DiagnosticScopeGuard {
+    decltype(finish_diagnostic_capture)& fn;
+    bool active;
+    ~DiagnosticScopeGuard() {
+      if (REX_UNLIKELY(active)) {
+        fn();
+      }
+    }
+  } diagnostic_cleanup{finish_diagnostic_capture,
+                        diagnostic_storage_enabled_ || diagnostic_snapshot_enabled_};
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -5666,6 +6011,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   bool profile_cpu = ShouldProfileFrameDraws(frame_current_);
   auto t_draw_start = profile_cpu ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
+  struct DrawProfileTimer {
+    FrameCpuProfilingStats* stats;
+    std::chrono::steady_clock::time_point start;
+    ~DrawProfileTimer() {
+      if (stats) {
+        stats->time_draw_total += std::chrono::steady_clock::now() - start;
+      }
+    }
+  } draw_profile_timer{profile_cpu ? &frame_cpu_profiling_stats_ : nullptr, t_draw_start};
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
@@ -5726,118 +6080,120 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   diagnostic_selection_stage = "predicate_evaluated";
   diagnostic_effective_pixel_hash = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
-  const uint64_t diagnostic_target_hash =
-      diagnostics::GetFragmentDiagnosticPixelHash(diagnostic_storage_shader_target_);
-  if (diagnostic_storage_enabled_ && !diagnostic_storage_first_pixel_hash_logged_ &&
-      diagnostic_effective_pixel_hash == diagnostic_target_hash) {
-    diagnostic_storage_first_pixel_hash_logged_ = true;
-    LogFragmentDiagnostic(
-        fmt::format("Fragment diagnostic first_target_PS: frame={} VS={:016X} PS={:016X} "
-                    "configured_frame={} recommended_frame={}",
-                    frame_current_, vertex_shader->ucode_data_hash(),
-                    diagnostic_effective_pixel_hash, diagnostic_storage_frame_, frame_current_));
-  }
-  if (diagnostic_storage_vertex_input_dump_mode_ &&
-      frame_current_ == diagnostics::kVertexInputDiagnosticFirstFrame && diagnostic_log_candidate) {
-    LogFragmentDiagnostic(fmt::format(
-        "Vertex input diagnostic draw: frame={} ordinal={} VS={:016X} PS={:016X} "
-        "prim={} indices={} indexed={} index_base=0x{:08X} index_bytes={} index_format={} "
-        "index_endian={}",
-        frame_current_, diagnostic_storage_draw_log_.ordinal(), vertex_shader->ucode_data_hash(),
-        diagnostic_effective_pixel_hash, uint32_t(prim_type), index_count,
-        index_buffer_info && index_buffer_info->length, index_buffer_info ? index_buffer_info->guest_base : 0,
-        index_buffer_info ? index_buffer_info->length : 0,
-        index_buffer_info ? uint32_t(index_buffer_info->format) : 0,
-        index_buffer_info ? uint32_t(index_buffer_info->endianness) : 0));
-    const auto& fetch_bitmap = vertex_shader->constant_register_map().vertex_fetch_bitmap;
-    for (uint32_t bitmap_index = 0; bitmap_index < rex::countof(fetch_bitmap); ++bitmap_index) {
-      uint32_t bits = fetch_bitmap[bitmap_index];
-      uint32_t bit_index;
-      while (rex::bit_scan_forward(bits, &bit_index)) {
-        bits &= ~(uint32_t(1) << bit_index);
-        const uint32_t fetch_index = bitmap_index * 32 + bit_index;
-        const auto fetch = regs.GetVertexFetch(fetch_index);
-        LogFragmentDiagnostic(fmt::format(
-            "Vertex input diagnostic fetch: frame={} draw_ordinal={} fetch={} type={} "
-            "address=0x{:08X} bytes={} endian={} dword0={:08X} dword1={:08X}",
-            frame_current_, diagnostic_storage_draw_log_.ordinal(), fetch_index,
-            uint32_t(fetch.type), fetch.address << 2, uint64_t(fetch.size) << 2,
-            uint32_t(fetch.endian), fetch.dword_0, fetch.dword_1));
+  if (REX_UNLIKELY(diagnostic_storage_enabled_)) {
+    const uint64_t diagnostic_target_hash =
+        diagnostics::GetFragmentDiagnosticPixelHash(diagnostic_storage_shader_target_);
+    if (!diagnostic_storage_first_pixel_hash_logged_ &&
+        diagnostic_effective_pixel_hash == diagnostic_target_hash) {
+      diagnostic_storage_first_pixel_hash_logged_ = true;
+      LogFragmentDiagnostic(
+          fmt::format("Fragment diagnostic first_target_PS: frame={} VS={:016X} PS={:016X} "
+                      "configured_frame={} recommended_frame={}",
+                      frame_current_, vertex_shader->ucode_data_hash(),
+                      diagnostic_effective_pixel_hash, diagnostic_storage_frame_, frame_current_));
+    }
+    if (diagnostic_storage_vertex_input_dump_mode_ &&
+        frame_current_ == diagnostics::kVertexInputDiagnosticFirstFrame && diagnostic_log_candidate) {
+      LogFragmentDiagnostic(fmt::format(
+          "Vertex input diagnostic draw: frame={} ordinal={} VS={:016X} PS={:016X} "
+          "prim={} indices={} indexed={} index_base=0x{:08X} index_bytes={} index_format={} "
+          "index_endian={}",
+          frame_current_, diagnostic_storage_draw_log_.ordinal(), vertex_shader->ucode_data_hash(),
+          diagnostic_effective_pixel_hash, uint32_t(prim_type), index_count,
+          index_buffer_info && index_buffer_info->length, index_buffer_info ? index_buffer_info->guest_base : 0,
+          index_buffer_info ? index_buffer_info->length : 0,
+          index_buffer_info ? uint32_t(index_buffer_info->format) : 0,
+          index_buffer_info ? uint32_t(index_buffer_info->endianness) : 0));
+      const auto& fetch_bitmap = vertex_shader->constant_register_map().vertex_fetch_bitmap;
+      for (uint32_t bitmap_index = 0; bitmap_index < rex::countof(fetch_bitmap); ++bitmap_index) {
+        uint32_t bits = fetch_bitmap[bitmap_index];
+        uint32_t bit_index;
+        while (rex::bit_scan_forward(bits, &bit_index)) {
+          bits &= ~(uint32_t(1) << bit_index);
+          const uint32_t fetch_index = bitmap_index * 32 + bit_index;
+          const auto fetch = regs.GetVertexFetch(fetch_index);
+          LogFragmentDiagnostic(fmt::format(
+              "Vertex input diagnostic fetch: frame={} draw_ordinal={} fetch={} type={} "
+              "address=0x{:08X} bytes={} endian={} dword0={:08X} dword1={:08X}",
+              frame_current_, diagnostic_storage_draw_log_.ordinal(), fetch_index,
+              uint32_t(fetch.type), fetch.address << 2, uint64_t(fetch.size) << 2,
+              uint32_t(fetch.endian), fetch.dword_0, fetch.dword_1));
+        }
       }
     }
-  }
-  const bool candidate_shader_match =
-      (diagnostic_storage_local_candidate_output_mode_ ||
-       diagnostic_storage_local_candidate_triples_mode_)
-          ? (diagnostic_storage_shader_target_ == diagnostics::FragmentDiagnosticShaderTarget::kHead
-                 ? ((diagnostic_effective_pixel_hash == UINT64_C(0x79A3448304FA0D22) &&
-                     vertex_shader &&
-                     vertex_shader->ucode_data_hash() == UINT64_C(0x4197798218650D43) &&
-                     index_count == 22914 && index_buffer_info &&
-                     index_buffer_info->guest_base == UINT32_C(0x1B237EC0)) ||
-                    diagnostic_effective_pixel_hash == UINT64_C(0x2D4C010D3D75DEA5) ||
-                    diagnostic_effective_pixel_hash == UINT64_C(0x3EB44C3A6D2D267B))
-                 : diagnostic_storage_shader_target_ ==
-                           diagnostics::FragmentDiagnosticShaderTarget::kProducerConsumer
-                       ? (diagnostic_effective_pixel_hash ==
-                              diagnostics::kFragmentDiagnosticGBufferPixelHash ||
-                          diagnostic_effective_pixel_hash ==
-                              diagnostics::kFragmentDiagnosticDeferredPixelHash)
-                 : diagnostic_effective_pixel_hash == diagnostic_target_hash)
-          : diagnostics::IsFragmentDiagnosticTarget(frame_current_, diagnostic_effective_pixel_hash,
-                                                    diagnostic_storage_frame_,
-                                                    diagnostic_storage_shader_target_);
-  const bool expected_shader_capture =
-      frame_current_ == diagnostic_storage_frame_ && candidate_shader_match;
-  const bool later_local_overwrite_capture =
-      diagnostic_storage_local_overwrite_census_mode_ &&
-      frame_current_ == diagnostic_storage_frame_ &&
-      diagnostic_storage_local_overwrite_tracking_started_;
-  if ((!diagnostic_storage_vertex_input_dump_mode_ ||
-       diagnostic_storage_combined_vertex_output_mode_) && diagnostic_storage_enabled_ &&
-      diagnostic_storage_buffer_ && pixel_shader &&
-      (expected_shader_capture || later_local_overwrite_capture)) {
-    const bool local_candidate_mode = diagnostic_storage_local_candidate_triples_mode_ ||
-                                     diagnostic_storage_local_candidate_output_mode_;
-    const bool local_roi_mode = local_candidate_mode || diagnostic_storage_local_overwrite_census_mode_;
-    const bool multi_draw_diagnostic_mode = diagnostic_storage_census_mode_ || local_candidate_mode;
-    const bool census_limit_reached =
-        multi_draw_diagnostic_mode && diagnostic_storage_census_draw_count_ >=
-                                          diagnostics::kFragmentDiagnosticMaxCensusDraws;
-    if (census_limit_reached) {
-      diagnostic_selection_stage = "census_draw_limit";
-      if (!diagnostic_storage_census_limit_logged_) {
-        diagnostic_storage_census_limit_logged_ = true;
-        LogFragmentDiagnostic(
-            fmt::format("Fragment diagnostic multi-draw capture stopped at limit: frame={} max_draws={}",
-                        frame_current_, diagnostics::kFragmentDiagnosticMaxCensusDraws));
-      }
-    } else if (!diagnostic_storage_attempt_consumed_ || multi_draw_diagnostic_mode) {
-      diagnostic_storage_attempt_consumed_ = true;
-      if (multi_draw_diagnostic_mode)
-        ++diagnostic_storage_census_draw_count_;
-      diagnostic_vertex_hash = vertex_shader->ucode_data_hash();
-      diagnostic_pixel_hash = pixel_shader->ucode_data_hash();
-      diagnostic_selection_stage = "selected";
-      const uint64_t prior_submission =
-          submission_open_ ? GetCurrentSubmission() : GetCurrentSubmission() - 1;
-      bool previous_work_completed = !submission_open_ || EndSubmission(false);
-      if (previous_work_completed && prior_submission > submission_completed_) {
-        CheckSubmissionFenceAndDeviceLoss(prior_submission);
-        previous_work_completed = !device_lost_ && submission_completed_ >= prior_submission;
-      }
-      if (!previous_work_completed || device_lost_) {
-        report_diagnostic_outcome("failed", 0, false, "prior_submission_failed");
-      } else if (!diagnostic_storage_buffer_->Clear() ||
-                 !diagnostic_storage_buffer_->SetRecordingEnabled(
-                     true, !diagnostic_storage_census_mode_ || local_candidate_mode,
-                     local_roi_mode, diagnostic_storage_local_candidate_output_mode_)) {
-        report_diagnostic_outcome("failed", 0, false, "reset_or_enable_failed");
-      } else {
-        diagnostic_capture_active = true;
-        if (!BeginSubmission(true)) {
-          diagnostic_capture_error = "begin_submission_failed";
-          return draw_fail("diagnostic_begin_submission");
+    const bool candidate_shader_match =
+        (diagnostic_storage_local_candidate_output_mode_ ||
+         diagnostic_storage_local_candidate_triples_mode_)
+            ? (diagnostic_storage_shader_target_ == diagnostics::FragmentDiagnosticShaderTarget::kHead
+                   ? ((diagnostic_effective_pixel_hash == UINT64_C(0x79A3448304FA0D22) &&
+                       vertex_shader &&
+                       vertex_shader->ucode_data_hash() == UINT64_C(0x4197798218650D43) &&
+                       index_count == 22914 && index_buffer_info &&
+                       index_buffer_info->guest_base == UINT32_C(0x1B237EC0)) ||
+                      diagnostic_effective_pixel_hash == UINT64_C(0x2D4C010D3D75DEA5) ||
+                      diagnostic_effective_pixel_hash == UINT64_C(0x3EB44C3A6D2D267B))
+                   : diagnostic_storage_shader_target_ ==
+                             diagnostics::FragmentDiagnosticShaderTarget::kProducerConsumer
+                         ? (diagnostic_effective_pixel_hash ==
+                                diagnostics::kFragmentDiagnosticGBufferPixelHash ||
+                            diagnostic_effective_pixel_hash ==
+                                diagnostics::kFragmentDiagnosticDeferredPixelHash)
+                   : diagnostic_effective_pixel_hash == diagnostic_target_hash)
+            : diagnostics::IsFragmentDiagnosticTarget(frame_current_, diagnostic_effective_pixel_hash,
+                                                      diagnostic_storage_frame_,
+                                                      diagnostic_storage_shader_target_);
+    const bool expected_shader_capture =
+        frame_current_ == diagnostic_storage_frame_ && candidate_shader_match;
+    const bool later_local_overwrite_capture =
+        diagnostic_storage_local_overwrite_census_mode_ &&
+        frame_current_ == diagnostic_storage_frame_ &&
+        diagnostic_storage_local_overwrite_tracking_started_;
+    if ((!diagnostic_storage_vertex_input_dump_mode_ ||
+         diagnostic_storage_combined_vertex_output_mode_) &&
+        diagnostic_storage_buffer_ && pixel_shader &&
+        (expected_shader_capture || later_local_overwrite_capture)) {
+      const bool local_candidate_mode = diagnostic_storage_local_candidate_triples_mode_ ||
+                                       diagnostic_storage_local_candidate_output_mode_;
+      const bool local_roi_mode = local_candidate_mode || diagnostic_storage_local_overwrite_census_mode_;
+      const bool multi_draw_diagnostic_mode = diagnostic_storage_census_mode_ || local_candidate_mode;
+      const bool census_limit_reached =
+          multi_draw_diagnostic_mode && diagnostic_storage_census_draw_count_ >=
+                                            diagnostics::kFragmentDiagnosticMaxCensusDraws;
+      if (census_limit_reached) {
+        diagnostic_selection_stage = "census_draw_limit";
+        if (!diagnostic_storage_census_limit_logged_) {
+          diagnostic_storage_census_limit_logged_ = true;
+          LogFragmentDiagnostic(
+              fmt::format("Fragment diagnostic multi-draw capture stopped at limit: frame={} max_draws={}",
+                          frame_current_, diagnostics::kFragmentDiagnosticMaxCensusDraws));
+        }
+      } else if (!diagnostic_storage_attempt_consumed_ || multi_draw_diagnostic_mode) {
+        diagnostic_storage_attempt_consumed_ = true;
+        if (multi_draw_diagnostic_mode)
+          ++diagnostic_storage_census_draw_count_;
+        diagnostic_vertex_hash = vertex_shader->ucode_data_hash();
+        diagnostic_pixel_hash = pixel_shader->ucode_data_hash();
+        diagnostic_selection_stage = "selected";
+        const uint64_t prior_submission =
+            submission_open_ ? GetCurrentSubmission() : GetCurrentSubmission() - 1;
+        bool previous_work_completed = !submission_open_ || EndSubmission(false);
+        if (previous_work_completed && prior_submission > submission_completed_) {
+          CheckSubmissionFenceAndDeviceLoss(prior_submission);
+          previous_work_completed = !device_lost_ && submission_completed_ >= prior_submission;
+        }
+        if (!previous_work_completed || device_lost_) {
+          report_diagnostic_outcome("failed", 0, false, "prior_submission_failed");
+        } else if (!diagnostic_storage_buffer_->Clear() ||
+                   !diagnostic_storage_buffer_->SetRecordingEnabled(
+                       true, !diagnostic_storage_census_mode_ || local_candidate_mode,
+                       local_roi_mode, diagnostic_storage_local_candidate_output_mode_)) {
+          report_diagnostic_outcome("failed", 0, false, "reset_or_enable_failed");
+        } else {
+          diagnostic_capture_active = true;
+          if (!BeginSubmission(true)) {
+            diagnostic_capture_error = "begin_submission_failed";
+            return draw_fail("diagnostic_begin_submission");
+          }
         }
       }
     }
@@ -5857,21 +6213,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
   }
   draw_util::Scissor vertex_diagnostic_scissor{};
-  draw_util::GetScissor(regs, vertex_diagnostic_scissor);
-  const uint32_t ben_vertex_output_target =
-      diagnostics::GetBenOcclusionVertexOutputDiagnosticTarget(
-          frame_current_, vertex_diagnostic_scissor.extent[1], diagnostic_raw_vertex_hash,
-          diagnostic_effective_pixel_hash, index_count,
-          regs.Get<reg::RB_DEPTHCONTROL>().value);
-  const bool legacy_vertex_input_target =
-      !diagnostic_storage_ben_occlusion_mode_ &&
-      diagnostics::IsVertexInputDiagnosticHeadDraw(
-          frame_current_, diagnostic_storage_draw_log_.ordinal(),
-          vertex_diagnostic_scissor.extent[1], diagnostic_raw_vertex_hash,
-          diagnostic_effective_pixel_hash);
-  if (diagnostic_storage_vertex_input_dump_mode_ && diagnostic_storage_buffer_ && pixel_shader &&
-      (diagnostic_storage_ben_occlusion_mode_ ? ben_vertex_output_target != 0
-                                               : legacy_vertex_input_target)) {
+  if (REX_UNLIKELY(diagnostic_storage_vertex_input_dump_mode_)) {
+    draw_util::GetScissor(regs, vertex_diagnostic_scissor);
+    const uint32_t ben_vertex_output_target =
+        diagnostics::GetBenOcclusionVertexOutputDiagnosticTarget(
+            frame_current_, vertex_diagnostic_scissor.extent[1], diagnostic_raw_vertex_hash,
+            diagnostic_effective_pixel_hash, index_count,
+            regs.Get<reg::RB_DEPTHCONTROL>().value);
+    const bool legacy_vertex_input_target =
+        !diagnostic_storage_ben_occlusion_mode_ &&
+        diagnostics::IsVertexInputDiagnosticHeadDraw(
+            frame_current_, diagnostic_storage_draw_log_.ordinal(),
+            vertex_diagnostic_scissor.extent[1], diagnostic_raw_vertex_hash,
+            diagnostic_effective_pixel_hash);
+    if (diagnostic_storage_buffer_ && pixel_shader &&
+        (diagnostic_storage_ben_occlusion_mode_ ? ben_vertex_output_target != 0
+                                                 : legacy_vertex_input_target)) {
     if (diagnostic_storage_ben_occlusion_mode_ && ben_vertex_output_target && index_buffer_info &&
         index_buffer_info->length && index_buffer_info->length <= 16 * 1024 * 1024 && memory_) {
       const uint8_t* index_bytes =
@@ -6038,6 +6395,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       }
       }
     }
+    }
   }
 
   const uint64_t draw_vs_hash = vertex_shader ? vertex_shader->ucode_data_hash() : 0;
@@ -6064,6 +6422,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   SpirvShaderTranslator::Modification vertex_shader_modification;
   SpirvShaderTranslator::Modification pixel_shader_modification;
+  RasterVariantDecision raster_variant_decision;
+  const bool raster_variant_active = RasterVariantAuditActive(frame_current_) && pixel_shader &&
+                                    IsRasterVariantTarget(pixel_shader->ucode_data_hash());
   VulkanShader::VulkanTranslation* vertex_shader_translation;
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
@@ -6119,7 +6480,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       return false;
     }
 
-    // Shader modifications.
+    // Shader modifications and translations form one measured phase. This
+    // phase starts after primitive processing and ends before sampler work, so
+    // it does not overlap the other draw-accounting buckets.
+    auto t_shader_translation_start = profile_cpu ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
     vertex_shader_modification = pipeline_cache_->GetCurrentVertexShaderModification(
         *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
         ps_param_gen_pos != UINT32_MAX);
@@ -6128,7 +6493,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
     pixel_shader_modification = pixel_shader ? pipeline_cache_->GetCurrentPixelShaderModification(
                                                    *pixel_shader, interpolator_mask,
-                                                   ps_param_gen_pos, normalized_depth_control)
+                                                   ps_param_gen_pos, normalized_depth_control,
+                                                   raster_variant_active ? &raster_variant_decision : nullptr)
                                              : SpirvShaderTranslator::Modification(0);
     if (diagnostic_capture_active && pixel_shader && i == 0) {
       const auto& target_texture_bindings = pixel_shader->texture_bindings();
@@ -6156,6 +6522,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                                   pixel_shader_translation)) {
       return draw_fail("shader_translation");
     }
+    if (profile_cpu) {
+      frame_cpu_profiling_stats_.time_shader_translation +=
+          std::chrono::steady_clock::now() - t_shader_translation_start;
+    }
 
     // Obtain the samplers. Note that the bindings don't depend on the shader
     // modification, so if on the second iteration of this loop it becomes
@@ -6165,6 +6535,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // TODO(Triang3l): Sampler caching and reuse for adjacent draws within one
     // submission.
     uint32_t samplers_overflowed_count = 0;
+    auto t_sampler_prep_start = profile_cpu ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
     for (uint32_t j = 0; j < 2; ++j) {
       std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>& shader_samplers =
           j ? current_samplers_pixel_ : current_samplers_vertex_;
@@ -6305,6 +6677,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         }
       }
     }
+    if (profile_cpu) {
+      frame_cpu_profiling_stats_.time_sampler_preparation +=
+          std::chrono::steady_clock::now() - t_sampler_prep_start;
+    }
     if (!samplers_overflowed_count) {
       break;
     }
@@ -6331,7 +6707,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+  auto t_texture_request_start = profile_cpu ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
   texture_cache_->RequestTextures(used_texture_mask);
+  if (profile_cpu) {
+    frame_cpu_profiling_stats_.time_texture_request +=
+        std::chrono::steady_clock::now() - t_texture_request_start;
+  }
 
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
@@ -6440,6 +6822,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
     return draw_fail("pipeline_lookup");
   }
+  auto t_dyn_start = profile_cpu ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
   if (current_guest_graphics_pipeline_ != pipeline) {
     deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     current_guest_graphics_pipeline_ = pipeline;
@@ -6521,7 +6905,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
       host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
 
-  if (frame_current_ == 6000) {
+  if (REX_UNLIKELY(frame_current_ == 6000)) {
     const auto rpk = render_target_cache_->last_update_render_pass_key();
     const bool depth_attachment_bound = (rpk.depth_and_color_used & 1) != 0;
     const reg::RB_DEPTHCONTROL raw_dc = regs.Get<reg::RB_DEPTHCONTROL>();
@@ -6568,7 +6952,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         get_tf_str(0), get_tf_str(1), get_tf_str(2), get_tf_str(3)));
   }
 
-  if (frame_current_ == 6000 && (is_ultimatrix_draw || is_torso_draw || is_glow_draw)) {
+  if (REX_UNLIKELY(frame_current_ == 6000 && (is_ultimatrix_draw || is_torso_draw || is_glow_draw))) {
     const auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
     const float po_scale = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE);
     const float po_offset = regs.Get<float>(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET);
@@ -6738,36 +7122,38 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
 
-  const bool is_ben_mesh =
-      (draw_ps_hash == UINT64_C(0x79A3448304FA0D22) ||
-       draw_ps_hash == UINT64_C(0x6E6F06115807B602) ||
-       draw_ps_hash == UINT64_C(0x2D4C010D3D75DEA5) ||
-       draw_ps_hash == UINT64_C(0x3EB44C3A6D2D267B));
-  if (is_ben_mesh) {
-    s_current_ben_delta.char_draw_count++;
-    const auto tf0_fetch = regs.GetTextureFetch(0);
-    const auto tf2_fetch = regs.GetTextureFetch(2);
-    s_current_ben_delta.texture_hash ^= (uint64_t(tf0_fetch.base_address) << 32) ^ uint64_t(tf2_fetch.base_address);
-    s_current_ben_delta.blend_hash ^= regs[XE_GPU_REG_RB_BLENDCONTROL0];
-    const auto c102_val = regs[XE_GPU_REG_SHADER_CONSTANT_256_X + 102 * 4];
-    const auto c41_val = regs[XE_GPU_REG_SHADER_CONSTANT_256_X + 41 * 4];
-    s_current_ben_delta.constant_hash ^= (uint64_t(c102_val) << 32) ^ uint64_t(c41_val);
+  if (REX_UNLIKELY(diagnostic_storage_enabled_)) {
+    const bool is_ben_mesh =
+        (draw_ps_hash == UINT64_C(0x79A3448304FA0D22) ||
+         draw_ps_hash == UINT64_C(0x6E6F06115807B602) ||
+         draw_ps_hash == UINT64_C(0x2D4C010D3D75DEA5) ||
+         draw_ps_hash == UINT64_C(0x3EB44C3A6D2D267B));
+    if (is_ben_mesh) {
+      s_current_ben_delta.char_draw_count++;
+      const auto tf0_fetch = regs.GetTextureFetch(0);
+      const auto tf2_fetch = regs.GetTextureFetch(2);
+      s_current_ben_delta.texture_hash ^= (uint64_t(tf0_fetch.base_address) << 32) ^ uint64_t(tf2_fetch.base_address);
+      s_current_ben_delta.blend_hash ^= regs[XE_GPU_REG_RB_BLENDCONTROL0];
+      const auto c102_val = regs[XE_GPU_REG_SHADER_CONSTANT_256_X + 102 * 4];
+      const auto c41_val = regs[XE_GPU_REG_SHADER_CONSTANT_256_X + 41 * 4];
+      s_current_ben_delta.constant_hash ^= (uint64_t(c102_val) << 32) ^ uint64_t(c41_val);
 
-    if (draw_ps_hash == UINT64_C(0x6E6F06115807B602)) {
-      if (index_count == 24) s_current_ben_delta.submesh_counts[0]++;
-      else if (index_count == 48) s_current_ben_delta.submesh_counts[1]++;
-      else if (index_count == 108) s_current_ben_delta.submesh_counts[2]++;
-      else if (index_count == 183) s_current_ben_delta.submesh_counts[3]++;
-    } else if (draw_ps_hash == UINT64_C(0x2D4C010D3D75DEA5)) {
-      if (index_count == 432) s_current_ben_delta.submesh_counts[4]++;
-      else if (index_count == 576) s_current_ben_delta.submesh_counts[5]++;
-      else if (index_count == 1344) s_current_ben_delta.submesh_counts[6]++;
-    } else if (draw_ps_hash == UINT64_C(0x79A3448304FA0D22)) {
-      s_current_ben_delta.submesh_counts[7]++;
+      if (draw_ps_hash == UINT64_C(0x6E6F06115807B602)) {
+        if (index_count == 24) s_current_ben_delta.submesh_counts[0]++;
+        else if (index_count == 48) s_current_ben_delta.submesh_counts[1]++;
+        else if (index_count == 108) s_current_ben_delta.submesh_counts[2]++;
+        else if (index_count == 183) s_current_ben_delta.submesh_counts[3]++;
+      } else if (draw_ps_hash == UINT64_C(0x2D4C010D3D75DEA5)) {
+        if (index_count == 432) s_current_ben_delta.submesh_counts[4]++;
+        else if (index_count == 576) s_current_ben_delta.submesh_counts[5]++;
+        else if (index_count == 1344) s_current_ben_delta.submesh_counts[6]++;
+      } else if (draw_ps_hash == UINT64_C(0x79A3448304FA0D22)) {
+        s_current_ben_delta.submesh_counts[7]++;
+      }
     }
   }
 
-  if (frame_current_ >= 5312 && frame_current_ <= 5322 && pixel_shader && index_count > 10) {
+  if (REX_UNLIKELY(frame_current_ >= 5312 && frame_current_ <= 5322 && pixel_shader && index_count > 10)) {
     const auto tf0_dbg = regs.GetTextureFetch(0);
     LogFragmentDiagnostic(fmt::format(
         "BEN_FLICKER_TRACE: frame={} draw={} VS={:016X} PS={:016X} idx={} raw_dc=0x{:08X} tf0=[0x{:08X} fmt={}]",
@@ -6781,11 +7167,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
        diagnostic_storage_local_candidate_output_mode_ ||
        diagnostic_storage_vertex_input_dump_mode_) &&
       diagnostic_log_candidate && frame_current_ == diagnostic_storage_frame_;
-  if ((diagnostic_capture_active &&
+  if (REX_UNLIKELY((diagnostic_capture_active &&
        (diagnostic_storage_census_mode_ || diagnostic_storage_local_candidate_triples_mode_ ||
         diagnostic_storage_local_candidate_output_mode_ ||
         diagnostic_storage_vertex_input_dump_mode_)) ||
-      comprehensive_candidate_state) {
+      comprehensive_candidate_state)) {
     draw_util::Scissor scissor_info{};
     draw_util::GetScissor(regs, scissor_info);
     const auto* framebuffer =
@@ -6884,7 +7270,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
        draw_ps_hash == UINT64_C(0x18156850FF8D8BB1)) ||
       (draw_vs_hash == UINT64_C(0x7FF3708774FB5864) &&
        draw_ps_hash == UINT64_C(0xAC8BA94BD9146611));
-  if (diagnostic_snapshot_enabled_ && frame_current_ == 10000 && ben_watch_shader_pair) {
+  if (REX_UNLIKELY(diagnostic_snapshot_enabled_ && frame_current_ == 10000 && ben_watch_shader_pair)) {
     float native_bias_constant, native_bias_slope;
     draw_util::GetPreferredFacePolygonOffset(regs, primitive_polygonal, native_bias_slope,
                                              native_bias_constant);
@@ -6950,6 +7336,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   UpdateSystemConstantValues(primitive_polygonal, primitive_processing_result,
                              shader_32bit_index_dma, 0, viewport_info, used_texture_mask,
                              normalized_depth_control, normalized_color_mask);
+  if (profile_cpu) {
+    frame_cpu_profiling_stats_.time_dynamic_state +=
+        std::chrono::steady_clock::now() - t_dyn_start;
+  }
 
   // Update uniform buffers and descriptor sets after binding the pipeline with
   // the new layout.
@@ -7003,7 +7393,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
 
-  if (diagnostic_storage_vertex_input_dump_mode_ && !diagnostic_storage_ben_occlusion_mode_ &&
+  if (REX_UNLIKELY(diagnostic_storage_vertex_input_dump_mode_) && !diagnostic_storage_ben_occlusion_mode_ &&
       pixel_shader &&
       diagnostics::IsVertexInputDiagnosticHeadDraw(
           frame_current_, diagnostic_storage_draw_log_.ordinal(),
@@ -7240,106 +7630,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         std::chrono::steady_clock::now() - t_bar_start;
   }
 
-  bool diagnostic_snapshot_shader_match = false;
+  bool diagnostic_snapshot_target_draw = false;
   uint32_t diagnostic_ben_candidate_kind = 0;
-  switch (diagnostic_snapshot_request_.target) {
-    case diagnostics::RenderTargetSnapshotTarget::kQuadPartner:
-      diagnostic_snapshot_shader_match =
-          diagnostics::IsQuadPartnerMarkerShader(diagnostic_raw_pixel_hash);
-      break;
-    case diagnostics::RenderTargetSnapshotTarget::kHeadShader:
-      diagnostic_snapshot_shader_match =
-          diagnostic_raw_vertex_hash == diagnostics::kRenderTargetSnapshotHeadVertexHash &&
-          diagnostic_raw_pixel_hash == diagnostics::kRenderTargetSnapshotHeadPixelHash;
-      break;
-    case diagnostics::RenderTargetSnapshotTarget::kGBufferHeadShader:
-      diagnostic_snapshot_shader_match =
-          diagnostic_raw_vertex_hash == diagnostics::kRenderTargetSnapshotGBufferVertexHash &&
-          diagnostic_raw_pixel_hash == diagnostics::kRenderTargetSnapshotGBufferPixelHash;
-      break;
-    case diagnostics::RenderTargetSnapshotTarget::kDeferredLighting:
-      diagnostic_snapshot_shader_match =
-          diagnostic_raw_vertex_hash == diagnostics::kRenderTargetSnapshotDeferredVertexHash &&
-          diagnostic_raw_pixel_hash == diagnostics::kRenderTargetSnapshotDeferredPixelHash;
-      break;
-    case diagnostics::RenderTargetSnapshotTarget::kBenCuff: {
-      if (diagnostic_snapshot_request_.compact_ben) {
-        if (diagnostic_snapshot_request_.ben_pixel_history) {
-          diagnostic_ben_candidate_kind = diagnostics::kBenOcclusionCandidateAllDraw;
-          diagnostic_snapshot_shader_match = true;
-        } else {
-          bool is_hud_glow = false;
-          if (diagnostic_raw_vertex_hash == UINT64_C(0x7A0841365E75A823) &&
-              diagnostic_raw_pixel_hash == UINT64_C(0x7ABDFEFBCADB4BF9)) {
-            float c11_z = 0.0f;
-            float c11_w = 0.0f;
-            std::memcpy(&c11_z,
-                        &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 11 * 4 + 2],
-                        sizeof(c11_z));
-            std::memcpy(&c11_w,
-                        &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 11 * 4 + 3],
-                        sizeof(c11_w));
-            is_hud_glow = c11_z == 0.0f && c11_w == 1.0f;
-          }
-          diagnostic_ben_candidate_kind = diagnostics::GetBenOcclusionCandidateKind(
-              diagnostic_raw_vertex_hash, diagnostic_raw_pixel_hash, is_hud_glow);
-          diagnostic_snapshot_shader_match = diagnostic_ben_candidate_kind != 0;
-        }
-      } else {
-        diagnostic_snapshot_shader_match =
-            diagnostic_raw_vertex_hash == UINT64_C(0x046523BA1EB2717E) &&
-            diagnostic_raw_pixel_hash == UINT64_C(0x2D4C010D3D75DEA5) && index_count == 1836 &&
-            viewport_info.xy_extent[1] == 336;
-      }
-    } break;
-  }
-  const bool diagnostic_snapshot_requested_draw =
-      diagnostic_snapshot_request_.draw_ordinal
-          ? diagnostic_snapshot_request_.matches(frame_current_,
-                                                 diagnostic_snapshot_draw_ordinal_)
-          : diagnostic_snapshot_shader_match;
-  bool diagnostic_ben_roi_intersects_scissor = true;
   uint32_t diagnostic_ben_capture_origin_y = 0;
   uint32_t diagnostic_ben_output_y_offset = 0;
-  if (diagnostic_snapshot_request_.compact_ben && diagnostic_snapshot_shader_match) {
-    draw_util::Scissor ben_scissor{};
-    draw_util::GetScissor(regs, ben_scissor);
-    const int64_t scissor_left = ben_scissor.offset[0];
-    const int64_t scissor_top = ben_scissor.offset[1];
-    const int64_t scissor_right = scissor_left + ben_scissor.extent[0];
-    const int64_t scissor_bottom = scissor_top + ben_scissor.extent[1];
-    if (diagnostic_snapshot_request_.ben_pixel_history) {
-      if (ben_scissor.extent[1] == 336) {
-        diagnostic_ben_capture_origin_y = 64;
-        diagnostic_ben_output_y_offset = 384;
-      } else if (ben_scissor.extent[1] == 720) {
-        diagnostic_ben_capture_origin_y = 448;
-        diagnostic_ben_output_y_offset = 0;
-      } else {
-        diagnostic_ben_roi_intersects_scissor = false;
-      }
-    }
-    const int64_t roi_left = diagnostic_snapshot_request_.x;
-    const int64_t roi_top = diagnostic_snapshot_request_.ben_pixel_history
-                                ? diagnostic_ben_capture_origin_y
-                                : diagnostic_snapshot_request_.y;
-    const int64_t roi_right = roi_left + diagnostic_snapshot_request_.width;
-    const int64_t roi_bottom = roi_top + diagnostic_snapshot_request_.height;
-    const bool expected_ben_scissor_height = diagnostic_snapshot_request_.ben_pixel_history ||
-        (diagnostic_ben_candidate_kind == diagnostics::kBenOcclusionCandidateGlow
-             ? (ben_scissor.extent[1] == 336 || ben_scissor.extent[1] == 720)
-             : ben_scissor.extent[1] == 336);
-    diagnostic_ben_roi_intersects_scissor = diagnostic_ben_roi_intersects_scissor &&
-        expected_ben_scissor_height && scissor_left < roi_right && roi_left < scissor_right &&
-        scissor_top < roi_bottom && roi_top < scissor_bottom;
-  }
-  const bool diagnostic_snapshot_target_draw =
-      diagnostic_snapshot_enabled_ &&
-      (diagnostic_snapshot_request_.compact_ben || !diagnostic_snapshot_head_draw_seen_ ||
-       diagnostic_snapshot_request_.target == diagnostics::RenderTargetSnapshotTarget::kQuadPartner) &&
-      diagnostic_snapshot_requested_draw &&
-      diagnostic_ben_roi_intersects_scissor &&
-      frame_current_ == diagnostic_snapshot_request_.frame;
   auto record_diagnostic_snapshot_boundary = [&](diagnostics::RenderTargetSnapshotPoint point) {
     diagnostics::RenderTargetSnapshotBoundary boundary{};
     boundary.frame = frame_current_;
@@ -7385,8 +7679,106 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
     return captured;
   };
-  if (diagnostic_snapshot_target_draw) {
-    record_diagnostic_snapshot_boundary(diagnostics::RenderTargetSnapshotPoint::kBeforeHeadDraw);
+  if (REX_UNLIKELY(diagnostic_snapshot_enabled_)) {
+    bool diagnostic_snapshot_shader_match = false;
+    switch (diagnostic_snapshot_request_.target) {
+      case diagnostics::RenderTargetSnapshotTarget::kQuadPartner:
+        diagnostic_snapshot_shader_match =
+            diagnostics::IsQuadPartnerMarkerShader(diagnostic_raw_pixel_hash);
+        break;
+      case diagnostics::RenderTargetSnapshotTarget::kHeadShader:
+        diagnostic_snapshot_shader_match =
+            diagnostic_raw_vertex_hash == diagnostics::kRenderTargetSnapshotHeadVertexHash &&
+            diagnostic_raw_pixel_hash == diagnostics::kRenderTargetSnapshotHeadPixelHash;
+        break;
+      case diagnostics::RenderTargetSnapshotTarget::kGBufferHeadShader:
+        diagnostic_snapshot_shader_match =
+            diagnostic_raw_vertex_hash == diagnostics::kRenderTargetSnapshotGBufferVertexHash &&
+            diagnostic_raw_pixel_hash == diagnostics::kRenderTargetSnapshotGBufferPixelHash;
+        break;
+      case diagnostics::RenderTargetSnapshotTarget::kDeferredLighting:
+        diagnostic_snapshot_shader_match =
+            diagnostic_raw_vertex_hash == diagnostics::kRenderTargetSnapshotDeferredVertexHash &&
+            diagnostic_raw_pixel_hash == diagnostics::kRenderTargetSnapshotDeferredPixelHash;
+        break;
+      case diagnostics::RenderTargetSnapshotTarget::kBenCuff: {
+        if (diagnostic_snapshot_request_.compact_ben) {
+          if (diagnostic_snapshot_request_.ben_pixel_history) {
+            diagnostic_ben_candidate_kind = diagnostics::kBenOcclusionCandidateAllDraw;
+            diagnostic_snapshot_shader_match = true;
+          } else {
+            bool is_hud_glow = false;
+            if (diagnostic_raw_vertex_hash == UINT64_C(0x7A0841365E75A823) &&
+                diagnostic_raw_pixel_hash == UINT64_C(0x7ABDFEFBCADB4BF9)) {
+              float c11_z = 0.0f;
+              float c11_w = 0.0f;
+              std::memcpy(&c11_z,
+                          &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 11 * 4 + 2],
+                          sizeof(c11_z));
+              std::memcpy(&c11_w,
+                          &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 11 * 4 + 3],
+                          sizeof(c11_w));
+              is_hud_glow = c11_z == 0.0f && c11_w == 1.0f;
+            }
+            diagnostic_ben_candidate_kind = diagnostics::GetBenOcclusionCandidateKind(
+                diagnostic_raw_vertex_hash, diagnostic_raw_pixel_hash, is_hud_glow);
+            diagnostic_snapshot_shader_match = diagnostic_ben_candidate_kind != 0;
+          }
+        } else {
+          diagnostic_snapshot_shader_match =
+              diagnostic_raw_vertex_hash == UINT64_C(0x046523BA1EB2717E) &&
+              diagnostic_raw_pixel_hash == UINT64_C(0x2D4C010D3D75DEA5) && index_count == 1836 &&
+              viewport_info.xy_extent[1] == 336;
+        }
+      } break;
+    }
+    const bool diagnostic_snapshot_requested_draw =
+        diagnostic_snapshot_request_.draw_ordinal
+            ? diagnostic_snapshot_request_.matches(frame_current_,
+                                                   diagnostic_snapshot_draw_ordinal_)
+            : diagnostic_snapshot_shader_match;
+    bool diagnostic_ben_roi_intersects_scissor = true;
+    if (diagnostic_snapshot_request_.compact_ben && diagnostic_snapshot_shader_match) {
+      draw_util::Scissor ben_scissor{};
+      draw_util::GetScissor(regs, ben_scissor);
+      const int64_t scissor_left = ben_scissor.offset[0];
+      const int64_t scissor_top = ben_scissor.offset[1];
+      const int64_t scissor_right = scissor_left + ben_scissor.extent[0];
+      const int64_t scissor_bottom = scissor_top + ben_scissor.extent[1];
+      if (diagnostic_snapshot_request_.ben_pixel_history) {
+        if (ben_scissor.extent[1] == 336) {
+          diagnostic_ben_capture_origin_y = 64;
+          diagnostic_ben_output_y_offset = 384;
+        } else if (ben_scissor.extent[1] == 720) {
+          diagnostic_ben_capture_origin_y = 448;
+          diagnostic_ben_output_y_offset = 0;
+        } else {
+          diagnostic_ben_roi_intersects_scissor = false;
+        }
+      }
+      const int64_t roi_left = diagnostic_snapshot_request_.x;
+      const int64_t roi_top = diagnostic_snapshot_request_.ben_pixel_history
+                                  ? diagnostic_ben_capture_origin_y
+                                  : diagnostic_snapshot_request_.y;
+      const int64_t roi_right = roi_left + diagnostic_snapshot_request_.width;
+      const int64_t roi_bottom = roi_top + diagnostic_snapshot_request_.height;
+      const bool expected_ben_scissor_height = diagnostic_snapshot_request_.ben_pixel_history ||
+          (diagnostic_ben_candidate_kind == diagnostics::kBenOcclusionCandidateGlow
+               ? (ben_scissor.extent[1] == 336 || ben_scissor.extent[1] == 720)
+               : ben_scissor.extent[1] == 336);
+      diagnostic_ben_roi_intersects_scissor = diagnostic_ben_roi_intersects_scissor &&
+          expected_ben_scissor_height && scissor_left < roi_right && roi_left < scissor_right &&
+          scissor_top < roi_bottom && roi_top < scissor_bottom;
+    }
+    diagnostic_snapshot_target_draw =
+        (diagnostic_snapshot_request_.compact_ben || !diagnostic_snapshot_head_draw_seen_ ||
+         diagnostic_snapshot_request_.target == diagnostics::RenderTargetSnapshotTarget::kQuadPartner) &&
+        diagnostic_snapshot_requested_draw &&
+        diagnostic_ben_roi_intersects_scissor &&
+        frame_current_ == diagnostic_snapshot_request_.frame;
+    if (diagnostic_snapshot_target_draw) {
+      record_diagnostic_snapshot_boundary(diagnostics::RenderTargetSnapshotPoint::kBeforeHeadDraw);
+    }
   }
 
   // Draw.
@@ -7395,7 +7787,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
       shader_32bit_index_dma) {
-    NoteScopeDraw();
+    NoteScopeDraw(pixel_shader);
     deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
   } else {
     std::pair<VkBuffer, VkDeviceSize> index_buffer;
@@ -7435,9 +7827,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       bound_index_buffer_offset_ = index_buffer.second;
       bound_index_type_ = index_type;
     }
-    NoteScopeDraw();
+    NoteScopeDraw(pixel_shader);
     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
                                               0, 0, 0);
+  }
+  if (raster_variant_active) {
+    // Both indexed and non-indexed guest draw commands have been recorded.
+    // Failed/skipped/retried attempts never reach this consumer seam.
+    raster_variant_audit_.Record(pixel_shader->ucode_data_hash(),
+                                  pixel_shader_modification.value, raster_variant_decision);
+  }
+  if (pixel_shader_modification.pixel.depth_stencil_mode ==
+      SpirvShaderTranslator::Modification::DepthStencilMode::kEarlyHint) {
+    ++current_frame_early_z_draws_;
   }
   if (diagnostic_capture_active) {
     diagnostic_draw_recorded = true;
@@ -7501,11 +7903,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   if (memexport_used_vertex) {
     frame_pass_stats_.draws_memexport++;
   }
-  if (profile_cpu) {
-    frame_cpu_profiling_stats_.draw_count++;
-    frame_cpu_profiling_stats_.time_draw_total +=
-        std::chrono::steady_clock::now() - t_draw_start;
-  }
+  if (profile_cpu) frame_cpu_profiling_stats_.draw_count++;
   return true;
 }
 
@@ -8015,7 +8413,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
         VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
         VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE,
         "resolve_downscale");
-    deferred_command_buffer_.CmdVkDispatch(tile_count, 1, 1);
+    deferred_command_buffer_.CmdVkDispatch(tile_count, 1, 1, WorkPurpose::kDownscale);
     EndScopeProfile(downscale_scope);
 
     VkBufferMemoryBarrier downscale_barrier = {};
@@ -8611,6 +9009,8 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     current_dynamic_rendering_has_stencil_ = false;
     current_dynamic_rendering_color_count_ = 0;
     current_dynamic_rendering_transfer_dest_view_ = VK_NULL_HANDLE;
+    current_dynamic_rendering_transfer_depth_view_ = VK_NULL_HANDLE;
+    current_dynamic_rendering_transfer_dest_is_depth_ = false;
     current_dynamic_rendering_render_pass_key_ = {};
     current_dynamic_rendering_area_ = {};
     current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
@@ -8637,6 +9037,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     scope_profile_reset_count_ = 0;
     frame_scopes_[scope_slot].clear();
     active_scope_index_ = UINT32_MAX;
+    work_purpose_audit_.Reset();
     frame_start_time_ = std::chrono::steady_clock::now();
     if (REXCVAR_GET(gpu_frame_audit_enable) && REXCVAR_GET(gpu_frame_timeline_enable))
       GetFrameCpuTimeline().Start(frame_start_time_);
@@ -8826,6 +9227,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       active_occlusion_query_ = {};
     }
 
+    if (render_target_cache_->HasPendingDeferredClear()) {
+      render_target_cache_->FlushPendingDeferredClear();
+    }
     if (in_render_pass_ && REXCVAR_GET(gpu_frame_audit_enable)) ++frame_cpu_profiling_stats_.break_submission;
     EndRenderPass();
 
@@ -8943,6 +9347,12 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       scope_profile_reset_count_ = scope_count;
     }
     const bool audit_submission = REXCVAR_GET(gpu_frame_audit_enable) && frame_open_;
+    const uint64_t purpose_end = REXCVAR_GET(gpu_frame_audit_window_end);
+    WorkPurposeAudit* purpose_audit =
+        audit_submission && frame_current_ >= REXCVAR_GET(gpu_frame_audit_window_start) &&
+                (!purpose_end || frame_current_ <= purpose_end)
+            ? &work_purpose_audit_ : nullptr;
+    if (purpose_audit) purpose_audit->BeginSubmission();
     auto audit_submit_start = audit_submission ? std::chrono::steady_clock::now()
                                                 : std::chrono::steady_clock::time_point{};
     {
@@ -8966,7 +9376,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
                 VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &pre_barrier, 0, nullptr);
 
-        prologue_deferred_command_buffer_.Execute(command_buffer.buffer);
+        prologue_deferred_command_buffer_.Execute(command_buffer.buffer, purpose_audit, true);
 
         VkBufferMemoryBarrier post_barrier;
         post_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -8987,7 +9397,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
                 VK_PIPELINE_STAGE_TRANSFER_BIT,
             0, 0, nullptr, 1, &post_barrier, 0, nullptr);
       }
-      deferred_command_buffer_.Execute(command_buffer.buffer);
+      deferred_command_buffer_.Execute(command_buffer.buffer, purpose_audit);
+      if (purpose_audit) purpose_audit->EndSubmission();
     }
     if (record_timestamps) {
       uint32_t end_q = timestamp_slot * kMaxQueriesPerFrameSlot + sub_idx * 2 + 1;
@@ -9120,6 +9531,11 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
                            (audit_start == 0 || frame_current_ >= audit_start) &&
                            (audit_end == 0 || frame_current_ <= audit_end);
 
+    if (RasterVariantAuditActive(frame_current_)) {
+      FlushRasterVariantAudit();
+    } else {
+      raster_variant_audit_.Clear();
+    }
     if (in_audit_window) {
       RecordFrameAuditRow(frame_current_, frame_wall_ms);
     }
@@ -9207,6 +9623,13 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
     }
+    if (REXCVAR_GET(vulkan_early_z_opaque) &&
+        (IsGpuProvenanceFrame(frame_current_) || in_audit_window)) {
+      REXGPU_INFO("[EARLY_Z_FRAME] frame={} early_z_draws={}/{}", frame_current_,
+                  current_frame_early_z_draws_, frame_cpu_profiling_stats_.draw_count);
+    }
+    current_frame_early_z_draws_ = 0;
+
     frame_open_ = false;
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kMaxFramesInFlight] = GetCurrentSubmission() - 1;
@@ -9945,7 +10368,12 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     flags |= SpirvShaderTranslator::kSysFlag_PrimitiveLine;
   }
   // MSAA sample count.
-  flags |= uint32_t(rb_surface_info.msaa_samples)
+  xenos::MsaaSamples effective_msaa_samples = rb_surface_info.msaa_samples;
+  if (REXCVAR_GET(vulkan_alias_4x_depth_to_1x) && !normalized_color_mask &&
+      effective_msaa_samples == xenos::MsaaSamples::k4X) {
+    effective_msaa_samples = xenos::MsaaSamples::k1X;
+  }
+  flags |= uint32_t(effective_msaa_samples)
            << SpirvShaderTranslator::kSysFlag_MsaaSamples_Shift;
   // Depth format.
   if (rb_depth_info.depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
@@ -10439,7 +10867,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           float_constant_map_entry &= ~(1ull << float_constant_index);
           std::memcpy(
               mapping,
-              &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) + (float_constant_index << 2)],
+              &regs[PixelFloatConstantRegister((i << 6) + float_constant_index, 0)],
               sizeof(float) * 4);
           mapping += sizeof(float) * 4;
         }

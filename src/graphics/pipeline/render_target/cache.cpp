@@ -41,6 +41,19 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
                     "Resolve from host render targets directly to shared memory when possible")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(gpu_direct_host_resolve_fused, true, "GPU",
+                    "Fuse eligible scaled host-render-target resolves directly into guest memory; false uses the legacy path")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(gpu_direct_host_resolve_parity_resolves, 0, "GPU",
+                     "Debug only: compare N fused host resolves against the legacy resolve path")
+    .range(0, 8)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(gpu_direct_host_resolve_audit, false, "GPU",
+                    "Log per-attempt direct host resolve eligibility and byte-range metadata")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(render_target_retain_color_on_depth_only, false, "GPU",
                     "Keep compatible accumulated color attachments across depth-only draws");
 
@@ -408,6 +421,10 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
 
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
+  if (REXCVAR_GET(vulkan_alias_4x_depth_to_1x) && !normalized_color_mask &&
+      msaa_samples == xenos::MsaaSamples::k4X) {
+    msaa_samples = xenos::MsaaSamples::k1X;
+  }
   assert_true(msaa_samples <= xenos::MsaaSamples::k4X);
   if (msaa_samples > xenos::MsaaSamples::k4X) {
     // Safety check because a lot of code assumes up to 4x.

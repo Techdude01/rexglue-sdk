@@ -78,6 +78,8 @@ u32 XamContentGetDeviceName_entry(u32 device_id, mapped_wstring name_buffer, u32
 
 u32 XamContentGetDeviceState_entry(u32 device_id, mapped_void overlapped_ptr) {
   auto device_info = GetDummyDeviceInfo(device_id);
+  REXKRNL_INFO("XamContentGetDeviceState(device={:08X}) -> {}", uint32_t(device_id),
+               device_info ? "ok" : "not connected");
   if (device_info == nullptr) {
     if (overlapped_ptr) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(
@@ -110,6 +112,8 @@ static_assert_size(X_CONTENT_DEVICE_DATA, 0x50);
 
 u32 XamContentGetDeviceData_entry(u32 device_id, ppc_ptr_t<X_CONTENT_DEVICE_DATA> device_data) {
   auto device_info = GetDummyDeviceInfo(device_id);
+  REXKRNL_INFO("XamContentGetDeviceData(device={:08X}) -> {}", uint32_t(device_id),
+               device_info ? "ok" : "not connected");
   if (device_info == nullptr) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }

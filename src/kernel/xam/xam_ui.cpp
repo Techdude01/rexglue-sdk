@@ -503,14 +503,16 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
 u32 XamShowDeviceSelectorUI_entry(u32 user_index, u32 content_type, u32 content_flags,
                                   u64 total_requested, mapped_u32 device_id_ptr,
                                   mapped_void overlapped) {
-  REXKRNL_DEBUG("XamShowDeviceSelectorUI({:08X}, {:08X}, {:08X}, {:016X}, {:08X}, {:08X})",
-                uint32_t(user_index), uint32_t(content_type), uint32_t(content_flags),
-                uint64_t(total_requested), device_id_ptr.guest_address(),
-                overlapped.guest_address());
+  REXKRNL_INFO(
+      "XamShowDeviceSelectorUI(user={:08X}, type={:08X}, flags={:08X}, req={:016X}, "
+      "device_ptr={:08X}, overlapped={:08X})",
+      uint32_t(user_index), uint32_t(content_type), uint32_t(content_flags),
+      uint64_t(total_requested), device_id_ptr.guest_address(), overlapped.guest_address());
   return xeXamDispatchHeadless(
       [device_id_ptr]() -> X_RESULT {
         // NOTE: 0x00000001 is our dummy device ID from xam_content.cc
         *device_id_ptr = 0x00000001;
+        REXKRNL_INFO("XamShowDeviceSelectorUI: selected dummy HDD device_id=1");
         return X_ERROR_SUCCESS;
       },
       overlapped.guest_address());
@@ -550,14 +552,21 @@ u32 XamShowCommunitySessionsUI_entry(u32 r3, u32 r4) {
   return X_ERROR_FUNCTION_FAILED;
 }
 
-uint32_t XamShowMessageBoxUIEx_entry() {
-  // TODO(tomc): implement properly
-  static bool warned = false;
-  if (!warned) {
-    REXKRNL_WARN("[STUB] XamShowMessageBoxUIEx - not implemented");
-    warned = true;
-  }
-  return 0;
+// Same as XamShowMessageBoxUI with one unused dword before the result pointer.
+// Canary: xenia-canary xam_ui.cc XamShowMessageBoxUIEx_entry.
+// Ben10 Cosmic Destruction imports only the Ex variant (not XamShowMessageBoxUI).
+u32 XamShowMessageBoxUIEx_entry(u32 user_index, mapped_wstring title_ptr, mapped_wstring text_ptr,
+                                u32 button_count, mapped_u32 button_ptrs, u32 active_button,
+                                u32 flags, u32 unknown_unused, mapped_u32 result_ptr,
+                                mapped_void overlapped) {
+  (void)unknown_unused;
+  REXKRNL_INFO(
+      "XamShowMessageBoxUIEx(user={:08X}, buttons={}, active={}, flags={:08X}, "
+      "result_ptr={:08X}, overlapped={:08X})",
+      uint32_t(user_index), uint32_t(button_count), uint32_t(active_button), uint32_t(flags),
+      result_ptr.guest_address(), overlapped.guest_address());
+  return XamShowMessageBoxUI_entry(user_index, title_ptr, text_ptr, button_count, button_ptrs,
+                                   active_button, flags, result_ptr, overlapped);
 }
 
 }  // namespace xam

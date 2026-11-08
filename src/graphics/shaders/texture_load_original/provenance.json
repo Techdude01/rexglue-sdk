@@ -1,0 +1,39 @@
+{
+  "repository": "https://github.com/xenia-project/xenia",
+  "revision": "0b2ffa31485318f18838afa142cdb51cf1b35213",
+  "files": [
+    {
+      "path": "gpu/shaders/texture_load_32bpb_scaled.cs.xesl",
+      "sha256": "2714b95c9b10600bf98ac4b7b132d42e2fbf8b356b8952316149fc980e89db30"
+    },
+    {
+      "path": "gpu/shaders/texture_load_depth_unorm_scaled.cs.xesl",
+      "sha256": "e1223b5b3e3629a4ddc27570735f12798f1ea07989ffbd47e62dc54be97d0d2b"
+    },
+    {
+      "path": "gpu/shaders/texture_load_32bpb.xesli",
+      "sha256": "ba6e03e099e93dc964b7b8907a55f2e2625dfe0d19e02e0ddd18365ecbeb4848"
+    },
+    {
+      "path": "gpu/shaders/texture_load.xesli",
+      "sha256": "12707a362580283f6bbee86fe009f18003f7a16dbeb26e648ada1a9cbc808122"
+    },
+    {
+      "path": "gpu/shaders/texture_address.xesli",
+      "sha256": "366e5de562f5b6dd9a0eaf450a57189e081a06787e37cee9b718f0a5fbcae6ca"
+    },
+    {
+      "path": "gpu/shaders/endian.xesli",
+      "sha256": "a2bae617ba27371d6b881808ab1fc29621ef043c83bde0ded8b70e2642743108"
+    },
+    {
+      "path": "gpu/shaders/pixel_formats.xesli",
+      "sha256": "3543d3d7137aa8f111e9f0558f094027a3385073f2225c9702378202de11331a"
+    },
+    {
+      "path": "ui/shaders/xesl.xesli",
+      "sha256": "7ae2017e13678b961f3f9191f42544bc772ed7b89000d04b4156f525ddb90ed5"
+    }
+  ],
+  "verification": "Both scaled RGBA8 and depth-unorm SPIR-V word arrays match pinned upstream byte-for-byte."
+}

@@ -477,6 +477,7 @@ u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 
 
 u32 XamShowSigninUI_entry(u32 unk, u32 unk_mask) {
   // Mask values vary. Probably matching user types? Local/remote?
+  REXKRNL_INFO("XamShowSigninUI(unk={:08X}, mask={:08X})", uint32_t(unk), uint32_t(unk_mask));
 
   // To fix game modes that display a 4 profile signin UI (even if playing
   // alone):

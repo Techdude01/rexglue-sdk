@@ -24,6 +24,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
 #include <rex/graphics/xenos.h>
@@ -39,6 +40,8 @@ REXCVAR_DEFINE_BOOL(vsync, false, "GPU", "Enable vertical sync");
 
 REXCVAR_DEFINE_BOOL(gpu_wait_correlation, false, "GPU",
                     "Log diagnostic WAIT_REG_MEM, vblank and candidate writes");
+REXCVAR_DEFINE_UINT32(gpu_fetch_probe_address, 0, "GPU",
+                      "Diagnostic: log GPU slot-zero fetches for this physical texture address");
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
@@ -255,6 +258,7 @@ void CommandProcessor::WorkerThreadMain() {
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
     if (read_ptr_writeback_ptr_) {
+      PassSignalGate();
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
                                        read_ptr_index_);
     }
@@ -375,6 +379,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     uint32_t scratch_reg = index - XE_GPU_REG_SCRATCH_REG0;
     if ((1 << scratch_reg) & regs.values[XE_GPU_REG_SCRATCH_UMSK]) {
       // Enabled - write to address.
+      PassSignalGate();
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
@@ -746,6 +751,11 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   uint32_t opcode = (packet >> 8) & 0x7F;
   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
   auto data_start_offset = reader->read_offset();
+  if (draw_observer_.load(std::memory_order_relaxed)) [[unlikely]] {
+    size_t header_offset = (data_start_offset + reader->capacity() - sizeof(uint32_t)) % reader->capacity();
+    observed_packet_address_ =
+        uint32_t(uintptr_t(reader->buffer()) + header_offset - uintptr_t(memory_->physical_membase()));
+  }
 
   if (reader->read_count() < count * sizeof(uint32_t)) {
     REXGPU_ERROR("ExecutePacketType3 overflow (read count {:08X}, packet count {:08X})",
@@ -773,9 +783,11 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       result = ExecutePacketType3_NOP(reader, packet, count);
       break;
     case PM4_INTERRUPT:
+      PassSignalGate();
       result = ExecutePacketType3_INTERRUPT(reader, packet, count);
       break;
     case PM4_XE_SWAP:
+      PassSignalGate();
       result = ExecutePacketType3_XE_SWAP(reader, packet, count);
       break;
     case PM4_INDIRECT_BUFFER:
@@ -789,24 +801,30 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       result = ExecutePacketType3_REG_RMW(reader, packet, count);
       break;
     case PM4_REG_TO_MEM:
+      PassSignalGate();
       result = ExecutePacketType3_REG_TO_MEM(reader, packet, count);
       break;
     case PM4_MEM_WRITE:
+      PassSignalGate();
       result = ExecutePacketType3_MEM_WRITE(reader, packet, count);
       break;
     case PM4_COND_WRITE:
+      PassSignalGate();
       result = ExecutePacketType3_COND_WRITE(reader, packet, count);
       break;
     case PM4_EVENT_WRITE:
       result = ExecutePacketType3_EVENT_WRITE(reader, packet, count);
       break;
     case PM4_EVENT_WRITE_SHD:
+      PassSignalGate();
       result = ExecutePacketType3_EVENT_WRITE_SHD(reader, packet, count);
       break;
     case PM4_EVENT_WRITE_EXT:
+      PassSignalGate();
       result = ExecutePacketType3_EVENT_WRITE_EXT(reader, packet, count);
       break;
     case PM4_EVENT_WRITE_ZPD:
+      PassSignalGate();
       result = ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
       break;
     case PM4_DRAW_INDX:
@@ -1433,6 +1451,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   // we don't support yet.
   reader->AdvanceRead(count_remaining * sizeof(uint32_t));
 
+  bool draw_issued = false;
   if (draw_succeeded) {
     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
     if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
@@ -1443,22 +1462,76 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
-      draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
-                                 is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
-      if (!draw_succeeded) {
-        auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
-        auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();
-        auto rb_modecontrol = register_file_->Get<reg::RB_MODECONTROL>();
-        REXGPU_ERROR(
-            "{}({}, {}, {}): Failed in backend "
-            "(major_mode={}, explicit_major={}, path_select={}, tess_mode={}, edram_mode={})",
-            opcode_name, static_cast<uint32_t>(vgt_draw_initiator.num_indices),
-            uint32_t(vgt_draw_initiator.prim_type), uint32_t(vgt_draw_initiator.source_select),
-            uint32_t(vgt_draw_initiator.major_mode), uint32_t(major_mode_explicit),
-            uint32_t(vgt_output_path_cntl.path_select), uint32_t(vgt_hos_cntl.tess_mode),
-            uint32_t(rb_modecontrol.edram_mode));
+      if (host_rendering()) {
+        draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+                                   is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+        draw_issued = draw_succeeded;
+        if (!draw_succeeded) {
+          auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
+          auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();
+          auto rb_modecontrol = register_file_->Get<reg::RB_MODECONTROL>();
+          REXGPU_ERROR(
+              "{}({}, {}, {}): Failed in backend "
+              "(major_mode={}, explicit_major={}, path_select={}, tess_mode={}, edram_mode={})",
+              opcode_name, static_cast<uint32_t>(vgt_draw_initiator.num_indices),
+              uint32_t(vgt_draw_initiator.prim_type), uint32_t(vgt_draw_initiator.source_select),
+              uint32_t(vgt_draw_initiator.major_mode), uint32_t(major_mode_explicit),
+              uint32_t(vgt_output_path_cntl.path_select), uint32_t(vgt_hos_cntl.tess_mode),
+              uint32_t(rb_modecontrol.edram_mode));
+        }
+      } else {
+        draw_succeeded = true;
+        draw_issued = true;
       }
     }
+  }
+
+  if (REXCVAR_GET(gpu_fetch_probe_address)) {
+    const auto& fetch = register_file_->GetTextureFetch(0);
+    if ((fetch.base_address << 12) == REXCVAR_GET(gpu_fetch_probe_address)) {
+      static uint32_t logged_valid = 0, logged_invalid = 0;
+      if ((fetch.type == xenos::FetchConstantType::kTexture && logged_valid++ < 2) ||
+          (fetch.type != xenos::FetchConstantType::kTexture && logged_invalid++ < 12)) {
+        REXGPU_INFO("[GPU_FETCH_PROBE] address={:08X} type={} format={} dimension={} word0={:08X} packet={:08X}",
+                    fetch.base_address << 12, uint32_t(fetch.type), uint32_t(fetch.format),
+                    uint32_t(fetch.dimension), register_file_->values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0],
+                    observed_packet_address_);
+      }
+    }
+    const auto vertex = register_file_->GetVertexFetch(95);
+    if (active_vertex_shader_ && active_vertex_shader_->ucode_data_hash() == 0xDD9E5F946265C0F0ull &&
+        (vertex.address << 2) == 0x1C892100u) {
+      static uint32_t vertex_logged = 0;
+      if (vertex_logged++ < 8)
+        REXGPU_INFO("[GPU_SCENE_VERTEX] slot=95 type={} address={:08X} bytes={} endian={} initiator={:08X}",
+                    uint32_t(vertex.type), vertex.address << 2, vertex.size << 2, uint32_t(vertex.endian),
+                    register_file_->values[XE_GPU_REG_VGT_DRAW_INITIATOR]);
+    }
+  }
+  if (system::GpuDrawObserver observer = draw_observer_.load(std::memory_order_acquire)) [[unlikely]] {
+    system::GpuDrawInfo info{};
+    info.packet_address = observed_packet_address_;
+    info.opcode = (packet >> 8) & 0x7F;
+    info.registers = register_file_->values;
+    info.register_count = uint32_t(RegisterFile::kRegisterCount);
+    info.bin_mask = bin_mask_;
+    info.bin_select = bin_select_;
+    info.issued = draw_issued;
+    if (const Shader* vs = active_vertex_shader_) {
+      info.vertex_shader_hash = vs->ucode_data_hash();
+      if (vs->is_ucode_analyzed()) {
+        info.vertex_shader_constants = &vs->constant_register_map();
+        info.vertex_shader_memexport = vs->memexport_eM_written();
+      }
+    }
+    if (const Shader* ps = active_pixel_shader_) {
+      info.pixel_shader_hash = ps->ucode_data_hash();
+      if (ps->is_ucode_analyzed()) {
+        info.pixel_shader_constants = &ps->constant_register_map();
+        info.pixel_shader_memexport = ps->memexport_eM_written();
+      }
+    }
+    observer(draw_observer_user_, info);
   }
 
   // If read the packed correctly, but merely couldn't execute it (because of,
@@ -1466,6 +1539,13 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   // buffer processing as that would leave rendering in a way more inconsistent
   // state than just a single dropped draw command.
   return true;
+}
+
+void CommandProcessor::SetDrawObserver(system::GpuDrawObserver observer, void* user) {
+  // The user pointer is published before the observer (release), and read after it (acquire).
+  draw_observer_.store(nullptr, std::memory_order_release);
+  draw_observer_user_ = user;
+  draw_observer_.store(observer, std::memory_order_release);
 }
 
 bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet,

@@ -13,7 +13,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,6 +24,8 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/vulkan/diagnostic_storage_buffer.h>
@@ -30,6 +34,9 @@
 #include <rex/graphics/vulkan/vertex_input_diagnostic.h>
 #include <rex/math.h>
 #include <rex/string/buffer.h>
+
+REXCVAR_DEFINE_STRING(raster_spirv_dump_directory, "", "GPU/Shader",
+                      "Absolute directory for dumping selected translated pixel SPIR-V modules");
 
 namespace rex::graphics {
 
@@ -1510,6 +1517,35 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
                       reinterpret_cast<const uint8_t*>(module_uints.data()) +
                           sizeof(unsigned int) * module_uints.size());
   const Modification modification = GetSpirvShaderModification();
+  const uint64_t ucode_hash = current_shader().ucode_data_hash();
+  const std::string& dump_directory = REXCVAR_GET(raster_spirv_dump_directory);
+  if (is_pixel_shader() && !dump_directory.empty() &&
+      (ucode_hash == UINT64_C(0x6E6F06115807B602) ||
+       ucode_hash == UINT64_C(0x2D4C010D3D75DEA5))) {
+    // Duplicate translations must not truncate/write the same artifact concurrently.
+    static std::mutex dump_mutex;
+    const std::lock_guard<std::mutex> dump_lock(dump_mutex);
+    const std::string path = fmt::format("{}/shader_{:016X}_mod_{:016X}.spv", dump_directory,
+                                         ucode_hash, modification.value);
+    const bool absolute = std::filesystem::path(dump_directory).is_absolute();
+    FILE* dump_file = absolute ? rex::filesystem::OpenFile(path, "wb") : nullptr;
+    if (!dump_file) {
+      REXLOG_ERROR("[RASTER_SPIRV_DUMP] failed hash={:016X} mod={:016X} path={}", ucode_hash,
+                   modification.value, path);
+    } else {
+      const size_t written = fwrite(module_bytes.data(), 1, module_bytes.size(), dump_file);
+      const int close_result = fclose(dump_file);
+      if (written != module_bytes.size() || close_result != 0) {
+        REXLOG_ERROR("[RASTER_SPIRV_DUMP] failed hash={:016X} mod={:016X} bytes={}/{} path={}",
+                     ucode_hash, modification.value, written, module_bytes.size(), path);
+      } else {
+        REXLOG_INFO("[RASTER_SPIRV_DUMP] hash={:016X} mod={:016X} bytes={} "
+                    "early_fragment_tests={} depth_stencil_mode={} path={}", ucode_hash,
+                    modification.value, module_bytes.size(), IsExecutionModeEarlyFragmentTests(),
+                    uint32_t(modification.pixel.depth_stencil_mode), path);
+      }
+    }
+  }
   if (is_pixel_shader() && vulkan::diagnostics::QuadPartnerMarkerEnabled() &&
       vulkan::diagnostics::IsQuadPartnerMarkerShader(current_shader().ucode_data_hash())) {
     const std::string path = fmt::format(
@@ -3651,10 +3687,10 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
             builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
                                         id_vector_temp_),
             spv::NoPrecision));
-    if (draw_resolution_scale_x_ > 1) {
+    if (shader_resolution_scale_x_ > 1.0f) {
       param_gen_x = builder_->createNoContractionBinOp(
           spv::OpFMul, type_float_, param_gen_x,
-          builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_x_)));
+          builder_->makeFloatConstant(1.0f / shader_resolution_scale_x_));
     }
     param_gen_x = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
                                                    GLSLstd450FAbs, param_gen_x);
@@ -3687,10 +3723,10 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
             builder_->createAccessChain(spv::StorageClassInput, input_fragment_coordinates_,
                                         id_vector_temp_),
             spv::NoPrecision));
-    if (draw_resolution_scale_y_ > 1) {
+    if (shader_resolution_scale_y_ > 1.0f) {
       param_gen_y = builder_->createNoContractionBinOp(
           spv::OpFMul, type_float_, param_gen_y,
-          builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_y_)));
+          builder_->makeFloatConstant(1.0f / shader_resolution_scale_y_));
     }
     param_gen_y = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
                                                    GLSLstd450FAbs, param_gen_y);

@@ -35,6 +35,7 @@
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/vulkan/render_target_cache.h>
+#include <rex/graphics/vulkan/raster_variant_audit.h>
 #include <rex/graphics/vulkan/shader.h>
 #include <rex/graphics/xenos.h>
 #include <rex/ui/vulkan/api.h>
@@ -47,6 +48,8 @@ class VulkanCommandProcessor;
 // implementations.
 class VulkanPipelineCache {
  public:
+  using AuditState = RasterAuditState;
+  using PixelShaderVariantAudit = RasterVariantDecision;
   static constexpr size_t kLayoutUIDEmpty = 0;
 
   class PipelineLayoutProvider {
@@ -82,7 +85,8 @@ class VulkanPipelineCache {
       uint32_t interpolator_mask, bool ps_param_gen_used) const;
   SpirvShaderTranslator::Modification GetCurrentPixelShaderModification(
       const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
-      reg::RB_DEPTHCONTROL normalized_depth_control) const;
+      reg::RB_DEPTHCONTROL normalized_depth_control,
+      PixelShaderVariantAudit* audit = nullptr) const;
 
   bool EnsureShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,
                                VulkanShader::VulkanTranslation* pixel_shader);

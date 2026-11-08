@@ -61,6 +61,16 @@ endif()
 set(REXGLUE_FIDELITYFX_SOURCE_DIR "${fidelityfx_SOURCE_DIR}" CACHE INTERNAL
     "Root of the fetched FidelityFX SDK source tree")
 
+# Spatial FSR1 uses SDK headers plus ReXGlue's EASU/RCAS presenter shaders.
+# The pinned temporal SDK backend invokes the bundled Windows PE shader tool
+# even with FFX_API_AUTO_COMPILE_SHADERS=OFF. Do not attempt to execute that
+# backend on macOS; keep SDK availability distinct from runtime availability.
+# src/ui/CMakeLists.txt already gates REX_HAS_FIDELITYFX_RUNTIME on backend targets.
+if(APPLE)
+    message(STATUS "FidelityFX: spatial EASU/RCAS enabled; temporal FSR2/FSR3 runtime unavailable on macOS")
+    return()
+endif()
+
 # ── Backend selection ────────────────────────────────────────────────────
 set(REXGLUE_FIDELITYFX_BACKEND "auto" CACHE STRING
     "FidelityFX backend to build (auto, vk, dx12)")

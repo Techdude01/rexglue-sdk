@@ -2192,6 +2192,31 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
       }
 
       if (guest_output_flow.effect_count) {
+#if defined(REX_HAS_FIDELITYFX_SDK)
+        // Log actual selected Vulkan passes when the source/output size changes.
+        // FSR here is spatial EASU + RCAS, not native Apple MetalFX.
+        uint32_t logged_input_width = 0, logged_input_height = 0;
+        guest_output_flow.GetEffectInputSize(0, logged_input_width, logged_input_height);
+        const uint64_t flow_key = uint64_t(logged_input_width) |
+            (uint64_t(logged_input_height) << 16) |
+            (uint64_t(paint_context_.swapchain_extent.width) << 32) |
+            (uint64_t(paint_context_.swapchain_extent.height) << 48);
+        static std::atomic<uint64_t> last_logged_flow{0};
+        if (last_logged_flow.exchange(flow_key) != flow_key) {
+          uint32_t easu_passes = 0, rcas_passes = 0;
+          for (size_t pass = 0; pass < guest_output_flow.effect_count; ++pass) {
+            const auto selected = guest_output_flow.effects[pass];
+            easu_passes += selected == GuestOutputPaintEffect::kFsrEasu;
+            rcas_passes += selected == GuestOutputPaintEffect::kFsrRcas ||
+                           selected == GuestOutputPaintEffect::kFsrRcasDither;
+          }
+          REXLOG_INFO("[PRESENT_EFFECT] selected={} passes={} easu={} rcas={} input={}x{} output={}x{}",
+              guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr ? "fsr" : "other",
+              guest_output_flow.effect_count, easu_passes, rcas_passes,
+              logged_input_width, logged_input_height,
+              paint_context_.swapchain_extent.width, paint_context_.swapchain_extent.height);
+        }
+#endif
         // Actually draw the guest output.
         paint_context_.guest_output_image_paint_refs[guest_output_image_paint_ref_index].first =
             current_paint_submission_index;

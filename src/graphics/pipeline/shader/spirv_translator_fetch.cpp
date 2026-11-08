@@ -1017,7 +1017,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     const spv::Id unoffset_coordinates[3] = {coordinates[0], coordinates[1], coordinates[2]};
     spv::Id texture_resolution_scaled = spv::NoResult;
     uint32_t revert_resolution_scale_axes =
-        uint32_t(draw_resolution_scale_x_ > 1) | (uint32_t(draw_resolution_scale_y_ > 1) << 1);
+        uint32_t(shader_resolution_scale_x_ > 1.0f) | (uint32_t(shader_resolution_scale_y_ > 1.0f) << 1);
     spv::Id const_texture_resolution_scale[] = {spv::NoResult, spv::NoResult};
     spv::Id const_texture_resolution_scale_reciprocal[] = {spv::NoResult, spv::NoResult};
     if (revert_resolution_scale_axes) {
@@ -1034,15 +1034,15 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           const_uint_0_);
       if (revert_resolution_scale_axes & 0b001) {
         const_texture_resolution_scale[0] =
-            builder_->makeFloatConstant(float(draw_resolution_scale_x_));
+            builder_->makeFloatConstant(shader_resolution_scale_x_);
         const_texture_resolution_scale_reciprocal[0] =
-            builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_x_));
+            builder_->makeFloatConstant(1.0f / shader_resolution_scale_x_);
       }
       if (revert_resolution_scale_axes & 0b010) {
         const_texture_resolution_scale[1] =
-            builder_->makeFloatConstant(float(draw_resolution_scale_y_));
+            builder_->makeFloatConstant(shader_resolution_scale_y_);
         const_texture_resolution_scale_reciprocal[1] =
-            builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_y_));
+            builder_->makeFloatConstant(1.0f / shader_resolution_scale_y_);
       }
     }
 

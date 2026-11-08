@@ -17,6 +17,8 @@
 
 #include <rex/assert.h>
 #include <rex/math.h>
+#include <rex/graphics/vulkan/work_purpose_audit.h>
+#include <rex/graphics/vulkan/gpu_work_labels.h>
 #include <rex/ui/vulkan/api.h>
 
 namespace rex::graphics::vulkan {
@@ -36,7 +38,8 @@ class DeferredCommandBuffer {
   }
 
   void Reset();
-  void Execute(VkCommandBuffer command_buffer);
+  void Execute(VkCommandBuffer command_buffer, WorkPurposeAudit* audit = nullptr,
+               bool prologue = false);
 
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
@@ -172,7 +175,7 @@ class DeferredCommandBuffer {
   }
 
   VkBufferCopy* CmdCopyBufferEmplace(VkBuffer src_buffer, VkBuffer dst_buffer,
-                                     uint32_t region_count) {
+                                     uint32_t region_count, WorkPurpose purpose = WorkPurpose::kBufferCopy) {
     const size_t header_size = rex::align(sizeof(ArgsVkCopyBuffer), alignof(VkBufferCopy));
     uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
         WriteCommand(Command::kVkCopyBuffer, header_size + sizeof(VkBufferCopy) * region_count));
@@ -180,11 +183,22 @@ class DeferredCommandBuffer {
     args.src_buffer = src_buffer;
     args.dst_buffer = dst_buffer;
     args.region_count = region_count;
+    args.purpose = purpose;
     return reinterpret_cast<VkBufferCopy*>(args_ptr + header_size);
   }
+  void CmdVkCopyImageToBuffer(VkImage image, VkImageLayout layout, VkBuffer buffer,
+                              const VkBufferImageCopy& region) {
+    auto& args = *reinterpret_cast<ArgsVkCopyImageToBuffer*>(
+        WriteCommand(Command::kVkCopyImageToBuffer, sizeof(ArgsVkCopyImageToBuffer)));
+    args.image = image;
+    args.layout = layout;
+    args.buffer = buffer;
+    args.region = region;
+  }
+
   void CmdVkCopyBuffer(VkBuffer src_buffer, VkBuffer dst_buffer, uint32_t region_count,
-                       const VkBufferCopy* regions) {
-    std::memcpy(CmdCopyBufferEmplace(src_buffer, dst_buffer, region_count), regions,
+                       const VkBufferCopy* regions, WorkPurpose purpose = WorkPurpose::kBufferCopy) {
+    std::memcpy(CmdCopyBufferEmplace(src_buffer, dst_buffer, region_count, purpose), regions,
                 sizeof(VkBufferCopy) * region_count);
   }
 
@@ -196,9 +210,18 @@ class DeferredCommandBuffer {
     args.flags = flags;
   }
 
+  void CmdParityCopyImageToBuffer(VkImage image, VkBuffer buffer, const VkBufferImageCopy& region) {
+    auto& args = *reinterpret_cast<ArgsParityCopyImageToBuffer*>(WriteCommand(
+        Command::kParityCopyImageToBuffer, sizeof(ArgsParityCopyImageToBuffer)));
+    args.image = image; args.buffer = buffer; args.region = region;
+  }
+
   VkBufferImageCopy* CmdCopyBufferToImageEmplace(VkBuffer src_buffer, VkImage dst_image,
                                                  VkImageLayout dst_image_layout,
-                                                 uint32_t region_count) {
+                                                 uint32_t region_count,
+                                                 uint32_t block_width = 0,
+                                                 uint32_t block_height = 0,
+                                                 uint32_t block_bytes = 0) {
     const size_t header_size =
         rex::align(sizeof(ArgsVkCopyBufferToImage), alignof(VkBufferImageCopy));
     uint8_t* args_ptr = reinterpret_cast<uint8_t*>(WriteCommand(
@@ -208,6 +231,9 @@ class DeferredCommandBuffer {
     args.dst_image = dst_image;
     args.dst_image_layout = dst_image_layout;
     args.region_count = region_count;
+    args.block_width = block_width;
+    args.block_height = block_height;
+    args.block_bytes = block_bytes;
     return reinterpret_cast<VkBufferImageCopy*>(args_ptr + header_size);
   }
   void CmdVkCopyBufferToImage(VkBuffer src_buffer, VkImage dst_image,
@@ -231,12 +257,25 @@ class DeferredCommandBuffer {
     args.flags = flags;
   }
 
-  void CmdVkDispatch(uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z) {
-    auto& args = *reinterpret_cast<ArgsVkDispatch*>(
-        WriteCommand(Command::kVkDispatch, sizeof(ArgsVkDispatch)));
-    args.group_count_x = group_count_x;
-    args.group_count_y = group_count_y;
-    args.group_count_z = group_count_z;
+  void CmdVkDispatch(uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z,
+                     WorkPurpose purpose = WorkPurpose::kUnknownDispatch,
+                     const ResolveWorkMetadata* resolve_metadata = nullptr) {
+    if (resolve_metadata && resolve_metadata->valid) {
+      auto& args = *reinterpret_cast<ArgsVkResolveDispatch*>(
+          WriteCommand(Command::kVkDispatchResolve, sizeof(ArgsVkResolveDispatch)));
+      args.dispatch.group_count_x = group_count_x;
+      args.dispatch.group_count_y = group_count_y;
+      args.dispatch.group_count_z = group_count_z;
+      args.dispatch.purpose = purpose;
+      args.resolve_metadata = *resolve_metadata;
+    } else {
+      auto& args = *reinterpret_cast<ArgsVkDispatch*>(
+          WriteCommand(Command::kVkDispatch, sizeof(ArgsVkDispatch)));
+      args.group_count_x = group_count_x;
+      args.group_count_y = group_count_y;
+      args.group_count_z = group_count_z;
+      args.purpose = purpose;
+    }
   }
 
   void CmdVkDraw(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
@@ -370,9 +409,12 @@ class DeferredCommandBuffer {
     kVkClearAttachments,
     kVkClearColorImage,
     kVkCopyBuffer,
+    kVkCopyImageToBuffer,
     kVkCopyBufferToImage,
+    kParityCopyImageToBuffer,
     kVkCopyQueryPoolResults,
     kVkDispatch,
+    kVkDispatchResolve,
     kVkDraw,
     kVkDrawIndexed,
     kVkEndQuery,
@@ -475,19 +517,31 @@ class DeferredCommandBuffer {
     static_assert(alignof(VkImageSubresourceRange) <= alignof(uintmax_t));
   };
 
+  struct ArgsVkCopyImageToBuffer {
+    VkImage image;
+    VkImageLayout layout;
+    VkBuffer buffer;
+    VkBufferImageCopy region;
+  };
+
   struct ArgsVkCopyBuffer {
     VkBuffer src_buffer;
     VkBuffer dst_buffer;
     uint32_t region_count;
+    WorkPurpose purpose;
     // Followed by aligned VkBufferCopy[].
     static_assert(alignof(VkBufferCopy) <= alignof(uintmax_t));
   };
 
+  struct ArgsParityCopyImageToBuffer {
+    VkImage image; VkBuffer buffer; VkBufferImageCopy region;
+  };
   struct ArgsVkCopyBufferToImage {
     VkBuffer src_buffer;
     VkImage dst_image;
     VkImageLayout dst_image_layout;
     uint32_t region_count;
+    uint32_t block_width, block_height, block_bytes;
     // Followed by aligned VkBufferImageCopy[].
     static_assert(alignof(VkBufferImageCopy) <= alignof(uintmax_t));
   };
@@ -503,9 +557,15 @@ class DeferredCommandBuffer {
   };
 
   struct ArgsVkDispatch {
+    WorkPurpose purpose;
     uint32_t group_count_x;
     uint32_t group_count_y;
     uint32_t group_count_z;
+  };
+
+  struct ArgsVkResolveDispatch {
+    ArgsVkDispatch dispatch;
+    ResolveWorkMetadata resolve_metadata;
   };
 
   struct ArgsProfileTimestamp { VkQueryPool pool; uint32_t query; };

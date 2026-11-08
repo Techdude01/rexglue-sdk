@@ -16,9 +16,15 @@
 #include <rex/assert.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/vulkan/gpu_work_labels.h>
+#include <rex/logging.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/math.h>
+
+REXCVAR_DEFINE_BOOL(gpu_work_labels, false, "GPU/Vulkan", "Bounded profiling-only GPU work labels");
+REXCVAR_DEFINE_UINT64(gpu_work_label_start, 4000, "GPU/Vulkan", "First frame carrying GPU work labels");
+REXCVAR_DEFINE_UINT64(gpu_work_label_frames, 64, "GPU/Vulkan", "Number of labeled frames (1..384)");
 
 namespace rex::graphics::vulkan {
 
@@ -32,13 +38,64 @@ void DeferredCommandBuffer::Reset() {
   command_stream_.clear();
 }
 
-void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer,
+                                    WorkPurposeAudit* audit, bool prologue) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
-  const ui::vulkan::VulkanDevice::Functions& dfn =
-      command_processor_.GetVulkanDevice()->functions();
+  const auto* device = command_processor_.GetVulkanDevice();
+  const auto& dfn = device->functions();
+  const uint64_t frame = command_processor_.GetCurrentFrame();
+  bool labels = IsGpuWorkLabelFrame(REXCVAR_GET(gpu_work_labels), frame,
+      REXCVAR_GET(gpu_work_label_start), REXCVAR_GET(gpu_work_label_frames));
+  PFN_vkCmdBeginDebugUtilsLabelEXT label_begin = nullptr;
+  PFN_vkCmdEndDebugUtilsLabelEXT label_end = nullptr;
+  if (labels && !device->vulkan_instance()->extensions().ext_EXT_debug_utils) {
+    REXGPU_WARN("[GPU_WORK] VK_EXT_debug_utils unavailable; no GPU identities emitted");
+    labels = false;
+  }
+  if (labels) {
+    const auto& ifn = device->vulkan_instance()->functions();
+    label_begin = reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(
+        ifn.vkGetDeviceProcAddr(device->device(), "vkCmdBeginDebugUtilsLabelEXT"));
+    label_end = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(
+        ifn.vkGetDeviceProcAddr(device->device(), "vkCmdEndDebugUtilsLabelEXT"));
+    if (!label_begin || !label_end) {
+      REXGPU_WARN("[GPU_WORK] Debug-utils entrypoints unavailable; no GPU identities emitted");
+      labels = false;
+    }
+  }
+  uint64_t work_id = 0;
+  uint64_t graphics_pipeline = 0, compute_pipeline = 0;
+  bool render_label = false;
+  auto begin_work = [&](const char* kind, uint64_t pipeline = 0,
+                        uint32_t x = 0, uint32_t y = 0, uint32_t z = 0,
+                        const ResolveWorkMetadata* resolve = nullptr) {
+    if (!labels) return;
+    auto name = FormatGpuWorkLabel(frame, command_processor_.GetCurrentSubmission(),
+                                   prologue, ++work_id, kind, pipeline, x, y, z, resolve);
+    REXGPU_INFO("[GPU_WORK] {}", name.data());
+    VkDebugUtilsLabelEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+    info.pLabelName = name.data();
+    label_begin(command_buffer, &info);
+  };
+  auto end_work = [&]() { if (labels) label_end(command_buffer); };
+  auto execute_dispatch = [&](const ArgsVkDispatch& args,
+                              const ResolveWorkMetadata* resolve_metadata) {
+    if (audit) audit->Record({args.purpose, args.group_count_x, args.group_count_y,
+                              args.group_count_z, 0}, prologue);
+    const size_t purpose = size_t(args.purpose);
+    begin_work(purpose < size_t(WorkPurpose::kCount) ? kWorkPurposeNames[purpose]
+                                                    : "unknown_compute",
+               compute_pipeline, args.group_count_x, args.group_count_y, args.group_count_z,
+               resolve_metadata);
+    dfn.vkCmdDispatch(command_buffer, args.group_count_x, args.group_count_y,
+                      args.group_count_z);
+    end_work();
+  };
+  begin_work("stream");
+
   const uintmax_t* stream = command_stream_.data();
   size_t stream_remaining = command_stream_.size();
   while (stream_remaining) {
@@ -53,6 +110,9 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                                args.pool, args.query);
       } break;
       case Command::kVkBeginRenderPass: {
+        begin_work("render_scope");
+        render_label = true;
+        if (audit) audit->BeginRender();
         auto& args = *reinterpret_cast<const ArgsVkBeginRenderPass*>(stream);
         size_t offset_bytes = sizeof(ArgsVkBeginRenderPass);
         VkRenderPassBeginInfo render_pass_begin_info;
@@ -104,6 +164,10 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 
       case Command::kVkBindPipeline: {
         auto& args = *reinterpret_cast<const ArgsVkBindPipeline*>(stream);
+        if (args.pipeline_bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS)
+          graphics_pipeline = uint64_t(args.pipeline);
+        else if (args.pipeline_bind_point == VK_PIPELINE_BIND_POINT_COMPUTE)
+          compute_pipeline = uint64_t(args.pipeline);
         dfn.vkCmdBindPipeline(command_buffer, args.pipeline_bind_point, args.pipeline);
       } break;
 
@@ -130,60 +194,124 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                                   alignof(VkClearRect));
         const VkClearRect* rects = reinterpret_cast<const VkClearRect*>(
             reinterpret_cast<const uint8_t*>(stream) + offset_bytes);
+        begin_work("clear_attachments", 0, args.attachment_count, args.rect_count);
         dfn.vkCmdClearAttachments(command_buffer, args.attachment_count, attachments,
                                   args.rect_count, rects);
+        end_work();
       } break;
 
       case Command::kVkClearColorImage: {
         auto& args = *reinterpret_cast<const ArgsVkClearColorImage*>(stream);
+        if (audit) audit->Record({WorkPurpose::kClearImage, args.range_count, 0, 0, 0}, prologue);
+        begin_work("clear_image", 0, args.range_count);
         dfn.vkCmdClearColorImage(
             command_buffer, args.image, args.image_layout, &args.color, args.range_count,
             reinterpret_cast<const VkImageSubresourceRange*>(
                 reinterpret_cast<const uint8_t*>(stream) +
                 rex::align(sizeof(ArgsVkClearColorImage), alignof(VkImageSubresourceRange))));
+        end_work();
       } break;
 
       case Command::kVkCopyBuffer: {
         auto& args = *reinterpret_cast<const ArgsVkCopyBuffer*>(stream);
+        if (audit) {
+          const auto* regions = reinterpret_cast<const VkBufferCopy*>(
+              reinterpret_cast<const uint8_t*>(stream) +
+              rex::align(sizeof(ArgsVkCopyBuffer), alignof(VkBufferCopy)));
+          uint64_t bytes = 0;
+          for (uint32_t i = 0; i < args.region_count; ++i) bytes += regions[i].size;
+          audit->Record({args.purpose, args.region_count, 0, 0, bytes}, prologue);
+        }
+        const size_t purpose = size_t(args.purpose);
+        begin_work(purpose < size_t(WorkPurpose::kCount) ? kWorkPurposeNames[purpose] : "copy_buffer",
+                   0, args.region_count);
         dfn.vkCmdCopyBuffer(command_buffer, args.src_buffer, args.dst_buffer, args.region_count,
                             reinterpret_cast<const VkBufferCopy*>(
                                 reinterpret_cast<const uint8_t*>(stream) +
                                 rex::align(sizeof(ArgsVkCopyBuffer), alignof(VkBufferCopy))));
+        end_work();
+      } break;
+
+      case Command::kVkCopyImageToBuffer: {
+        const auto& args = *reinterpret_cast<const ArgsVkCopyImageToBuffer*>(stream);
+        begin_work("fused_resolve_parity_readback", 0, 1);
+        dfn.vkCmdCopyImageToBuffer(command_buffer, args.image, args.layout, args.buffer, 1,
+                                   &args.region);
+        end_work();
       } break;
 
       case Command::kVkCopyBufferToImage: {
         auto& args = *reinterpret_cast<const ArgsVkCopyBufferToImage*>(stream);
+        if (audit) {
+          const auto* regions = reinterpret_cast<const VkBufferImageCopy*>(
+              reinterpret_cast<const uint8_t*>(stream) +
+              rex::align(sizeof(ArgsVkCopyBufferToImage), alignof(VkBufferImageCopy)));
+          uint64_t bytes = 0;
+          if (args.block_width && args.block_height && args.block_bytes) {
+            for (uint32_t i = 0; i < args.region_count; ++i) {
+              const auto& r = regions[i];
+              bytes += uint64_t((r.imageExtent.width + args.block_width - 1) / args.block_width) *
+                  ((r.imageExtent.height + args.block_height - 1) / args.block_height) *
+                  r.imageExtent.depth * r.imageSubresource.layerCount * args.block_bytes;
+            }
+          }
+          audit->Record({WorkPurpose::kImageCopy, args.region_count, 0, 0, bytes}, prologue);
+        }
+        begin_work("copy_buffer_to_image", 0, args.region_count);
         dfn.vkCmdCopyBufferToImage(
             command_buffer, args.src_buffer, args.dst_image, args.dst_image_layout,
             args.region_count,
             reinterpret_cast<const VkBufferImageCopy*>(
                 reinterpret_cast<const uint8_t*>(stream) +
                 rex::align(sizeof(ArgsVkCopyBufferToImage), alignof(VkBufferImageCopy))));
+        end_work();
+      } break;
+
+      case Command::kParityCopyImageToBuffer: {
+        const auto& args = *reinterpret_cast<const ArgsParityCopyImageToBuffer*>(stream);
+        begin_work("parity_image_readback", 0, args.region.imageExtent.width,
+                   args.region.imageExtent.height, args.region.imageExtent.depth);
+        dfn.vkCmdCopyImageToBuffer(command_buffer, args.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            args.buffer, 1, &args.region);
+        end_work();
       } break;
 
       case Command::kVkCopyQueryPoolResults: {
         auto& args = *reinterpret_cast<const ArgsVkCopyQueryPoolResults*>(stream);
+        if (audit) audit->Record({WorkPurpose::kQueryCopy, args.query_count, 0, 0,
+            uint64_t(args.query_count) * ((args.flags & VK_QUERY_RESULT_64_BIT) ? 8u : 4u) *
+            ((args.flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ? 2u : 1u)}, prologue);
+        begin_work("query_copy", 0, args.query_count);
         dfn.vkCmdCopyQueryPoolResults(command_buffer, args.query_pool, args.first_query,
                                       args.query_count, args.dst_buffer, args.dst_offset,
                                       args.stride, args.flags);
+        end_work();
       } break;
 
       case Command::kVkDispatch: {
         auto& args = *reinterpret_cast<const ArgsVkDispatch*>(stream);
-        dfn.vkCmdDispatch(command_buffer, args.group_count_x, args.group_count_y,
-                          args.group_count_z);
+        execute_dispatch(args, nullptr);
+      } break;
+
+      case Command::kVkDispatchResolve: {
+        auto& args = *reinterpret_cast<const ArgsVkResolveDispatch*>(stream);
+        execute_dispatch(args.dispatch, &args.resolve_metadata);
       } break;
 
       case Command::kVkDraw: {
         auto& args = *reinterpret_cast<const ArgsVkDraw*>(stream);
+        begin_work("draw", graphics_pipeline, args.vertex_count, args.instance_count);
         dfn.vkCmdDraw(command_buffer, args.vertex_count, args.instance_count, args.first_vertex,
                       args.first_instance);
+        end_work();
       } break;
 
       case Command::kVkDrawIndexed: {
         auto& args = *reinterpret_cast<const ArgsVkDrawIndexed*>(stream);
+        begin_work("draw_indexed", graphics_pipeline, args.index_count, args.instance_count);
         dfn.vkCmdDrawIndexed(command_buffer, args.index_count, args.instance_count,
                              args.first_index, args.vertex_offset, args.first_instance);
+        end_work();
       } break;
 
       case Command::kVkEndQuery: {
@@ -193,9 +321,13 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 
       case Command::kVkEndRenderPass:
         dfn.vkCmdEndRenderPass(command_buffer);
+        if (render_label) { end_work(); render_label = false; }
         break;
 
       case Command::kVkBeginRendering: {
+        begin_work("render_scope");
+        render_label = true;
+        if (audit) audit->BeginRender();
         auto& args = *reinterpret_cast<const ArgsVkBeginRendering*>(stream);
         size_t offset_bytes =
             rex::align(sizeof(ArgsVkBeginRendering), alignof(VkRenderingAttachmentInfo));
@@ -232,6 +364,7 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 
       case Command::kVkEndRendering:
         dfn.vkCmdEndRendering(command_buffer);
+        if (render_label) { end_work(); render_label = false; }
         break;
 
       case Command::kVkPipelineBarrier: {
@@ -327,6 +460,8 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
     stream += header.arguments_size_elements;
     stream_remaining -= header.arguments_size_elements;
   }
+  if (render_label) end_work();
+  end_work();
 }
 
 void DeferredCommandBuffer::CmdVkPipelineBarrier(

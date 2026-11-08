@@ -301,6 +301,8 @@ class RenderTargetCache {
     RenderTargetKey key_;
   };
 
+  RenderTarget* GetOrCreateRenderTarget(RenderTargetKey key);
+
   // Compatibility policy for already-bound attachments. The caller also
   // enforces backend scope and ownership-transfer constraints.
   static bool CanKeepAccumulatedRenderTargets(
@@ -667,8 +669,6 @@ class RenderTargetCache {
     }
     return xenos::GetStorageColorFormat(format);
   }
-
-  RenderTarget* GetOrCreateRenderTarget(RenderTargetKey key);
 
   // Checks if changing ownership of the range to the specified render target
   // would require transferring data - primarily for barrier placement on the

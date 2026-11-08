@@ -137,6 +137,8 @@ class TextureCache {
 
 
  protected:
+  // Called for scaled-resolve address invalidations, including GPU writes.
+  virtual void InvalidateResolvedImages(uint32_t address, uint32_t length) {}
   struct TextureKey {
     // Dimensions minus 1 are stored similarly to how they're stored in fetch
     // constants so fewer bits can be used, while the maximum size (8192 for 2D)
@@ -229,6 +231,16 @@ class TextureCache {
     static constexpr uint32_t kOutdatedBitMips = UINT32_C(1) << 1;
     uint32_t outdated_mask() const { return outdated_mask_.load(std::memory_order_acquire); }
 
+    // Watch callbacks, not byte/content versions. Diagnostic only.
+    void AuditInvalidation(bool mip, bool gpu) {
+      (gpu ? audit_gpu_invalidations_[mip] : audit_cpu_invalidations_[mip])
+          .fetch_add(1, std::memory_order_relaxed);
+    }
+    std::pair<uint64_t, uint64_t> audit_invalidations(bool mip) const {
+      return {audit_cpu_invalidations_[mip].load(std::memory_order_relaxed),
+              audit_gpu_invalidations_[mip].load(std::memory_order_relaxed)};
+    }
+
     bool base_outdated(const std::unique_lock<std::recursive_mutex>& global_lock) const {
       return base_outdated_;
     }
@@ -280,6 +292,8 @@ class TextureCache {
     // Whether the recent mip data needs reloading from the memory.
     bool mips_outdated_ = false;
     std::atomic<uint32_t> outdated_mask_{0};
+    std::atomic<uint64_t> audit_cpu_invalidations_[2]{};
+    std::atomic<uint64_t> audit_gpu_invalidations_[2]{};
     // Watch handles for the memory ranges.
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
@@ -521,6 +535,10 @@ class TextureCache {
   // failure, it should return nullptr), modifying it is not allowed.
   virtual std::unique_ptr<Texture> CreateTexture(TextureKey key) = 0;
 
+  // Return a unique already-observed base texture for an exact guest range.
+  // Ambiguous aliases must take the ordinary resolve/load path.
+  const TextureKey* FindUniqueResolvedTextureKey(uint32_t address, uint32_t length) const;
+
   // Returns nullptr not only if the key is not supported, but also if couldn't
   // create the texture - if it's nullptr, occasionally a recreation attempt
   // should be made.
@@ -615,6 +633,9 @@ class TextureCache {
   uint64_t current_submission_time_ = 0;
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
+
+  // O(1) index for scaled resolve texture keys by (address, length).
+  std::unordered_map<uint64_t, const TextureKey*> scaled_resolve_texture_keys_;
 
   uint64_t textures_total_host_memory_usage_ = 0;
 

@@ -35,9 +35,8 @@ REXCVAR_DEFINE_STRING(
     "Select active Vulkan driver on macOS ('kosmickrisp' [default] or 'moltenvk' override)");
 
 REXCVAR_DEFINE_STRING(
-    vulkan_kosmickrisp_icd,
-    "/Users/Kushal/Projects/cosmicR/out/kosmickrisp-trial-20261028/trial-icd.json", "UI/Vulkan",
-    "Path to the pinned KosmicKrisp ICD manifest");
+    vulkan_kosmickrisp_icd, "", "UI/Vulkan",
+    "Path to the pinned KosmicKrisp ICD manifest; empty resolves next to the executable");
 
 namespace rex::ui::vulkan {
 namespace {
@@ -201,15 +200,37 @@ MacOSVulkanRuntimePaths DetectMacOSVulkanRuntimePaths() {
   return paths;
 }
 
+namespace {
+
+// An unset cvar must not make KosmicKrisp look unavailable just because the
+// manifest lives beside the binary rather than at an absolute path.
+std::string ResolveKosmicKrispManifest() {
+  const std::string configured = REXCVAR_GET(vulkan_kosmickrisp_icd);
+  if (!configured.empty()) {
+    return configured;
+  }
+  std::error_code ec;
+  const auto exe_folder = rex::filesystem::GetExecutableFolder();
+  for (const auto& relative : {"kosmickrisp_icd.json", "vulkan/kosmickrisp_icd.json"}) {
+    const auto candidate = exe_folder / relative;
+    if (std::filesystem::is_regular_file(candidate, ec)) {
+      return candidate.string();
+    }
+  }
+  return {};
+}
+
+}  // namespace
+
 bool IsMacOSKosmicKrispAvailable() {
-  return PathExists(REXCVAR_GET(vulkan_kosmickrisp_icd));
+  return PathExists(ResolveKosmicKrispManifest());
 }
 
 void ConfigureMacOSVulkanEnvironment(const MacOSVulkanRuntimePaths& paths,
                                     bool force_moltenvk) {
   const std::string driver_choice = REXCVAR_GET(vulkan_driver);
   if (!force_moltenvk && driver_choice == "kosmickrisp") {
-    const std::string manifest = REXCVAR_GET(vulkan_kosmickrisp_icd);
+    const std::string manifest = ResolveKosmicKrispManifest();
     setenv("VK_DRIVER_FILES", manifest.c_str(), 1);
     setenv("VK_ICD_FILENAMES", manifest.c_str(), 1);
     REXLOG_INFO("Configured Vulkan environment for KosmicKrisp: {}", manifest);

@@ -123,6 +123,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                                          VkRenderingAttachmentInfo* depth_attachment,
                                          VkRenderingAttachmentInfo* stencil_attachment) const;
   bool HasAnyPendingClear() const;
+  bool HasPendingDeferredClear() const;
+  bool CanEmitDeferredClearInFramebuffer(const Framebuffer* draw_framebuffer) const;
+  void FlushPendingDeferredClear();
+  bool TryEmitDeferredClearInDrawPass(const Framebuffer* draw_framebuffer);
+  bool IsImageActiveAttachment(VkImage image) const;
   bool CaptureDiagnosticSnapshot(const diagnostics::RenderTargetSnapshotRequest& request,
                                  diagnostics::RenderTargetSnapshotBoundary boundary,
                                  diagnostics::BenOcclusionSnapshotBoundaryMetadata metadata = {});
@@ -822,15 +827,20 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     uint32_t source_base_tiles;
     uint32_t source_pitch_tiles;
     uint32_t dispatch_first_tile;
+    uint32_t source_msaa_2x_supported;
   };
 
   struct DirectResolvePipelineKey {
     DumpPipelineKey dump_pipeline_key;
     draw_util::ResolveCopyShaderIndex copy_shader;
     bool draw_resolution_scaled;
+    bool sampled_image_output;
+    bool skip_guest_byte_store = false;
     uint64_t packed() const {
       return uint64_t(dump_pipeline_key.key) | (uint64_t(size_t(copy_shader)) << 32) |
-             (uint64_t(draw_resolution_scaled ? 1 : 0) << 40);
+             (uint64_t(draw_resolution_scaled ? 1 : 0) << 40) |
+             (uint64_t(sampled_image_output ? 1 : 0) << 41) |
+             (uint64_t(skip_guest_byte_store ? 1 : 0) << 42);
     }
     struct Hasher {
       size_t operator()(const DirectResolvePipelineKey& key) const {
@@ -868,7 +878,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkPipeline GetDirectResolvePipeline(DirectResolvePipelineKey key);
   bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
                               draw_util::ResolveCopyShaderIndex copy_shader,
-                              bool draw_resolution_scaled);
+                              bool draw_resolution_scaled,
+                              VulkanTextureCache& texture_cache,
+                              uint64_t& parity_resolve_id,
+                              const char** fallback_reason_out);
 
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
@@ -917,6 +930,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // buffer. VK_NULL_HANDLE if failed to create.
   std::unordered_map<DumpPipelineKey, VkPipeline, DumpPipelineKey::Hasher> dump_pipelines_;
   VkPipelineLayout direct_resolve_pipeline_layout_color_ = VK_NULL_HANDLE;
+  VkDescriptorSetLayout direct_resolve_image_descriptor_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout direct_resolve_image_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout direct_resolve_pipeline_layout_depth_ = VK_NULL_HANDLE;
   std::unordered_map<DirectResolvePipelineKey, VkPipeline, DirectResolvePipelineKey::Hasher>
       direct_resolve_pipelines_;
@@ -926,6 +941,30 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   // Temporary storage for PerformTransfersAndResolveClears.
   std::vector<TransferInvocation> current_transfer_invocations_;
+  uint64_t last_frame_depth_transfer_audit_ = UINT64_MAX;
+  uint32_t current_frame_depth_transfer_index_ = 0;
+
+  // Dead intermediate depth transfer tracking and deferred sync.
+  bool base0_depth_1x_sync_pending_ = false;
+  RenderTargetKey base0_deferred_dest_key_{};
+  std::vector<Transfer> base0_deferred_transfers_;
+  uint64_t last_depth_transfer_detect_frame_ = UINT64_MAX;
+  uint32_t intermediate_depth_transfers_elided_count_ = 0;
+  uint32_t intermediate_depth_transfers_executed_count_ = 0;
+  uint32_t intermediate_depth_transfers_fallback_count_ = 0;
+
+  // Candidate B: coalesced adjacent depth/color resolve clear and hoisted shared upload.
+  struct PendingDeferredClear {
+    bool pending = false;
+    VulkanRenderTarget* depth_target = nullptr;
+    VulkanRenderTarget* color_target = nullptr;
+    uint64_t depth_clear_value = 0;
+    uint64_t color_clear_value = 0;
+    VkClearRect clear_rect = {};
+    const Framebuffer* framebuffer = nullptr;
+    VkRenderPass render_pass = VK_NULL_HANDLE;
+  };
+  PendingDeferredClear pending_deferred_clear_;
 
   // Temporary storage for DumpRenderTargets.
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
@@ -933,7 +972,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   std::vector<ResolveCopyDispatch> direct_resolve_dispatches_;
   uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
+  uint64_t direct_resolve_fused_count_ = 0;
   uint64_t direct_resolve_fallback_count_ = 0;
+  bool direct_resolve_fused_logged_once_ = false;
 
   // For pixel (fragment) shader interlock.
 

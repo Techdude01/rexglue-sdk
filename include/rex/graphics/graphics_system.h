@@ -77,6 +77,9 @@ class GraphicsSystem : public system::IGraphicsSystem {
   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) override;
 
   void SetInterruptCallback(uint32_t callback, uint32_t user_data) override;
+  bool SetDrawObserver(system::GpuDrawObserver observer, void* user) override;
+  bool SetHostRendering(bool enabled) override;
+  bool SetSignalGate(system::GpuSignalGate gate, void* user) override;
   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
 
   virtual void ClearCaches();

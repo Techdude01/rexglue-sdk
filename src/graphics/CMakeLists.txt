@@ -52,6 +52,8 @@ set(REXGPU_XENOS_VULKAN_SOURCES
     vulkan/shader.cpp
     vulkan/shared_memory.cpp
     vulkan/texture_cache.cpp
+    vulkan/direct_storage_image_parity.cpp
+    vulkan/direct_host_resolve_parity.cpp
 )
 
 # D3D12 backend
@@ -99,11 +101,33 @@ endif()
 add_library(rexgpu-xenos SHARED ${REXGPU_XENOS_SOURCES})
 add_library(rex::gpu-xenos ALIAS rexgpu-xenos)
 
+# Destination-only variants of the exact pinned legacy XeSL sources.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+file(GLOB_RECURSE DIRECT_IMAGE_ORIGINAL_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/texture_load_original/*")
+set(DIRECT_IMAGE_SOURCE_HEADER "${CMAKE_CURRENT_BINARY_DIR}/direct_storage_image_sources.h")
+add_custom_command(OUTPUT "${DIRECT_IMAGE_SOURCE_HEADER}"
+    COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/generate_direct_storage_sources.py"
+        "${DIRECT_IMAGE_SOURCE_HEADER}"
+    DEPENDS ${DIRECT_IMAGE_ORIGINAL_SOURCES}
+        "${CMAKE_CURRENT_SOURCE_DIR}/shaders/generate_direct_storage_sources.py"
+    VERBATIM)
+target_sources(rexgpu-xenos PRIVATE "${DIRECT_IMAGE_SOURCE_HEADER}")
+target_include_directories(rexgpu-xenos PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+
 set_target_properties(rexgpu-xenos PROPERTIES
     EXPORT_NAME gpu-xenos
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
 )
+
+if(APPLE)
+    target_link_options(rexgpu-xenos PRIVATE
+        -Wl,-exported_symbol,_rex_gpu_abi_version
+        -Wl,-exported_symbol,_rex_gpu_create
+    )
+endif()
 
 target_include_directories(rexgpu-xenos PRIVATE
     ${REXGLUE_ROOT}/thirdparty/renderdoc
