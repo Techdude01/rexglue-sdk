@@ -207,6 +207,18 @@ void WindowSDL::RequestCloseImpl() {
   PerformClose();
 }
 
+bool WindowSDL::SetLogicalSize(uint32_t width, uint32_t height) {
+  if (!sdl_window_ || !width || !height || width > 8192 || height > 8192) return false;
+  if (!SDL_SetWindowSize(sdl_window_, int(width), int(height))) return false;
+  OnDesiredLogicalSizeUpdate(width, height);
+  int pixel_width = 0, pixel_height = 0;
+  if (!SDL_GetWindowSizeInPixels(sdl_window_, &pixel_width, &pixel_height) || pixel_width <= 0 || pixel_height <= 0)
+    return false;
+  WindowDestructionReceiver receiver(this);
+  OnActualSizeUpdate(uint32_t(pixel_width), uint32_t(pixel_height), receiver);
+  return !receiver.IsWindowDestroyed();
+}
+
 void WindowSDL::PerformClose() {
   WindowDestructionReceiver destruction_receiver(this);
   OnBeforeClose(destruction_receiver);

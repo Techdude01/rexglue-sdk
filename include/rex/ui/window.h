@@ -259,6 +259,9 @@ class Window {
   // user resizes a non-maximized window.
   uint32_t GetDesiredLogicalWidth() const { return desired_logical_width_; }
   uint32_t GetDesiredLogicalHeight() const { return desired_logical_height_; }
+  // UI-thread resize of an already-created window, before a guest renderer
+  // snapshots its drawable size. Unsupported backends return false.
+  virtual bool SetLogicalSize(uint32_t, uint32_t) { return false; }
 
   // 0 width or height may be returned even in case of an open window with a
   // valid non-zero-area surface depending on the platform.
