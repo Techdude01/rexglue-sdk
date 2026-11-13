@@ -24,6 +24,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/register_debug.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
@@ -37,6 +38,8 @@
 #include <rex/system/user_module.h>
 
 REXCVAR_DEFINE_BOOL(vsync, false, "GPU", "Enable vertical sync");
+REXCVAR_DEFINE_BOOL(gpu_lazy_register_debug, false, "GPU",
+                   "Candidate: skip register metadata lookup when GPU debug logging is disabled");
 
 REXCVAR_DEFINE_BOOL(gpu_wait_correlation, false, "GPU",
                     "Log diagnostic WAIT_REG_MEM, vblank and candidate writes");
@@ -128,6 +131,7 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
 CommandProcessor::~CommandProcessor() = default;
 
 bool CommandProcessor::Initialize() {
+  REXGPU_INFO("[GPU_REGISTER_DEBUG] lazy_metadata={}", REXCVAR_GET(gpu_lazy_register_debug));
   // Initialize the gamma ramps to their default (linear) values - taken from
   // what games set when starting with the sRGB (return value 1)
   // VdGetCurrentDisplayGamma.
@@ -370,9 +374,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
-    REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
-  }
+  detail::LogRegisterWriteDiagnostic(regs, index, value, REXCVAR_GET(gpu_lazy_register_debug));
 
   // Scratch register writeback.
   if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
