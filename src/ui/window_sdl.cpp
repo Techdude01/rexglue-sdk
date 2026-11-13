@@ -185,6 +185,19 @@ bool WindowSDL::OpenImpl() {
   // desired state so a reopened window comes back with the state it had.
   ApplyTextInputActiveNow();
   ApplyCursorVisibilityNow();
+  if (REXCVAR_GET(hidden_window)) {
+    // Shown but entirely off every display: SDL/Cocoa keep normal display-link pacing for a visible
+    // window (a never-shown one is throttled to about 60), and nothing appears on screen.
+    int display_count = 0;
+    SDL_DisplayID* displays = SDL_GetDisplays(&display_count);
+    int off_x = 0;
+    SDL_Rect bounds;
+    for (int i = 0; i < display_count; ++i) {
+      if (SDL_GetDisplayBounds(displays[i], &bounds)) off_x = std::max(off_x, bounds.x + bounds.w);
+    }
+    SDL_free(displays);
+    SDL_SetWindowPosition(sdl_window_, off_x + 64, 64);
+  }
   SDL_ShowWindow(sdl_window_);
 
   // Actualize state for the common Window code. Listener dispatch is handled

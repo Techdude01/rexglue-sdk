@@ -42,6 +42,11 @@ REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
     .range(0, 16)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+// Never shown: the window is created hidden and stays hidden (input still works when focused
+// programmatically). For automated runs that must not put anything on screen.
+REXCVAR_DEFINE_BOOL(hidden_window, false, "UI/Window", "Show the window entirely off all displays (no window on screen)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_STRING(video_driver, "", "UI/Window",
                       "SDL video driver to use, such as \"wayland\" or \"x11\". Empty picks "
                       "SDL's default for the session")
