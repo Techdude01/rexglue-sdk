@@ -53,6 +53,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
                        uint32_t draw_resolution_scale_y = 1, bool force_emit_source_map = false);
   ~DxbcShaderTranslator() override;
 
+  void SetShaderResolutionScale(float scale_x, float scale_y) {
+    shader_resolution_scale_x_ = scale_x > 1.0f ? scale_x : 1.0f;
+    shader_resolution_scale_y_ = scale_y > 1.0f ? scale_y : 1.0f;
+  }
+
   // Stage linkage ordering and rules (must be respected not only within the
   // DxbcShaderTranslator, but also by everything else between the VS and the
   // PS, such as geometry shaders for primitive types, and built-in pixel
@@ -936,6 +941,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // Guest pixel host width / height.
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+  float shader_resolution_scale_x_ = 1.0f;
+  float shader_resolution_scale_y_ = 1.0f;
 
   // Is currently writing the empty depth-only pixel shader, for
   // CompleteTranslation.

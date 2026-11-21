@@ -70,6 +70,8 @@ DxbcShaderTranslator::DxbcShaderTranslator(ui::GraphicsProvider::GpuVendorID ven
       msaa_2x_supported_(msaa_2x_supported),
       draw_resolution_scale_x_(draw_resolution_scale_x),
       draw_resolution_scale_y_(draw_resolution_scale_y),
+      shader_resolution_scale_x_(float(draw_resolution_scale_x)),
+      shader_resolution_scale_y_(float(draw_resolution_scale_y)),
       emit_source_map_(force_emit_source_map || REXCVAR_GET(dxbc_source_map)) {
   assert_not_zero(draw_resolution_scale_x);
   assert_not_zero(draw_resolution_scale_y);
@@ -658,13 +660,13 @@ void DxbcShaderTranslator::StartPixelShader() {
     in_position_used_ |= 0b0011;
     a_.OpRoundNI(dxbc::Dest::R(param_gen_temp, 0b0011), dxbc::Src::V1D(in_reg_ps_position_));
     uint32_t resolution_scaled_axes =
-        uint32_t(draw_resolution_scale_x_ > 1) | (uint32_t(draw_resolution_scale_y_ > 1) << 1);
+        uint32_t(shader_resolution_scale_x_ > 1.0f) | (uint32_t(shader_resolution_scale_y_ > 1.0f) << 1);
     if (resolution_scaled_axes) {
       // Revert resolution scale - after truncating, so if the pixel position
       // is passed to tfetch (assuming the game doesn't round it by itself),
       // it will be sampled with higher resolution too.
       a_.OpMul(dxbc::Dest::R(param_gen_temp, resolution_scaled_axes), dxbc::Src::R(param_gen_temp),
-               dxbc::Src::LF(1.0f / draw_resolution_scale_x_, 1.0f / draw_resolution_scale_y_, 1.0f,
+               dxbc::Src::LF(1.0f / shader_resolution_scale_x_, 1.0f / shader_resolution_scale_y_, 1.0f,
                              1.0f));
     }
     if (shader_modification.pixel.param_gen_point) {
