@@ -1634,6 +1634,12 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                   spv::OpVectorTimesScalar, type_float2_, gradients_h, lod_gradient_scale);
               gradients_v = builder_->createNoContractionBinOp(
                   spv::OpVectorTimesScalar, type_float2_, gradients_v, lod_gradient_scale);
+              if (face_lod_probe_buffer_ != spv::NoResult && fetch_constant_index == 0 &&
+                  !instr.attributes.use_register_gradients && !instr.attributes.unnormalized_coordinates) {
+                EmitFaceLodProbe(unoffset_coordinates[0], unoffset_coordinates[1],
+                                 coordinates[0], coordinates[1], gradients_h, gradients_v,
+                                 size[0], size[1], lod_gradient_scale, fetch_constant_index);
+              }
               if (quad_partner_valid_ != spv::NoResult && fetch_constant_index == 0 &&
                   !instr.attributes.use_register_gradients) {
                 const spv::Id uv = builder_->createCompositeConstruct(type_float2_,
@@ -1718,7 +1724,8 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         // diagnostic ROI branch. Reusing these IDs avoids issuing derivative
         // operations in divergent diagnostic control flow or estimating them
         // from adjacent (potentially different-primitive) logged fragments.
-        if (GetSpirvShaderModification().pixel.diagnostic_storage_version >= 10 &&
+        if (diagnostic_storage_buffer_ != spv::NoResult &&
+            GetSpirvShaderModification().pixel.diagnostic_storage_version >= 10 &&
             vulkan::diagnostics::IsQuadPartnerMarkerShader(current_shader().ucode_data_hash()) &&
             instr.dimension == xenos::FetchOpDimension::k2D && use_computed_lod &&
             (fetch_constant_index == 0 || fetch_constant_index == 14)) {
@@ -2627,6 +2634,116 @@ spv::Id SpirvShaderTranslator::QueryTextureLod(spv::Builder::TextureParameters& 
   }
   if_signed.makeEndIf();
   return if_signed.createMergePhi(lod_signed, lod_unsigned);
+}
+
+void SpirvShaderTranslator::EmitFaceLodProbe(
+    spv::Id u, spv::Id v, spv::Id sample_u, spv::Id sample_v,
+    spv::Id dx, spv::Id dy, spv::Id width, spv::Id height,
+    spv::Id lod_scale, uint32_t fetch_slot) {
+  // Diagnostic ABI 1: 16 uint header words followed by 64-word records.
+  // All derivatives precede the recording/coverage branch. In particular,
+  // helper invocations must execute this arithmetic even though they cannot
+  // publish storage side effects. The texture's original dx/dy IDs are untouched.
+  auto component = [&](spv::Id value, uint32_t c) {
+    return builder_->createCompositeExtract(value, type_float_, c);
+  };
+  auto mul = [&](spv::Id a, spv::Id b) {
+    return builder_->createNoContractionBinOp(spv::OpFMul, type_float_, a, b);
+  };
+  auto derivative = [&](spv::Id value, bool y, bool fine) {
+    return builder_->createUnaryOp(y ? (fine ? spv::OpDPdyFine : spv::OpDPdyCoarse)
+                                       : (fine ? spv::OpDPdxFine : spv::OpDPdxCoarse),
+                                    type_float_, value);
+  };
+  const spv::Id frag = builder_->createLoad(input_fragment_coordinates_, spv::NoPrecision);
+  const spv::Id q = component(frag, 3);
+  const spv::Id a[] = {mul(u, q), mul(v, q)};
+  const spv::Id uv[] = {u, v};
+  const spv::Id helper = builder_->createLoad(face_lod_probe_helper_, spv::NoPrecision);
+  const spv::Id helper_float = builder_->createTriOp(spv::OpSelect, type_float_, helper,
+                                                    const_float_1_, const_float_0_);
+  const spv::Id inverse_q_squared = builder_->createNoContractionBinOp(
+      spv::OpFDiv, type_float_, const_float_1_, mul(q, q));
+  std::array<spv::Id, 64> fields;
+  fields.fill(const_uint_0_);
+  auto float_field = [&](uint32_t index, spv::Id value) {
+    fields[index] = builder_->createUnaryOp(spv::OpBitcast, type_uint_, value);
+  };
+  fields[2] = builder_->makeUintConstant(fetch_slot);
+  fields[3] = builder_->createUnaryOp(spv::OpConvertFToU, type_uint_, component(frag, 0));
+  fields[4] = builder_->createUnaryOp(spv::OpConvertFToU, type_uint_, component(frag, 1));
+  fields[5] = builder_->createTriOp(spv::OpSelect, type_uint_, helper,
+                                   builder_->makeUintConstant(1), const_uint_0_);
+  fields[6] = builder_->makeUintConstant(UINT32_MAX); // sample identity not captured
+  fields[7] = builder_->makeUintConstant(1);
+  float_field(8, u); float_field(9, v);
+  float_field(10, sample_u); float_field(11, sample_v);
+  float_field(12, q); float_field(13, a[0]); float_field(14, a[1]);
+  for (uint32_t axis = 0; axis < 2; ++axis) {
+    const spv::Id dq = derivative(q, axis != 0, false);
+    float_field(15 + axis, dq);
+    float_field(46 + axis, derivative(helper_float, axis != 0, true));
+    for (uint32_t c = 0; c < 2; ++c) {
+      const spv::Id da = derivative(a[c], axis != 0, false);
+      const spv::Id numerator_term = mul(da, q);
+      const spv::Id denominator_term = mul(a[c], dq);
+      const spv::Id numerator = builder_->createNoContractionBinOp(
+          spv::OpFSub, type_float_, numerator_term, denominator_term);
+      float_field(17 + axis * 2 + c, da);
+      float_field(21 + axis * 2 + c, component(axis ? dy : dx, c));
+      float_field(25 + axis * 2 + c, mul(derivative(uv[c], axis != 0, true), lod_scale));
+      float_field(29 + axis * 2 + c, mul(mul(numerator, inverse_q_squared), lod_scale));
+      float_field(33 + axis * 4 + c, numerator_term);
+      float_field(35 + axis * 4 + c, denominator_term);
+      float_field(51 + axis * 2 + c, derivative(uv[c], axis != 0, false));
+      float_field(55 + axis * 2 + c, numerator);
+    }
+  }
+  float_field(41, width); float_field(42, height); float_field(43, lod_scale);
+  float_field(44, builder_->createNoContractionBinOp(spv::OpFDiv, type_float_, a[0], q));
+  float_field(45, builder_->createNoContractionBinOp(spv::OpFDiv, type_float_, a[1], q));
+  float_field(48, component(frag, 2));
+  float_field(49, component(frag, 0)); float_field(50, component(frag, 1));
+  fields[59] = const_uint_0_; // q source: gl_FragCoord.w, not a separate noperspective varying
+  fields[63] = builder_->makeUintConstant(0xFACE2B01);
+  auto pointer = [&](spv::Id word) {
+    return builder_->createAccessChain(spv::StorageClassStorageBuffer, face_lod_probe_buffer_,
+                                      std::vector<spv::Id>{const_int_0_, word});
+  };
+  auto load_header = [&](uint32_t word) {
+    return builder_->createLoad(pointer(builder_->makeUintConstant(word)), spv::NoPrecision);
+  };
+  const spv::Id enabled = builder_->createBinOp(spv::OpINotEqual, type_bool_,
+                                               load_header(3), const_uint_0_);
+  const spv::Id covered = builder_->createUnaryOp(spv::OpLogicalNot, type_bool_, helper);
+  SpirvBuilder::IfBuilder recording(builder_->createBinOp(spv::OpLogicalAnd, type_bool_, enabled, covered),
+                                    spv::SelectionControlMaskNone, *builder_);
+  auto atomic = [&](uint32_t header_word, spv::Op op, spv::Id value) {
+    const spv::Id id = builder_->getUniqueId();
+    auto instruction = std::make_unique<spv::Instruction>(id, type_uint_, op);
+    instruction->addIdOperand(pointer(builder_->makeUintConstant(header_word)));
+    instruction->addIdOperand(builder_->makeUintConstant(1)); // Device
+    instruction->addIdOperand(const_uint_0_); // relaxed, host waits for completion
+    instruction->addIdOperand(value);
+    builder_->getBuildPoint()->addInstruction(std::move(instruction));
+    return id;
+  };
+  const spv::Id record = atomic(0, spv::OpAtomicIAdd, builder_->makeUintConstant(1));
+  SpirvBuilder::IfBuilder capacity(builder_->createBinOp(spv::OpULessThan, type_bool_, record, load_header(2)),
+                                   spv::SelectionControlMaskNone, *builder_);
+  fields[0] = load_header(4);
+  fields[1] = load_header(5);
+  const spv::Id base = builder_->createBinOp(spv::OpIAdd, type_uint_,
+      builder_->createBinOp(spv::OpIMul, type_uint_, record, builder_->makeUintConstant(64)),
+      builder_->makeUintConstant(16));
+  for (uint32_t i = 0; i < fields.size(); ++i) {
+    builder_->createStore(fields[i], pointer(builder_->createBinOp(spv::OpIAdd, type_uint_,
+        base, builder_->makeUintConstant(i))));
+  }
+  capacity.makeBeginElse();
+  atomic(1, spv::OpAtomicOr, builder_->makeUintConstant(1));
+  capacity.makeEndIf();
+  recording.makeEndIf();
 }
 
 }  // namespace rex::graphics

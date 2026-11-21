@@ -1059,6 +1059,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
   std::array<spv::Id, 3> quad_partner_values_{};
   spv::Id quad_partner_valid_ = spv::NoResult;
   spv::Id diagnostic_storage_buffer_ = spv::NoResult;
+  // NativeX Phase 2B mode 15. Independent of the historical fragment ABI.
+  spv::Id face_lod_probe_buffer_ = spv::NoResult;
+  spv::Id face_lod_probe_helper_ = spv::NoResult;
+  void EmitFaceLodProbe(spv::Id u, spv::Id v, spv::Id sample_u, spv::Id sample_v,
+                       spv::Id dx, spv::Id dy, spv::Id width, spv::Id height,
+                       spv::Id lod_scale, uint32_t fetch_slot);
   // Translation-time index of the slot-0 fetch being emitted, for the head PS.
   uint32_t face_stage_slot0_fetch_index_ = 0;
   // Loaded by FSI_LoadSampleMask.

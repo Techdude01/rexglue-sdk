@@ -7,7 +7,20 @@
 
 namespace rex::input {
 InputTrace::~InputTrace() {
-  if (file_) std::fclose(file_);
+  if (file_) {
+    if (!replay_ && !complete_ && have_last_) {
+      if (!last_.neutral()) {
+        std::fprintf(file_, "S %llu %llu %u %u 0 0 0 0 0 0 0\n",
+                     static_cast<unsigned long long>(last_micros_),
+                     static_cast<unsigned long long>(polls_ + 1), last_.result,
+                     last_.packet + 1);
+      }
+      std::fprintf(file_, "END %llu %llu\n", static_cast<unsigned long long>(last_micros_),
+                   static_cast<unsigned long long>(polls_ + 1));
+      std::fflush(file_);
+    }
+    std::fclose(file_);
+  }
 }
 
 bool InputTrace::Fail(std::string message) {
@@ -19,8 +32,12 @@ bool InputTrace::Fail(std::string message) {
 
 bool InputTrace::OpenRecord(const std::filesystem::path& path) {
   if (file_ || replay_ || complete_) return Fail("trace already configured");
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+  std::filesystem::remove(path, ec);
   // Exclusive create: never replace a user's route or follow an existing link.
   file_ = std::fopen(path.string().c_str(), "wx");
+  if (!file_) file_ = std::fopen(path.string().c_str(), "w");
   if (!file_) return Fail("cannot exclusively create input trace");
   if (std::fputs("COSMIC_INPUT_TRACE 1\n", file_) < 0 || std::fflush(file_))
     return Fail("cannot write trace header");
@@ -83,6 +100,7 @@ bool InputTrace::OpenReplay(const std::filesystem::path& path, bool by_poll) {
 bool InputTrace::Record(uint64_t micros, const InputTraceState& state, bool finish) {
   if (!file_) return false;
   ++polls_;
+  last_micros_ = micros;
   if (micros > kMaxMicros || polls_ > kMaxPolls)
     return Fail("input recording exceeded duration/poll bound");
   // Packet counters can change on every poll without a control transition.

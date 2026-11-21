@@ -434,6 +434,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
                         rex::memory::Reinterpret<uint32_t>(new_gamma_ramp_rw_index));
         }
         if (write_gamma_ramp_component) {
+          gamma_ramp_version_.fetch_add(1, std::memory_order_release);
           OnGammaRamp256EntryTableValueWritten();
         }
       } break;
@@ -469,6 +470,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
                         rex::memory::Reinterpret<uint32_t>(new_gamma_ramp_rw_index));
         }
         if (write_gamma_ramp_component) {
+          gamma_ramp_version_.fetch_add(1, std::memory_order_release);
           OnGammaRampPWLValueWritten();
         }
       } break;
@@ -502,6 +504,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
         WriteRegister(XE_GPU_REG_DC_LUT_RW_INDEX,
                       rex::memory::Reinterpret<uint32_t>(new_gamma_ramp_rw_index));
         if (gamma_ramp_write_enable_mask) {
+          gamma_ramp_version_.fetch_add(1, std::memory_order_release);
           OnGammaRamp256EntryTableValueWritten();
         }
       } break;
@@ -721,6 +724,14 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  if (!write_one_reg && base_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+      base_index + count <= XE_GPU_REG_SHADER_CONSTANT_511_W + 1) {
+    auto* dest = const_cast<uint32_t*>(register_file_->values + base_index);
+    for (uint32_t m = 0; m < count; ++m) {
+      dest[m] = reader->ReadAndSwap<uint32_t>();
+    }
+    return true;
+  }
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
     uint32_t target_index = write_one_reg ? base_index : base_index + m;

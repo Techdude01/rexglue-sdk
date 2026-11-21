@@ -80,6 +80,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
   bool SetDrawObserver(system::GpuDrawObserver observer, void* user) override;
   bool SetHostRendering(bool enabled) override;
   bool SetSignalGate(system::GpuSignalGate gate, void* user) override;
+  bool GetGammaRamp(system::GammaRamp& ramp) override;
   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
 
   virtual void ClearCaches();

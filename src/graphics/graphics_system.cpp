@@ -323,6 +323,13 @@ bool GraphicsSystem::SetSignalGate(system::GpuSignalGate gate, void* user) {
   return true;
 }
 
+bool GraphicsSystem::GetGammaRamp(system::GammaRamp& ramp) {
+  if (!command_processor_) {
+    return false;
+  }
+  return command_processor_->GetGammaRamp(ramp);
+}
+
 void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   if (!interrupt_callback_) {
     return;

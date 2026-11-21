@@ -58,7 +58,7 @@ class InputTrace {
   FILE* file_ = nullptr;
   std::vector<InputTraceEvent> events_;
   InputTraceState last_{};
-  uint64_t polls_ = 0, end_micros_ = 0, end_poll_ = 0;
+  uint64_t polls_ = 0, end_micros_ = 0, end_poll_ = 0, last_micros_ = 0;
   size_t cursor_ = 0;
   bool have_last_ = false, replay_ = false, by_poll_ = false, complete_ = false;
   std::string error_;

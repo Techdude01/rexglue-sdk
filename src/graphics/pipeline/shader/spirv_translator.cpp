@@ -175,6 +175,8 @@ void SpirvShaderTranslator::Reset() {
   quad_partner_valid_ = spv::NoResult;
   face_stage_slot0_fetch_index_ = 0;
   diagnostic_storage_buffer_ = spv::NoResult;
+  face_lod_probe_buffer_ = spv::NoResult;
+  face_lod_probe_helper_ = spv::NoResult;
 
   main_switch_op_.reset();
   main_switch_next_pc_phi_operands_.clear();
@@ -482,6 +484,7 @@ void SpirvShaderTranslator::StartTranslation() {
         shader_hash == UINT64_C(0x3EB44C3A6D2D267B);
     const bool pixel_diagnostic_storage =
         is_pixel_shader() && modification.pixel.diagnostic_storage_version &&
+        modification.pixel.diagnostic_storage_version != 15 &&
         (is_diagnostic_candidate ||
          modification.pixel.diagnostic_storage_version >= 9);
     const bool vertex_diagnostic_storage =
@@ -490,7 +493,24 @@ void SpirvShaderTranslator::StartTranslation() {
          shader_hash == vulkan::diagnostics::kGBufferVertexDiagnosticVertexHash ||
          shader_hash == vulkan::diagnostics::kBenCuffVertexDiagnosticVertexHash ||
          shader_hash == vulkan::diagnostics::kBenDialVertexDiagnosticVertexHash ||
-         shader_hash == vulkan::diagnostics::kBenGlowVertexDiagnosticVertexHash);
+          shader_hash == vulkan::diagnostics::kBenGlowVertexDiagnosticVertexHash ||
+          (modification.vertex.diagnostic_storage_version == 15 &&
+           (shader_hash == UINT64_C(0x8A449D0796A656D7) ||
+            shader_hash == UINT64_C(0x35FAF0853F95B7A0))));
+    if (is_pixel_shader() && modification.pixel.diagnostic_storage_version == 15 &&
+        shader_hash == UINT64_C(0x79A3448304FA0D22)) {
+      const spv::Id words = builder_->makeRuntimeArray(type_uint_);
+      builder_->addDecoration(words, spv::DecorationArrayStride, 4);
+      const spv::Id type = builder_->makeStructType(std::vector<spv::Id>{words}, "XeFaceLodProbe");
+      builder_->addMemberDecoration(type, 0, spv::DecorationOffset, 0);
+      builder_->addDecoration(type, spv::DecorationBlock);
+      face_lod_probe_buffer_ = builder_->createVariable(spv::NoPrecision,
+          spv::StorageClassStorageBuffer, type, "xe_face_lod_probe");
+      builder_->addDecoration(face_lod_probe_buffer_, spv::DecorationDescriptorSet,
+                              int(kDescriptorSetSharedMemoryAndEdram));
+      builder_->addDecoration(face_lod_probe_buffer_, spv::DecorationBinding, 3);
+      if (features_.spirv_version >= spv::Spv_1_4) main_interface_.push_back(face_lod_probe_buffer_);
+    }
     if (pixel_diagnostic_storage || vertex_diagnostic_storage) {
       using DiagnosticBuffer = vulkan::VulkanDiagnosticStorageBuffer;
       id_vector_temp_.clear();
@@ -1280,7 +1300,10 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
          current_shader().ucode_data_hash() ==
              vulkan::diagnostics::kBenDialVertexDiagnosticVertexHash ||
          current_shader().ucode_data_hash() ==
-             vulkan::diagnostics::kBenGlowVertexDiagnosticVertexHash)) {
+              vulkan::diagnostics::kBenGlowVertexDiagnosticVertexHash ||
+          (shader_modification.vertex.diagnostic_storage_version == 15 &&
+           (current_shader().ucode_data_hash() == UINT64_C(0x8A449D0796A656D7) ||
+            current_shader().ucode_data_hash() == UINT64_C(0x35FAF0853F95B7A0))))) {
       using DiagnosticBuffer = vulkan::VulkanDiagnosticStorageBuffer;
       auto header_pointer = [&](uint32_t member) {
         return builder_->createAccessChain(
@@ -3232,7 +3255,7 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   // (per-sample if supported).
   bool memexport_resolution_scaled = current_shader().memexport_eM_written() &&
                                      (draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1);
-  if (edram_fragment_shader_interlock_ || param_gen_needed || memexport_resolution_scaled ||
+  if (edram_fragment_shader_interlock_ || face_lod_probe_buffer_ != spv::NoResult || param_gen_needed || memexport_resolution_scaled ||
       float24_depth_from_fragment_coordinates || alpha_to_coverage_possible ||
       (diagnostic_storage_buffer_ != spv::NoResult && is_pixel_shader() &&
        (current_shader().ucode_data_hash() == UINT64_C(0x79A3448304FA0D22) ||
@@ -3247,6 +3270,12 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   }
 
   // Is front facing.
+  if (face_lod_probe_buffer_ != spv::NoResult) {
+    face_lod_probe_helper_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,
+                                                     type_bool_, "gl_HelperInvocation");
+    builder_->addDecoration(face_lod_probe_helper_, spv::DecorationBuiltIn, spv::BuiltInHelperInvocation);
+    main_interface_.push_back(face_lod_probe_helper_);
+  }
   if (edram_fragment_shader_interlock_ ||
       (param_gen_needed && !GetSpirvShaderModification().pixel.param_gen_point)) {
     input_front_facing_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput,

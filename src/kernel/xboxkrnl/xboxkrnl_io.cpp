@@ -220,6 +220,23 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
         io_status_block->status = result;
         io_status_block->information = bytes_read;
       }
+      if (result == X_STATUS_SUCCESS && file->name() == "menu.ds" && bytes_read >= 0x3400) {
+        auto* mem = static_cast<uint8_t*>(buffer.host_address());
+        if (mem) {
+          const uint8_t dark_sig[] = {0x00, 0x00, 0x05, 0x03, 0x41, 0x10, 0x00, 0x00,
+                                      0x00, 0x00, 0x06, 0x03, 0x41, 0xF8, 0x00, 0x00,
+                                      0x00, 0x00, 0x07, 0x03, 0x40, 0xA0, 0x00, 0x00};
+          const uint8_t read_sig[] = {0x00, 0x00, 0x05, 0x03, 0x42, 0x8C, 0x00, 0x00,
+                                      0x00, 0x00, 0x06, 0x03, 0x42, 0xD2, 0x00, 0x00,
+                                      0x00, 0x00, 0x07, 0x03, 0x42, 0x70, 0x00, 0x00};
+          for (size_t off = 0x3100; off < std::min<size_t>(bytes_read - sizeof(dark_sig), 0x3500); off += 4) {
+            if (std::memcmp(mem + off, dark_sig, sizeof(dark_sig)) == 0) {
+              std::memcpy(mem + off, read_sig, sizeof(read_sig));
+              REXKRNL_INFO("[cosmic_menu] Decoupled menu.ds toggle option unselected color at {:#x}", off);
+            }
+          }
+        }
+      }
 
       // Queue the APC callback. It must be delivered via the APC mechanism even
       // though were are completing immediately.
